@@ -31,10 +31,10 @@ YACC=/bin/false
 event-filter-parser.h: event-filter-parser.c
 
 $(srcdir)/UnicodeData.txt:
-	test -f $@ || wget -O $@ https://dovecot.org/res/UnicodeData.txt
+	$(AM_V_GEN)test -f $@ || wget -O $@ https://dovecot.org/res/UnicodeData.txt
 
 $(srcdir)/unicodemap.c: $(srcdir)/unicodemap.pl $(srcdir)/UnicodeData.txt
-	perl $(srcdir)/unicodemap.pl < $(srcdir)/UnicodeData.txt > $@
+	$(AM_V_GEN)perl $(srcdir)/unicodemap.pl < $(srcdir)/UnicodeData.txt > $@
 
 liblib_la_LIBADD = $(LIBUNWIND_LIBS)
 liblib_la_SOURCES = \
@@ -105,6 +105,7 @@ liblib_la_SOURCES = \
 	istream-jsonstr.c \
 	istream-limit.c \
 	istream-multiplex.c \
+	istream-noop.c \
 	istream-rawlog.c \
 	istream-seekable.c \
 	istream-sized.c \
@@ -159,6 +160,7 @@ liblib_la_SOURCES = \
 	pkcs5.c \
 	primes.c \
 	printf-format-fix.c \
+	process-stat.c \
 	process-title.c \
 	priorityq.c \
 	randgen.c \
@@ -171,6 +173,7 @@ liblib_la_SOURCES = \
 	safe-mkstemp.c \
 	sendfile-util.c \
 	seq-range-array.c \
+	seq-set-builder.c \
 	sha1.c \
 	sha2.c \
 	sha3.c \
@@ -316,6 +319,7 @@ headers = \
 	pkcs5.h \
 	primes.h \
 	printf-format-fix.h \
+	process-stat.h \
 	process-title.h \
 	priorityq.h \
 	randgen.h \
@@ -327,6 +331,7 @@ headers = \
 	safe-mkstemp.h \
 	sendfile-util.h \
 	seq-range-array.h \
+	seq-set-builder.h \
 	sha-common.h \
 	sha1.h \
 	sha2.h \
@@ -380,6 +385,7 @@ test_lib_SOURCES = \
 	test-crc32.c \
 	test-cpu-limit.c \
 	test-data-stack.c \
+	test-env-util.c \
 	test-event-category-register.c \
 	test-event-filter.c \
 	test-event-filter-expr.c \
@@ -412,6 +418,7 @@ test_lib_SOURCES = \
 	test-istream-failure-at.c \
 	test-istream-jsonstr.c \
 	test-istream-multiplex.c \
+	test-istream-noop.c \
 	test-istream-seekable.c \
 	test-istream-sized.c \
 	test-istream-tee.c \
@@ -419,9 +426,11 @@ test_lib_SOURCES = \
 	test-istream-unix.c \
 	test-json-parser.c \
 	test-json-tree.c \
+	test-lib-event.c \
 	test-lib-signals.c \
 	test-llist.c \
 	test-log-throttle.c \
+	test-macros.c \
 	test-malloc-overflow.c \
 	test-memarea.c \
 	test-mempool.c \
@@ -441,6 +450,7 @@ test_lib_SOURCES = \
 	test-priorityq.c \
 	test-random.c \
 	test-seq-range-array.c \
+	test-seq-set-builder.c \
 	test-stats-dist.c \
 	test-str.c \
 	test-strescape.c \

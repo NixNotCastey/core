@@ -189,8 +189,6 @@
 #include <dirent.h>
 #include <sys/stat.h>
 
-#define MAILDIR_FILENAME_FLAG_FOUND 128
-
 /* When rename()ing many files from new/ to cur/, it's possible that next
    readdir() skips some files. we don't of course wish to lose them, so we
    go and rescan the new/ directory again from beginning until no files are
@@ -285,6 +283,8 @@ static void maildir_sync_deinit(struct maildir_sync_context *ctx)
 		(void)maildir_uidlist_sync_deinit(&ctx->uidlist_sync_ctx, FALSE);
 	if (ctx->index_sync_ctx != NULL)
 		maildir_sync_index_rollback(&ctx->index_sync_ctx);
+	if (ctx->mbox->storage->storage.rebuild_list_index)
+		(void)mail_storage_list_index_rebuild_and_set_uncorrupted(&ctx->mbox->storage->storage);
 }
 
 static int maildir_fix_duplicate(struct maildir_sync_context *ctx,
@@ -450,11 +450,11 @@ maildir_scan_dir(struct maildir_sync_context *ctx, bool new_dir, bool final,
 
 	start_time = time(NULL);
 	if (new_dir) {
-		ctx->mbox->maildir_hdr.new_check_time = start_time;
+		ctx->mbox->maildir_hdr.new_check_time = time_to_uint32(start_time);
 		ctx->mbox->maildir_hdr.new_mtime = st.st_mtime;
 		ctx->mbox->maildir_hdr.new_mtime_nsecs = ST_MTIME_NSEC(st);
 	} else {
-		ctx->mbox->maildir_hdr.cur_check_time = start_time;
+		ctx->mbox->maildir_hdr.cur_check_time = time_to_uint32(start_time);
 		ctx->mbox->maildir_hdr.cur_mtime = st.st_mtime;
 		ctx->mbox->maildir_hdr.cur_mtime_nsecs = ST_MTIME_NSEC(st);
 	}

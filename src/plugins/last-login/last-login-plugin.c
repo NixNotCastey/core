@@ -94,11 +94,8 @@ static void last_login_mail_user_created(struct mail_user *user)
 		return;
 
 	i_zero(&set);
-	set.username = user->username;
 	set.base_dir = user->set->base_dir;
 	set.event_parent = user->event;
-	if (mail_user_get_home(user, &set.home_dir) <= 0)
-		set.home_dir = NULL;
 	if (dict_init(dict_value, &set, &dict, &error) < 0) {
 		i_error("last_login_dict: dict_init(%s) failed: %s",
 			dict_value, error);
@@ -122,7 +119,9 @@ static void last_login_mail_user_created(struct mail_user *user)
 
 	precision = mail_user_plugin_getenv(user, "last_login_precision");
 
-	trans = dict_transaction_begin(dict);
+	struct dict_op_settings dset = *mail_user_get_dict_op_settings(user);
+	dset.no_slowness_warning = TRUE;
+	trans = dict_transaction_begin(dict, &dset);
 	if (precision == NULL || strcmp(precision, "s") == 0)
 		dict_set(trans, key_name, dec2str(ioloop_time));
 	else if (strcmp(precision, "ms") == 0) {
@@ -140,7 +139,6 @@ static void last_login_mail_user_created(struct mail_user *user)
 	} else {
 		i_error("last_login_dict: Invalid last_login_precision '%s'", precision);
 	}
-	dict_transaction_no_slowness_warning(trans);
 	dict_transaction_commit_async(&trans, last_login_dict_commit, user);
 }
 

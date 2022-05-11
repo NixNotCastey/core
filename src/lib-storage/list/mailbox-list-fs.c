@@ -335,7 +335,7 @@ static int fs_list_delete_dir(struct mailbox_list *list, const char *name)
 		if (mailbox_list_get_path(list, child_name,
 					  MAILBOX_LIST_PATH_TYPE_INDEX,
 					  &child_path) > 0 &&
-		    str_begins(child_path, path)) {
+		    str_begins_with(child_path, path)) {
 			/* drop the "/child" part out. */
 			p = strrchr(child_path, '/');
 			if (rmdir(t_strdup_until(child_path, p)) == 0) {
@@ -353,6 +353,12 @@ static int fs_list_delete_dir(struct mailbox_list *list, const char *name)
 	return -1;
 }
 
+static const char *path_get_parent_dir(const char *path)
+{
+	const char *p = strrchr(path, '/');
+	return p == NULL ? "/" : t_strdup_until(path, p);
+}
+
 static int rename_dir(struct mailbox_list *oldlist, const char *oldname,
 		      struct mailbox_list *newlist, const char *newname,
 		      enum mailbox_list_path_type type, bool rmdir_parent)
@@ -364,13 +370,23 @@ static int rename_dir(struct mailbox_list *oldlist, const char *oldname,
 	    mailbox_list_get_path(newlist, newname, type, &newpath) <= 0)
 		return 0;
 
+	if (oldlist->set.maildir_name[0] != '\0' &&
+	    oldlist->set.index_control_use_maildir_name) {
+		/* Paths end with "/maildir_name". However, renaming wants to
+		   rename the full mailbox hierarchy, not just a single
+		   mailbox. So we need to drop away the "/maildir_name"
+		   suffix. */
+		oldpath = path_get_parent_dir(oldpath);
+	}
+	if (newlist->set.maildir_name[0] != '\0' &&
+	    newlist->set.index_control_use_maildir_name)
+		newpath = path_get_parent_dir(newpath);
+
 	if (strcmp(oldpath, newpath) == 0)
 		return 0;
 
-	p = strrchr(oldpath, '/');
-	oldparent = p == NULL ? "/" : t_strdup_until(oldpath, p);
-	p = strrchr(newpath, '/');
-	newparent = p == NULL ? "/" : t_strdup_until(newpath, p);
+	oldparent = path_get_parent_dir(oldpath);
+	newparent = path_get_parent_dir(newpath);
 
 	if (strcmp(oldparent, newparent) != 0 && stat(oldpath, &st) == 0) {
 		/* make sure the newparent exists */

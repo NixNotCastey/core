@@ -24,25 +24,18 @@
         result = event_filter_parser_input_proc(buf, max_size, yyscanner)
 static size_t event_filter_parser_input_proc(char *buf, size_t size, yyscan_t scanner);
 
-#ifdef __clang__
-#pragma clang diagnostic push
-/* ignore "unknown warning" warning if we're using unpatched clang */
-#pragma clang diagnostic ignored "-Wunknown-warning-option"
-/* ignore strict bool warnings in generated code */
-#pragma clang diagnostic ignored "-Wstrict-bool"
-/* ignore sign comparison errors (buggy flex) */
-#pragma clang diagnostic ignored "-Wsign-compare"
-/* ignore unused functions */
-#pragma clang diagnostic ignored "-Wunused-function"
-/* ignore unused parameters */
-#pragma clang diagnostic ignored "-Wunused-parameter"
-#else
-/* and same for gcc */
 #pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wsign-compare"
-#pragma GCC diagnostic ignored "-Wunused-function"
-#pragma GCC diagnostic ignored "-Wunused-parameter"
+
+/* ignore strict bool warnings in generated code */
+#ifdef HAVE_STRICT_BOOL
+#  pragma GCC diagnostic ignored "-Wstrict-bool"
 #endif
+/* ignore sign comparison errors (buggy flex) */
+#pragma GCC diagnostic ignored "-Wsign-compare"
+/* ignore unused functions */
+#pragma GCC diagnostic ignored "-Wunused-function"
+/* ignore unused parameters */
+#pragma GCC diagnostic ignored "-Wunused-parameter"
 
 %}
 
@@ -71,21 +64,37 @@ static size_t event_filter_parser_input_proc(char *buf, size_t size, yyscan_t sc
 [Oo][Rr]			{ return OR; }
 [Nn][Oo][Tt]			{ return NOT; }
 [<>=()]				{ return *yytext; }
-[A-Za-z0-9:.*_-]+		{ yylval->str = t_strdup(yytext); return TOKEN; }
+[A-Za-z0-9:.*?_-]+		{ yylval->str = t_strdup(yytext); return TOKEN; }
 [ \t\n\r]			{ /* ignore */ }
 .				{
-					char msg[160];
-
-					i_snprintf(msg, sizeof(msg),
-						   "syntax error, unexpected character '%c'",
-						   yytext[0]);
-
-					event_filter_parser_error(yyextra, msg);
+					/*
+					 * We simply return the char to the
+					 * and let the grammar error out
+					 * with a syntax error.
+					 *
+					 * Note: The cast is significant
+					 * since utf-8 bytes >=128 will
+					 * otherwise result in sign
+					 * extension and a negative int
+					 * getting returned on some
+					 * platforms (e.g., x86) which in
+					 * turn confuses the parser.  E.g.,
+					 * if:
+					 *    *yytext = '\x80'
+					 * we get:
+					 *    *yytext             -> -128
+					 *    (int) *yytext       -> -128
+					 * which is wrong.  With the
+					 * unsigned char cast, we get:
+					 *    (u.c.) *yytext      -> 128
+					 *    (int)(u.c.) *yytext -> 128
+					 * which is correct.
+					 */
+					return (unsigned char) *yytext;
 				}
 %%
-#ifdef __clang__
-#pragma clang diagnostic pop
-#endif
+
+#pragma GCC diagnostic pop
 
 void *yyalloc(size_t bytes, void* yyscanner ATTR_UNUSED)
 {

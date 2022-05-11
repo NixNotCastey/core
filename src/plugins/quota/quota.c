@@ -38,8 +38,6 @@ struct quota_root_iter {
 unsigned int quota_module_id = 0;
 
 extern struct quota_backend quota_backend_count;
-extern struct quota_backend quota_backend_dict;
-extern struct quota_backend quota_backend_dirsize;
 extern struct quota_backend quota_backend_fs;
 extern struct quota_backend quota_backend_imapc;
 extern struct quota_backend quota_backend_maildir;
@@ -49,8 +47,6 @@ static const struct quota_backend *quota_internal_backends[] = {
 	&quota_backend_fs,
 #endif
 	&quota_backend_count,
-	&quota_backend_dict,
-	&quota_backend_dirsize,
 	&quota_backend_imapc,
 	&quota_backend_maildir
 };
@@ -93,9 +89,9 @@ void quota_backend_register(const struct quota_backend *backend)
 void quota_backend_unregister(const struct quota_backend *backend)
 {
 	for(unsigned int i = 0; i < array_count(&quota_backends); i++) {
-		const struct quota_backend *const *be =
-			array_idx(&quota_backends, i);
-		if (strcmp((*be)->name, backend->name) == 0) {
+		const struct quota_backend *be =
+			array_idx_elem(&quota_backends, i);
+		if (strcmp(be->name, backend->name) == 0) {
 			array_delete(&quota_backends, i, 1);
 			return;
 		}
@@ -184,11 +180,11 @@ quota_root_parse_set(struct mail_user *user, const char *root_name,
 	if (value == NULL)
 		return 0;
 
-	if (!str_begins(value, "dict:")) {
+	if (!str_begins(value, "dict:", &value)) {
 		*error_r = t_strdup_printf("%s supports only dict backend", name);
 		return -1;
 	}
-	root_set->limit_set = p_strdup(root_set->set->pool, value+5);
+	root_set->limit_set = p_strdup(root_set->set->pool, value);
 	return 0;
 }
 
@@ -315,7 +311,6 @@ int quota_user_read_settings(struct mail_user *user,
 		mail_user_plugin_getenv(user, "quota_exceeded_message");
 	if (quota_set->quota_exceeded_msg == NULL)
 		quota_set->quota_exceeded_msg = DEFAULT_QUOTA_EXCEEDED_MSG;
-	quota_set->vsizes = mail_user_plugin_getenv_bool(user, "quota_vsizes");
 
 	const char *max_size = mail_user_plugin_getenv(user,
 						       "quota_max_mail_size");
@@ -465,8 +460,14 @@ int quota_init(struct quota_settings *quota_set, struct mail_user *user,
 			quota_deinit(&quota);
 			return -1;
 		}
-		if (ret > 0)
+		if (ret > 0) {
 			array_push_back(&quota->roots, &root);
+			/* If a quota backend needs virtual size instead of physical
+			   size, use this for all backends. This is not ideal, but
+			   works. */
+			if (root->set->backend->use_vsize)
+				quota->set->vsizes = TRUE;
+		}
 	}
 	*quota_r = quota;
 	return 0;
@@ -833,6 +834,7 @@ int quota_set_resource(struct quota_root *root, const char *name,
 {
 	struct dict_transaction_context *trans;
 	const char *key, *error;
+	const struct dict_op_settings *set;
 
 	if (root->set->limit_set == NULL) {
 		*client_error_r = MAIL_ERRSTR_NO_PERMISSION;
@@ -854,11 +856,8 @@ int quota_set_resource(struct quota_root *root, const char *name,
 		struct dict_settings set;
 
 		i_zero(&set);
-		set.username = root->quota->user->username;
 		set.base_dir = root->quota->user->set->base_dir;
 		set.event_parent = root->quota->user->event;
-		if (mail_user_get_home(root->quota->user, &set.home_dir) <= 0)
-			set.home_dir = NULL;
 		if (dict_init(root->set->limit_set, &set,
 			      &root->limit_set_dict, &error) < 0) {
 			e_error(root->quota->event,
@@ -868,7 +867,8 @@ int quota_set_resource(struct quota_root *root, const char *name,
 		}
 	}
 
-	trans = dict_transaction_begin(root->limit_set_dict);
+	set = mail_user_get_dict_op_settings(root->ns->user);
+	trans = dict_transaction_begin(root->limit_set_dict, set);
 	key = t_strdup_printf(QUOTA_LIMIT_SET_PATH"%s", key);
 	dict_set(trans, key, dec2str(value));
 	if (dict_transaction_commit(&trans, &error) < 0) {

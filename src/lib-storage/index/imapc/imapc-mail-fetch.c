@@ -8,6 +8,7 @@
 #include "istream-header-filter.h"
 #include "message-header-parser.h"
 #include "imap-arg.h"
+#include "imap-util.h"
 #include "imap-date.h"
 #include "imap-quote.h"
 #include "imap-bodystructure.h"
@@ -56,13 +57,11 @@ imapc_mail_fetch_callback(const struct imapc_command_reply *reply,
 {
 	struct imapc_fetch_request *request = context;
 	struct imapc_fetch_request *const *requests;
-	struct imapc_mail *const *mailp;
+	struct imapc_mail *mail;
 	struct imapc_mailbox *mbox = NULL;
 	unsigned int i, count;
 
-	array_foreach(&request->mails, mailp) {
-		struct imapc_mail *mail = *mailp;
-
+	array_foreach_elem(&request->mails, mail) {
 		i_assert(mail->fetch_count > 0);
 		imapc_mail_set_failure(mail, reply);
 		if (--mail->fetch_count == 0)
@@ -145,14 +144,16 @@ imapc_mail_try_merge_fetch(struct imapc_mailbox *mbox, string_t *str)
 {
 	const char *s1 = str_c(str);
 	const char *s2 = str_c(mbox->pending_fetch_cmd);
-	const char *p1, *p2;
+	const char *s1_args, *s2_args, *p1, *p2;
 
-	i_assert(str_begins(s1, "UID FETCH "));
-	i_assert(str_begins(s2, "UID FETCH "));
+	if (!str_begins(s1, "UID FETCH ", &s1_args))
+		i_unreached();
+	if (!str_begins(s2, "UID FETCH ", &s2_args))
+		i_unreached();
 
 	/* skip over UID range */
-	p1 = strchr(s1+10, ' ');
-	p2 = strchr(s2+10, ' ');
+	p1 = strchr(s1_args, ' ');
+	p2 = strchr(s2_args, ' ');
 
 	if (null_strcmp(p1, p2) != 0)
 		return FALSE;
@@ -214,11 +215,14 @@ imapc_mail_send_fetch(struct mail *_mail, enum mail_fetch_field fields,
 	i_assert(headers == NULL ||
 		 IMAPC_BOX_HAS_FEATURE(mbox, IMAPC_FEATURE_FETCH_HEADERS));
 
-	if (_mail->lookup_abort != MAIL_LOOKUP_ABORT_NEVER) {
-		mail_set_aborted(_mail);
+	if (!mbox->selected) {
+		mail_storage_set_error(_mail->box->storage,
+				MAIL_ERROR_NOTPOSSIBLE, "Can't fetch mails before selecting mailbox");
 		return -1;
 	}
-	_mail->mail_stream_opened = TRUE;
+
+	if (!mail_stream_access_start(_mail))
+		return -1;
 
 	/* drop any fields that we may already be fetching currently */
 	fields &= ENUM_NEGATE(mail->fetching_fields);
@@ -329,6 +333,9 @@ static void imapc_mail_cache_get(struct imapc_mail *mail,
 	}
 	mail->header_fetched = TRUE;
 	mail->body_fetched = TRUE;
+	/* The stream was already accessed and now it's cached.
+	   It still needs to be set accessed to avoid assert-crash. */
+	mail->imail.mail.mail.mail_stream_accessed = TRUE;
 	imapc_mail_init_stream(mail);
 }
 
@@ -511,15 +518,15 @@ int imapc_mail_fetch(struct mail *_mail, enum mail_fetch_field fields,
 void imapc_mail_fetch_flush(struct imapc_mailbox *mbox)
 {
 	struct imapc_command *cmd;
-	struct imapc_mail *const *mailp;
+	struct imapc_mail *mail;
 
 	if (mbox->pending_fetch_request == NULL) {
 		i_assert(mbox->to_pending_fetch_send == NULL);
 		return;
 	}
 
-	array_foreach(&mbox->pending_fetch_request->mails, mailp)
-		(*mailp)->fetch_sent = TRUE;
+	array_foreach_elem(&mbox->pending_fetch_request->mails, mail)
+		mail->fetch_sent = TRUE;
 
 	cmd = imapc_client_mailbox_cmd(mbox->client_box,
 				       imapc_mail_fetch_callback,
@@ -806,7 +813,16 @@ imapc_args_to_bodystructure(struct imapc_mail *mail,
 		ret = NULL;
 	} else {
 		string_t *str = t_str_new(128);
-		imap_bodystructure_write(parts, str, extended);
+		if (imap_bodystructure_write(parts, str, extended, &error) < 0) {
+			/* All the input to imap_bodystructure_write() came
+			   from imap_bodystructure_parse_args(). We should never
+			   get here. Instead, if something is wrong the
+			   parsing should have returned an error already. */
+			str_truncate(str, 0);
+			imap_write_args(str, args);
+			i_panic("Failed to write parsed BODYSTRUCTURE: %s "
+				"(original string: '%s')", error, str_c(str));
+		}
 		ret = p_strdup(mail->imail.mail.data_pool, str_c(str));
 	}
 	pool_unref(&pool);

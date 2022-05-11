@@ -87,10 +87,10 @@ struct index_mail_data {
 	const char *from_envelope, *body_snippet;
 	struct message_part_envelope *envelope_data;
 
-	uint32_t seq;
 	uint32_t cache_flags;
 	uint64_t modseq, pvt_modseq;
 	enum index_mail_access_part access_part;
+	const char *access_reason_code;
 	/* dont_cache_fields overrides cache_fields */
 	enum mail_fetch_field cache_fetch_fields, dont_cache_fetch_fields;
 	unsigned int dont_cache_field_idx;
@@ -125,6 +125,7 @@ struct index_mail_data {
 	bool header_parsed:1;
 	bool no_caching:1;
 	bool forced_no_caching:1;
+	bool istream_error_logged:1;
 	bool destroying_stream:1;
 	bool initialized_wrapper_stream:1;
 	bool destroy_callback_set:1;
@@ -168,7 +169,9 @@ index_mail_alloc(struct mailbox_transaction_context *t,
 void index_mail_init(struct index_mail *mail,
 		     struct mailbox_transaction_context *_t,
 		     enum mail_fetch_field wanted_fields,
-		     struct mailbox_header_lookup_ctx *_wanted_headers);
+		     struct mailbox_header_lookup_ctx *_wanted_headers,
+		     struct pool *mail_pool,
+		     struct pool *data_pool);
 
 void index_mail_set_seq(struct mail *mail, uint32_t seq, bool saving);
 bool index_mail_set_uid(struct mail *mail, uint32_t uid);
@@ -195,12 +198,14 @@ int index_mail_parse_headers(struct index_mail *mail,
 			     struct mailbox_header_lookup_ctx *headers,
 			     const char *reason)
 	ATTR_NULL(2);
+void index_mail_parse_header_deinit(struct index_mail *mail);
 /* Same as index_mail_parse_headers(), but assume that the stream is
    already opened. */
 int index_mail_parse_headers_internal(struct index_mail *mail,
 				      struct mailbox_header_lookup_ctx *headers)
 	ATTR_NULL(2);
 int index_mail_headers_get_envelope(struct index_mail *mail);
+void index_mail_parts_reset(struct index_mail *mail);
 
 int index_mail_get_first_header(struct mail *_mail, const char *field,
 				bool decode_to_utf8, const char **value_r);

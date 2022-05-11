@@ -17,7 +17,7 @@ static struct file_listener_settings *anvil_unix_listeners[] = {
 	&anvil_unix_listeners_array[1]
 };
 static buffer_t anvil_unix_listeners_buf = {
-	anvil_unix_listeners, sizeof(anvil_unix_listeners), { NULL, }
+	{ { anvil_unix_listeners, sizeof(anvil_unix_listeners) } }
 };
 /* </settings checks> */
 
@@ -26,11 +26,11 @@ struct service_settings anvil_service_settings = {
 	.protocol = "",
 	.type = "anvil",
 	.executable = "anvil",
-	.user = "$default_internal_user",
+	.user = "",
 	.group = "",
 	.privileged_group = "",
 	.extra_groups = "",
-	.chroot = "empty",
+	.chroot = "",
 
 	.drop_priv_before_exec = FALSE,
 

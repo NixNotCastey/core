@@ -11,10 +11,10 @@
 Description=Dovecot IMAP/POP3 email server
 Documentation=man:dovecot(1)
 Documentation=https://doc.dovecot.org/
-After=local-fs.target network-online.target
+After=local-fs.target network-online.target remote-fs.target
 
 [Service]
-Type=notify
+Type=@systemdservicetype@
 ExecStart=@sbindir@/dovecot -F
 ExecReload=@bindir@/doveadm reload
 ExecStop=@bindir@/doveadm stop

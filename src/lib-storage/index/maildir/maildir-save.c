@@ -105,9 +105,9 @@ static int maildir_file_move(struct maildir_save_context *ctx,
 				       MAIL_ERRSTR_NO_QUOTA);
 		return -1;
 	} else {
-		mail_set_critical(ctx->ctx.dest_mail,
-				  "rename(%s, %s) failed: %m",
-				  tmp_path, new_path);
+		mailbox_set_critical(&ctx->mbox->box,
+				     "rename(%s, %s) failed: %m",
+				     tmp_path, new_path);
 		return -1;
 	}
 }
@@ -542,7 +542,7 @@ static int maildir_save_finish_real(struct mail_save_context *_ctx)
 	if (_ctx->data.save_date != (time_t)-1) {
 		/* we can't change ctime, but we can add the date to cache */
 		struct index_mail *mail = INDEX_MAIL(_ctx->dest_mail);
-		uint32_t t = _ctx->data.save_date;
+		uint32_t t = time_to_uint32_trunc(_ctx->data.save_date);
 
 		index_mail_cache_add(mail, MAIL_CACHE_SAVE_DATE, &t, sizeof(t));
 	}
@@ -666,14 +666,14 @@ static int maildir_transaction_fsync_dirs(struct maildir_save_context *ctx,
 
 	if (new_changed) {
 		if (fdatasync_path(ctx->newdir) < 0) {
-			mail_set_critical(ctx->ctx.dest_mail,
+			mailbox_set_critical(&ctx->mbox->box,
 				"fdatasync_path(%s) failed: %m", ctx->newdir);
 			return -1;
 		}
 	}
 	if (cur_changed) {
 		if (fdatasync_path(ctx->curdir) < 0) {
-			mail_set_critical(ctx->ctx.dest_mail,
+			mailbox_set_critical(&ctx->mbox->box,
 				"fdatasync_path(%s) failed: %m", ctx->curdir);
 			return -1;
 		}
@@ -865,7 +865,7 @@ static int
 maildir_save_move_files_to_newcur(struct maildir_save_context *ctx)
 {
 	ARRAY(struct maildir_filename *) files;
-	struct maildir_filename *mf, *const *mfp, *prev_mf;
+	struct maildir_filename *mf, *prev_mf;
 	bool newdir, new_changed, cur_changed;
 	int ret;
 
@@ -879,8 +879,7 @@ maildir_save_move_files_to_newcur(struct maildir_save_context *ctx)
 
 	new_changed = cur_changed = FALSE;
 	prev_mf = NULL;
-	array_foreach(&files, mfp) {
-		mf = *mfp;
+	array_foreach_elem(&files, mf) {
 		T_BEGIN {
 			const char *dest;
 

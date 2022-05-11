@@ -18,9 +18,8 @@ pop3c_mail_alloc(struct mailbox_transaction_context *t,
 
 	pool = pool_alloconly_create("mail", 2048);
 	mail = p_new(pool, struct pop3c_mail, 1);
-	mail->imail.mail.pool = pool;
 
-	index_mail_init(&mail->imail, t, wanted_fields, wanted_headers);
+	index_mail_init(&mail->imail, t, wanted_fields, wanted_headers, pool, NULL);
 	return &mail->imail.mail.mail;
 }
 
@@ -147,7 +146,8 @@ static bool pop3c_mail_prefetch(struct mail *_mail)
 	const char *cmd;
 
 	if (pmail->imail.data.access_part != 0 &&
-	    pmail->imail.data.stream == NULL) {
+	    pmail->imail.data.stream == NULL &&
+	    mail_stream_access_start(_mail)) {
 		capa = pop3c_client_get_capabilities(mbox->client);
 		pmail->prefetching_body = (capa & POP3C_CAPABILITY_TOP) == 0 ||
 			(pmail->imail.data.access_part & (READ_BODY | PARSE_BODY)) != 0;
@@ -195,9 +195,9 @@ pop3c_mail_get_stream(struct mail *_mail, bool get_body,
 
 	if (get_body && mail->data.stream != NULL) {
 		name = i_stream_get_name(mail->data.stream);
-		if (str_begins(name, "RETR")) {
+		if (str_begins_with(name, "RETR")) {
 			/* we've fetched the body */
-		} else if (str_begins(name, "TOP")) {
+		} else if (str_begins_with(name, "TOP")) {
 			/* we've fetched the header, but we need the body
 			   now too */
 			index_mail_close_streams(mail);
@@ -207,6 +207,8 @@ pop3c_mail_get_stream(struct mail *_mail, bool get_body,
 	}
 
 	if (mail->data.stream == NULL) {
+		if (!mail_stream_access_start(_mail))
+			return -1;
 		capa = pop3c_client_get_capabilities(mbox->client);
 		if (get_body || (capa & POP3C_CAPABILITY_TOP) == 0) {
 			cmd = t_strdup_printf("RETR %u\r\n", _mail->seq);

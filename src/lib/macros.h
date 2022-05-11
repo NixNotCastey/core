@@ -27,7 +27,7 @@
 	((const void *) (((uintptr_t) (ptr)) + ((size_t) (offset))))
 
 #define container_of(ptr, type, name) \
-	(type *)((uintptr_t)(ptr) - (uintptr_t)offsetof(type, name) + \
+	(type *)((char *)(ptr) - offsetof(type, name) + \
 		 COMPILE_ERROR_IF_TYPES_NOT_COMPATIBLE(ptr, &((type *) 0)->name))
 
 /* Don't use simply MIN/MAX, as they're often defined elsewhere in include
@@ -41,19 +41,10 @@
 #define POINTER_CAST(i) \
 	((void *) (((uintptr_t)NULL) + (i)))
 #define POINTER_CAST_TO(p, type) \
-	((type) ((const char *) (p) - (const char *) NULL))
+	((type)(uintptr_t)(p))
 
-/* Define VA_COPY() to do the right thing for copying va_list variables.
-   config.h may have already defined VA_COPY as va_copy or __va_copy. */
 #ifndef VA_COPY
-#  if defined (__GNUC__) && defined (__PPC__) && \
-      (defined (_CALL_SYSV) || defined (_WIN32))
-#    define VA_COPY(ap1, ap2) (*(ap1) = *(ap2))
-#  elif defined (VA_COPY_AS_ARRAY)
-#    define VA_COPY(ap1, ap2) memmove ((ap1), (ap2), sizeof (va_list))
-#  else /* va_list is a pointer */
-#    define VA_COPY(ap1, ap2) ((ap1) = (ap2))
-#  endif /* va_list is a pointer */
+   #error "VA_COPY not defined"
 #endif
 
 /* Provide convenience macros for handling structure
@@ -141,7 +132,40 @@
 #  define ATTR_DEPRECATED(str)
 #endif
 
-/* Macros to provide type safety for callback functions' context parameters */
+/* Macros to provide type safety for callback functions' context parameters.
+   This is used like:
+
+   // safe-api.h file:
+   typedef void safe_callback_t(struct foo *foo);
+
+   void safe_run(safe_callback_t *callback, void *context);
+   #define safe_run(callback, context) \
+       safe_run((safe_callback_t *)callback, \
+       TRUE ? context : CALLBACK_TYPECHECK(callback, void (*)(typeof(context))))
+
+   // safe-api.c file:
+   #undef safe_run
+   void safe_run(safe_callback_t *callback, void *context)
+   {
+       callback(context);
+   }
+
+   // in caller code:
+   static void callback(struct foo *foo);
+   struct foo *foo = ...;
+   safe_run(callback, foo);
+
+   The first step is to create the callback function in a normal way. Type
+   safety is added to it by creating a macro that overrides the function and
+   checks the callback type safety using CALLBACK_TYPECHECK().
+
+   The CALLBACK_TYPECHECK() macro works by giving a compiling failure if the
+   provided callback function isn't compatible with the specified function
+   type parameter. The function type parameter must use typeof(context) in
+   place of the "void *context" parameter, but otherwise use exactly the same
+   function type as what the callback is. The macro then casts the given
+   callback function into the type with "void *context".
+*/
 #ifdef HAVE_TYPE_CHECKS
 #  define CALLBACK_TYPECHECK(callback, type) \
 	(COMPILE_ERROR_IF_TRUE(!__builtin_types_compatible_p( \
@@ -150,7 +174,8 @@
 #  define CALLBACK_TYPECHECK(callback, type) 0
 #endif
 
-#if (__GNUC__ > 3 || (__GNUC__ == 3 && __GNUC_MINOR__ > 0)) && !defined(__cplusplus)
+#if (__GNUC__ > 3 || (__GNUC__ == 3 && __GNUC_MINOR__ > 0)) && \
+	!defined(__cplusplus) && !defined(STATIC_CHECKER)
 #  define COMPILE_ERROR_IF_TRUE(condition) \
 	(sizeof(char[1 - 2 * ((condition) ? 1 : 0)]) > 0 ? FALSE : FALSE)
 #else
@@ -191,31 +216,20 @@
 #ifdef DISABLE_ASSERTS
 #  define i_assert(expr)
 #else
-
-#define i_assert(expr)			STMT_START{			\
+#  define i_assert(expr)			STMT_START{			\
      if (unlikely(!(expr)))						\
        i_panic("file %s: line %d (%s): assertion failed: (%s)",		\
 		__FILE__,						\
 		__LINE__,						\
 		__func__,					\
 		#expr);			}STMT_END
-
 #endif
 
-#ifndef STATIC_CHECKER
-#  define i_unreached() \
-	i_panic("file %s: line %d: unreached", __FILE__, __LINE__)
-#else
-#  define i_unreached() __builtin_unreachable()
-#endif
-
-/* Convenience macros to test the versions of dovecot. */
-#if defined DOVECOT_VERSION_MAJOR && defined DOVECOT_VERSION_MINOR
-#  define DOVECOT_PREREQ(maj, min) \
-          ((DOVECOT_VERSION_MAJOR << 16) + DOVECOT_VERSION_MINOR >= ((maj) << 16) + (min))
-#else
-#  define DOVECOT_PREREQ(maj, min) 0
-#endif
+/* Convenience macro to test the versions of dovecot. */
+#define DOVECOT_PREREQ(maj, min, micro) \
+	((DOVECOT_VERSION_MAJOR << 24) + \
+	 (DOVECOT_VERSION_MINOR << 16) + \
+	 DOVECOT_VERSION_MICRO >= ((maj) << 24) + ((min) << 16) + (micro))
 
 #ifdef __cplusplus
 #  undef STATIC_ARRAY
@@ -240,8 +254,6 @@
 	 ST_MTIME_NSEC(st_a) != ST_MTIME_NSEC(st_b) || \
 	 (st_a).st_size != (st_b).st_size || \
 	 (st_a).st_ino != (st_b).st_ino)
-
-#endif
 
 #ifdef HAVE_UNDEFINED_SANITIZER
 # define ATTR_NO_SANITIZE(x) __attribute__((no_sanitize((x))))
@@ -270,5 +282,13 @@
 #endif
 
 /* negate enumeration flags in a way that avoids implicit conversion */
-#define ENUM_NEGATE(x) \
+#ifndef STATIC_CHECKER
+#  define ENUM_NEGATE(x) \
 	((unsigned int)(~(x)) + COMPILE_ERROR_IF_TRUE(sizeof((x)) > sizeof(int) || (x) < 0 || (x) > INT_MAX))
+#else
+/* clang scan-build keeps complaining about x > 2147483647 case, so disable the
+   sizeof check. */
+#  define ENUM_NEGATE(x) ((unsigned int)(~(x)))
+#endif
+
+#endif

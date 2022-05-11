@@ -167,7 +167,10 @@ void sql_unref(struct sql_db **_db)
 
 enum sql_db_flags sql_get_flags(struct sql_db *db)
 {
-	return db->flags;
+	if (db->v.get_flags != NULL)
+		return db->v.get_flags(db);
+	else
+		return db->flags;
 }
 
 int sql_connect(struct sql_db *db)
@@ -418,6 +421,16 @@ void sql_statement_bind_int64(struct sql_statement *stmt,
 
 	if (stmt->db->v.statement_bind_int64 != NULL)
 		stmt->db->v.statement_bind_int64(stmt, column_idx, value);
+}
+
+void sql_statement_bind_double(struct sql_statement *stmt,
+			       unsigned int column_idx, double value)
+{
+	const char *value_str = p_strdup_printf(stmt->pool, "%f", value);
+	array_idx_set(&stmt->args, column_idx, &value_str);
+
+	if (stmt->db->v.statement_bind_double != NULL)
+		stmt->db->v.statement_bind_double(stmt, column_idx, value);
 }
 
 #undef sql_statement_query
@@ -810,6 +823,13 @@ struct event_passthrough *sql_transaction_finished_event(struct sql_transaction_
 	return event_create_passthrough(ctx->event)->
 		set_name(SQL_TRANSACTION_FINISHED);
 }
+
+void sql_wait(struct sql_db *db)
+{
+	if (db->v.wait != NULL)
+		db->v.wait(db);
+}
+
 
 struct sql_result sql_not_connected_result = {
 	.v = {

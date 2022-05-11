@@ -35,12 +35,8 @@ http_server_location_add(struct http_server *server, pool_t pool,
 	loc = &qloc;
 
 	if (array_bsearch_insert_pos(&server->locations, &loc,
-				     http_server_location_cmp, &insert_idx)) {
-		struct http_server_location *const *loc_p;
-
-		loc_p = array_idx(&server->locations, insert_idx);
-		return *loc_p;
-	}
+				     http_server_location_cmp, &insert_idx))
+		return array_idx_elem(&server->locations, insert_idx);
 
 	loc = p_new(pool, struct http_server_location, 1);
 	loc->path = p_strdup(pool, path);
@@ -54,8 +50,7 @@ http_server_location_find(struct http_server *server, const char *path,
 			  const char **sub_path_r)
 {
 	struct http_server_location qloc, *loc;
-	struct http_server_location *const *loc_p;
-	size_t loc_len;
+	const char *loc_suffix;
 	unsigned int insert_idx;
 
 	*sub_path_r = NULL;
@@ -68,28 +63,25 @@ http_server_location_find(struct http_server *server, const char *path,
 	if (array_bsearch_insert_pos(&server->locations, &loc,
 				     http_server_location_cmp, &insert_idx)) {
 		/* Exact match */
-		loc_p = array_idx(&server->locations, insert_idx);
+		*loc_r = array_idx_elem(&server->locations, insert_idx);
 		*sub_path_r = "";
-		*loc_r = *loc_p;
 		return 1;
 	}
 	if (insert_idx == 0) {
 		/* Not found at all */
 		return -1;
 	}
-	loc_p = array_idx(&server->locations, insert_idx-1);
-	loc = *loc_p;
+	loc = array_idx_elem(&server->locations, insert_idx-1);
 
-	loc_len = strlen(loc->path);
-	if (!str_begins(path, loc->path)) {
+	if (!str_begins(path, loc->path, &loc_suffix)) {
 		/* Location isn't a prefix of path */
 		return -1;
-	} else if (path[loc_len] != '/') {
+	} else if (loc_suffix[0] != '/') {
 		/* Match doesn't end at '/' */
 		return -1;
 	}
 
-	*sub_path_r = &path[loc_len + 1];
+	*sub_path_r = loc_suffix + 1;
 	*loc_r = loc;
 	return 0;
 }
@@ -141,7 +133,6 @@ http_server_resource_create(struct http_server *server, pool_t pool,
 
 	pool_ref(pool);
 
-	pool = pool_alloconly_create("http server resource", 1024);
 	res = p_new(pool, struct http_server_resource, 1);
 	res->pool = pool;
 	res->server = server;
@@ -163,7 +154,7 @@ http_server_resource_create(struct http_server *server, pool_t pool,
 void http_server_resource_free(struct http_server_resource **_res)
 {
 	struct http_server_resource *res = *_res;
-	struct http_server_location *const *locp;
+	struct http_server_location *loc;
 
 	if (res == NULL)
 		return;
@@ -177,8 +168,8 @@ void http_server_resource_free(struct http_server_resource **_res)
 		res->destroy_callback = NULL;
 	}
 
-	array_foreach(&res->locations, locp)
-		http_server_location_remove(res->server, *locp);
+	array_foreach_elem(&res->locations, loc)
+		http_server_location_remove(res->server, loc);
 
 	event_unref(&res->event);
 	pool_unref(&res->pool);

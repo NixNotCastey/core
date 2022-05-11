@@ -215,7 +215,7 @@ static int ssl_ctx_use_certificate_chain(SSL_CTX *ctx, const char *cert)
 		X509 *ca;
 		int r;
 		unsigned long err;
-		
+
 		while ((ca = PEM_read_bio_X509(in,NULL,NULL,NULL)) != NULL) {
 #ifdef HAVE_SSL_CTX_ADD0_CHAIN_CERT
 			r = SSL_CTX_add0_chain_cert(ctx, ca);
@@ -232,7 +232,7 @@ static int ssl_ctx_use_certificate_chain(SSL_CTX *ctx, const char *cert)
 		err = ERR_peek_last_error();
 		if (ERR_GET_LIB(err) == ERR_LIB_PEM && ERR_GET_REASON(err) == PEM_R_NO_START_LINE)
 			ERR_clear_error();
-		else 
+		else
 			ret = 0; /* some real error */
 		}
 
@@ -573,9 +573,7 @@ ssl_proxy_ctx_set_crypto_params(SSL_CTX *ssl_ctx,
 	   bool in OpenSSL 1.1 and is int in OpenSSL 1.0.2+ */
 	if ((long)(SSL_CTX_set_ecdh_auto(ssl_ctx, 1)) == 0) {
 		/* shouldn't happen */
-		*error_r = t_strdup_printf("SSL_CTX_set_ecdh_auto() failed: %s",
-					   openssl_iostream_error());
-		return -1;
+		i_unreached();
 	}
 #else
 	/* For OpenSSL < 1.0.2, ECDH temporary key parameter selection must be

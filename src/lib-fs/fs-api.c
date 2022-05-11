@@ -41,8 +41,7 @@ fs_alloc(const struct fs *fs_class, const char *args,
 	 const struct fs_settings *set, struct fs **fs_r, const char **error_r)
 {
 	struct fs *fs;
-	const char *temp_error;
-	char *error = NULL;
+	const char *error;
 	int ret;
 
 	fs = fs_class->v.alloc();
@@ -54,15 +53,13 @@ fs_alloc(const struct fs *fs_class, const char *args,
 	event_set_forced_debug(fs->event, fs->set.debug);
 
 	T_BEGIN {
-		if ((ret = fs_class->v.init(fs, args, set, &temp_error)) < 0)
-			error = i_strdup(temp_error);
-	} T_END;
+		ret = fs_class->v.init(fs, args, set, &error);
+	} T_END_PASS_STR_IF(ret < 0, &error);
 	if (ret < 0) {
 		/* a bit kludgy way to allow data stack frame usage in normal
 		   conditions but still be able to return error message from
 		   data stack. */
 		*error_r = t_strdup_printf("%s: %s", fs_class->name, error);
-		i_free(error);
 		fs_unref(&fs);
 		return -1;
 	}
@@ -99,14 +96,14 @@ static void fs_classes_init(void)
 
 static const struct fs *fs_class_find(const char *driver)
 {
-	const struct fs *const *classp;
+	const struct fs *class;
 
 	if (!array_is_created(&fs_classes))
 		fs_classes_init();
 
-	array_foreach(&fs_classes, classp) {
-		if (strcmp((*classp)->name, driver) == 0)
-			return *classp;
+	array_foreach_elem(&fs_classes, class) {
+		if (strcmp(class->name, driver) == 0)
+			return class;
 	}
 	return NULL;
 }
@@ -1098,9 +1095,9 @@ int fs_get_nlinks(struct fs_file *file, nlink_t *nlinks_r)
 int fs_default_copy(struct fs_file *src, struct fs_file *dest)
 {
 	int tmp_errno;
-	/* we're going to be counting this as read+write, so remove the
-	   copy_count we just added */
-	dest->fs->stats.copy_count--;
+	/* we're going to be counting this as read+write, so don't update
+	   copy_count */
+	dest->copy_counted = TRUE;
 
 	if (dest->copy_src != NULL) {
 		i_assert(src == NULL || src == dest->copy_src);
@@ -1166,7 +1163,10 @@ int fs_copy(struct fs_file *src, struct fs_file *dest)
 	} T_END;
 	if (!(ret < 0 && errno == EAGAIN)) {
 		fs_file_timing_end(dest, FS_OP_COPY);
-		dest->fs->stats.copy_count++;
+		if (dest->copy_counted)
+			dest->copy_counted = FALSE;
+		else
+			dest->fs->stats.copy_count++;
 		dest->metadata_changed = FALSE;
 	}
 	return ret;
@@ -1181,7 +1181,10 @@ int fs_copy_finish_async(struct fs_file *dest)
 	} T_END;
 	if (!(ret < 0 && errno == EAGAIN)) {
 		fs_file_timing_end(dest, FS_OP_COPY);
-		dest->fs->stats.copy_count++;
+		if (dest->copy_counted)
+			dest->copy_counted = FALSE;
+		else
+			dest->fs->stats.copy_count++;
 		dest->metadata_changed = FALSE;
 	}
 	return ret;

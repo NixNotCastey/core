@@ -10,10 +10,6 @@
 
 #include <stdio.h>
 
-#define MAIL_INDEX_MIN_UPDATE_SIZE 1024
-/* if we're updating >= count-n messages, recreate the index */
-#define MAIL_INDEX_MAX_OVERWRITE_NEG_SEQ_COUNT 10
-
 static int mail_index_create_backup(struct mail_index *index)
 {
 	const char *backup_path, *tmp_backup_path;
@@ -78,19 +74,25 @@ static int mail_index_recreate(struct mail_index *index)
 	output = o_stream_create_fd_file(fd, 0, FALSE);
 	o_stream_cork(output);
 
-	base_size = I_MIN(map->hdr.base_header_size, sizeof(map->hdr));
-	o_stream_nsend(output, &map->hdr, base_size);
-	o_stream_nsend(output, CONST_PTR_OFFSET(map->hdr_base, base_size),
-		       map->hdr.header_size - base_size);
+	struct mail_index_header hdr = map->hdr;
+	/* Write tail_offset the same as head_offset. This function must not
+	   be called unless it's safe to do this. See the explanations in
+	   mail_index_sync_commit(). */
+	hdr.log_file_tail_offset = hdr.log_file_head_offset;
+
+	base_size = I_MIN(hdr.base_header_size, sizeof(hdr));
+	o_stream_nsend(output, &hdr, base_size);
+	o_stream_nsend(output, MAIL_INDEX_MAP_HDR_OFFSET(map, base_size),
+		       hdr.header_size - base_size);
 	o_stream_nsend(output, map->rec_map->records,
-		       map->rec_map->records_count * map->hdr.record_size);
+		       map->rec_map->records_count * hdr.record_size);
 	if (o_stream_finish(output) < 0) {
 		mail_index_file_set_syscall_error(index, path, "write()");
 		ret = -1;
 	}
 	o_stream_destroy(&output);
 
-	if (ret == 0 && index->fsync_mode != FSYNC_MODE_NEVER) {
+	if (ret == 0 && index->set.fsync_mode != FSYNC_MODE_NEVER) {
 		if (fdatasync(fd) < 0) {
 			mail_index_file_set_syscall_error(index, path,
 							  "fdatasync()");
@@ -184,7 +186,7 @@ void mail_index_write(struct mail_index *index, bool want_rotate,
 			/* Assume .log.2 was created successfully. If it
 			   wasn't, it just causes an extra stat() and gets
 			   fixed later on. */
-			hdr->log2_rotate_time = ioloop_time;
+			hdr->log2_rotate_time = ioloop_time32;
 			rotated = TRUE;
 		}
 	}
@@ -204,6 +206,6 @@ void mail_index_write(struct mail_index *index, bool want_rotate,
 			index->filepath, hdr->log_file_seq, reason);
 	}
 
-	index->last_read_log_file_seq = hdr->log_file_seq;
-	index->last_read_log_file_tail_offset = hdr->log_file_tail_offset;
+	index->main_index_hdr_log_file_seq = hdr->log_file_seq;
+	index->main_index_hdr_log_file_tail_offset = hdr->log_file_tail_offset;
 }

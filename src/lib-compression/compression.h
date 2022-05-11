@@ -7,17 +7,19 @@ enum istream_decompress_flags {
 	ISTREAM_DECOMPRESS_FLAG_TRY = BIT(0),
 };
 
-/* Compressed input is always detected once at maximum this many bytes have
-   been read. This value must be smaller than a typical istream max buffer
-   size. */
-#define COMPRESSION_HDR_MAX_SIZE 128
-
 struct compression_handler {
 	const char *name;
 	const char *ext;
 	bool (*is_compressed)(struct istream *input);
 	struct istream *(*create_istream)(struct istream *input);
 	struct ostream *(*create_ostream)(struct ostream *output, int level);
+	/* returns minimum level */
+	int (*get_min_level)(void);
+	/* the default can be -1 (e.g. gz), so the return value of this has to
+	   be used as-is. */
+	int (*get_default_level)(void);
+	/* returns maximum level */
+	int (*get_max_level)(void);
 };
 
 extern const struct compression_handler compression_handlers[];

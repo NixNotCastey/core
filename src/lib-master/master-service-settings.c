@@ -46,6 +46,7 @@ static const struct setting_define master_service_setting_defines[] = {
 	DEF(STR, log_timestamp),
 	DEF(STR, log_debug),
 	DEF(STR, log_core_filter),
+	DEF(STR, process_shutdown_filter),
 	DEF(STR, syslog_facility),
 	DEF(STR, import_environment),
 	DEF(STR, stats_writer_socket_path),
@@ -83,6 +84,7 @@ static const struct master_service_settings master_service_default_settings = {
 	.log_timestamp = DEFAULT_FAILURE_STAMP_FORMAT,
 	.log_debug = "",
 	.log_core_filter = "",
+	.process_shutdown_filter = "",
 	.syslog_facility = "mail",
 	.import_environment = "TZ CORE_OUTOFMEM CORE_ERROR" ENV_SYSTEMD ENV_GDB,
 	.stats_writer_socket_path = "stats-writer",
@@ -109,23 +111,33 @@ const struct setting_parser_info master_service_setting_parser_info = {
 
 /* <settings checks> */
 static bool
-log_filter_parse(const char *set_name, const char *set_value,
-		 struct event_filter **filter_r, const char **error_r)
+setting_filter_parse(const char *set_name, const char *set_value,
+		     void (*handle_filter)(struct event_filter *) ATTR_UNUSED,
+		     const char **error_r)
 {
+	struct event_filter *filter;
 	const char *error;
 
-	if (set_value[0] == '\0') {
-		*filter_r = NULL;
+	if (set_value[0] == '\0')
 		return TRUE;
-	}
 
-	*filter_r = event_filter_create();
-	if (event_filter_parse(set_value, *filter_r, &error) < 0) {
+	filter = event_filter_create();
+	if (event_filter_parse(set_value, filter, &error) < 0) {
 		*error_r = t_strdup_printf("Invalid %s: %s", set_name, error);
-		event_filter_unref(filter_r);
+		event_filter_unref(&filter);
 		return FALSE;
 	}
+#ifndef CONFIG_BINARY
+	handle_filter(filter);
+#endif
+	event_filter_unref(&filter);
 	return TRUE;
+}
+
+static void
+master_service_set_process_shutdown_filter_wrapper(struct event_filter *filter)
+{
+	master_service_set_process_shutdown_filter(master_service, filter);
 }
 
 static bool
@@ -145,36 +157,33 @@ master_service_settings_check(void *_set, pool_t pool ATTR_UNUSED,
 		return FALSE;
 	}
 
-	struct event_filter *filter;
-	if (!log_filter_parse("log_debug", set->log_debug, &filter, error_r))
+	if (!setting_filter_parse("log_debug", set->log_debug,
+				  event_set_global_debug_log_filter, error_r))
 		return FALSE;
-	if (filter != NULL) {
-#ifndef CONFIG_BINARY
-		event_set_global_debug_log_filter(filter);
-#endif
-		event_filter_unref(&filter);
-	}
-
-	if (!log_filter_parse("log_core_filter", set->log_core_filter,
-			      &filter, error_r))
+	if (!setting_filter_parse("log_core_filter", set->log_core_filter,
+				  event_set_global_core_log_filter, error_r))
 		return FALSE;
-	if (filter != NULL) {
-#ifndef CONFIG_BINARY
-		event_set_global_core_log_filter(filter);
-#endif
-		event_filter_unref(&filter);
-	}
+	if (!setting_filter_parse("process_shutdown_filter",
+				  set->process_shutdown_filter,
+				  master_service_set_process_shutdown_filter_wrapper,
+				  error_r))
+		return FALSE;
 	return TRUE;
 }
 /* </settings checks> */
+
+static void strarr_push(ARRAY_TYPE(const_string) *argv, const char *str)
+{
+	array_push_back(argv, &str);
+}
 
 static void ATTR_NORETURN
 master_service_exec_config(struct master_service *service,
 			   const struct master_service_settings_input *input)
 {
-	const char **conf_argv, *binary_path = service->argv[0];
+	ARRAY_TYPE(const_string) conf_argv;
+	const char *binary_path = service->argv[0];
 	const char *error = NULL;
-	unsigned int i, argv_max_count;
 
 	if (!t_binary_abspath(&binary_path, &error)) {
 		i_fatal("t_binary_abspath(%s) failed: %s", binary_path, error);
@@ -191,44 +200,52 @@ master_service_exec_config(struct master_service *service,
 		/* doveconf empties the environment before exec()ing us back
 		   if DOVECOT_PRESERVE_ENVS is set, so make sure it is. */
 		if (getenv(DOVECOT_PRESERVE_ENVS_ENV) == NULL)
-			env_put(DOVECOT_PRESERVE_ENVS_ENV"=");
+			env_put(DOVECOT_PRESERVE_ENVS_ENV, "");
 	} else {
 		/* make sure doveconf doesn't remove any environment */
 		env_remove(DOVECOT_PRESERVE_ENVS_ENV);
 	}
 	if (input->use_sysexits)
-		env_put("USE_SYSEXITS=1");
+		env_put("USE_SYSEXITS", "1");
 
-	/* @UNSAFE */
-	i = 0;
-	argv_max_count = 11 + (service->argc + 1) + 1;
-	conf_argv = t_new(const char *, argv_max_count);
-	conf_argv[i++] = DOVECOT_CONFIG_BIN_PATH;
+	t_array_init(&conf_argv, 11 + (service->argc + 1) + 1);
+	strarr_push(&conf_argv, DOVECOT_CONFIG_BIN_PATH);
 	if (input->service != NULL) {
-		conf_argv[i++] = "-f";
-		conf_argv[i++] = t_strconcat("service=", input->service, NULL);
+		strarr_push(&conf_argv, "-f");
+		strarr_push(&conf_argv,
+			    t_strconcat("service=", input->service, NULL));
 	}
-	conf_argv[i++] = "-c";
-	conf_argv[i++] = service->config_path;
+	strarr_push(&conf_argv, "-c");
+	strarr_push(&conf_argv, service->config_path);
 	if (input->module != NULL) {
-		conf_argv[i++] = "-m";
-		conf_argv[i++] = input->module;
-		if (service->want_ssl_settings) {
-			conf_argv[i++] = "-m";
-			conf_argv[i++] = "ssl";
+		strarr_push(&conf_argv, "-m");
+		strarr_push(&conf_argv, input->module);
+	}
+	if (input->extra_modules != NULL) {
+		for (unsigned int i = 0; input->extra_modules[i] != NULL; i++) {
+			strarr_push(&conf_argv, "-m");
+			strarr_push(&conf_argv, input->extra_modules[i]);
 		}
 	}
+	if ((service->flags & MASTER_SERVICE_FLAG_DISABLE_SSL_SET) == 0 &&
+	    (input->module != NULL || input->extra_modules != NULL)) {
+		strarr_push(&conf_argv, "-m");
+		if (service->want_ssl_server)
+			strarr_push(&conf_argv, "ssl-server");
+		else
+			strarr_push(&conf_argv, "ssl");
+	}
 	if (input->parse_full_config)
-		conf_argv[i++] = "-p";
+		strarr_push(&conf_argv, "-p");
 
-	conf_argv[i++] = "-e";
-	conf_argv[i++] = binary_path;
-	memcpy(conf_argv+i, service->argv + 1,
-	       (service->argc) * sizeof(conf_argv[0]));
-	i += service->argc;
+	strarr_push(&conf_argv, "-e");
+	strarr_push(&conf_argv, binary_path);
+	array_append(&conf_argv, (const char *const *)service->argv + 1,
+		     service->argc);
+	array_append_zero(&conf_argv);
 
-	i_assert(i < argv_max_count);
-	execv_const(conf_argv[0], conf_argv);
+	const char *const *argv = array_front(&conf_argv);
+	execv_const(argv[0], argv);
 }
 
 static void
@@ -341,11 +358,19 @@ config_build_request(struct master_service *service, string_t *str,
 		     const struct master_service_settings_input *input)
 {
 	str_append(str, "REQ");
-	if (input->module != NULL) {
+	if (input->module != NULL)
 		str_printfa(str, "\tmodule=%s", input->module);
-		if (service->want_ssl_settings)
-			str_append(str, "\tmodule=ssl");
+	if (input->extra_modules != NULL) {
+		for (unsigned int i = 0; input->extra_modules[i] != NULL; i++)
+			str_printfa(str, "\tmodule=%s", input->extra_modules[i]);
 	}
+	if ((service->flags & MASTER_SERVICE_FLAG_DISABLE_SSL_SET) == 0 &&
+	    (input->module != NULL || input->extra_modules != NULL)) {
+		str_printfa(str, "\tmodule=%s",
+			    service->want_ssl_server ? "ssl-server" : "ssl");
+	}
+	if (input->no_ssl_ca)
+		str_append(str, "\texclude=ssl_ca\texclude=ssl_verify_client_cert");
 	if (input->service != NULL)
 		str_printfa(str, "\tservice=%s", input->service);
 	if (input->username != NULL)
@@ -440,7 +465,7 @@ config_read_reply_header(struct istream *istream, const char *path, pool_t pool,
 	}
 
 	T_BEGIN {
-		const char *const *arg = t_strsplit_tabescaped(line);
+		const char *value, *const *arg = t_strsplit_tabescaped(line);
 		ARRAY_TYPE(const_string) services;
 
 		p_array_init(&services, pool, 8);
@@ -453,8 +478,8 @@ config_read_reply_header(struct istream *istream, const char *path, pool_t pool,
 				output_r->used_local = TRUE;
 			else if (strcmp(*arg, "used-remote") == 0)
 				output_r->used_remote = TRUE;
-			else if (str_begins(*arg, "service=")) {
-				const char *name = p_strdup(pool, *arg + 8);
+			else if (str_begins(*arg, "service=", &value)) {
+				const char *name = p_strdup(pool, value);
 				array_push_back(&services, &name);
 			 }
 		}
@@ -524,8 +549,8 @@ int master_service_settings_get_filters(struct master_service *service,
 		while((line = i_stream_read_next_line(is)) != NULL) {
 			if (*line == '\0')
 				break;
-			if (str_begins(line, "FILTER\t")) {
-				line = t_strdup(line+7);
+			if (str_begins(line, "FILTER\t", &line)) {
+				line = t_strdup(line);
 				array_push_back(&filters_tmp, &line);
 			}
 		}
@@ -592,8 +617,10 @@ int master_service_settings_read(struct master_service *service,
 	p_array_init(&all_roots, service->set_pool, 8);
 	tmp_root = &master_service_setting_parser_info;
 	array_push_back(&all_roots, &tmp_root);
-	if (service->want_ssl_settings) {
-		tmp_root = &master_service_ssl_setting_parser_info;
+	tmp_root = &master_service_ssl_setting_parser_info;
+	array_push_back(&all_roots, &tmp_root);
+	if (service->want_ssl_server) {
+		tmp_root = &master_service_ssl_server_setting_parser_info;
 		array_push_back(&all_roots, &tmp_root);
 	}
 	if (input->roots != NULL) {
@@ -742,8 +769,8 @@ void **master_service_settings_get_others(struct master_service *service)
 void **master_service_settings_parser_get_others(struct master_service *service,
 						 const struct setting_parser_context *set_parser)
 {
-	return settings_parser_get_list(set_parser) + 1 +
-		(service->want_ssl_settings ? 1 : 0);
+	return settings_parser_get_list(set_parser) + 2 +
+		(service->want_ssl_server ? 1 : 0);
 }
 
 struct setting_parser_context *
@@ -760,7 +787,7 @@ int master_service_set(struct master_service *service, const char *line)
 bool master_service_set_has_config_override(struct master_service *service,
 					    const char *key)
 {
-	const char *const *override, *key_root;
+	const char *override, *key_root;
 	bool ret;
 
 	if (!array_is_created(&service->config_overrides))
@@ -770,11 +797,11 @@ bool master_service_set_has_config_override(struct master_service *service,
 	if (key_root == NULL)
 		key_root = key;
 
-	array_foreach(&service->config_overrides, override) {
+	array_foreach_elem(&service->config_overrides, override) {
 		T_BEGIN {
 			const char *okey, *okey_root;
 
-			okey = t_strcut(*override, '=');
+			okey = t_strcut(override, '=');
 			okey_root = settings_parse_unalias(service->set_parser,
 							   okey);
 			if (okey_root == NULL)

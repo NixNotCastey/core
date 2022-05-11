@@ -62,12 +62,12 @@ static luaL_Reg lua_storage_methods[] = {
 void dlua_register_mail_storage(struct dlua_script *script)
 {
 	/* get dlua_dovecot */
-	dlua_getdovecot(script->L);
+	dlua_get_dovecot(script->L);
 
 	/* Create table for holding values */
 	lua_newtable(script->L);
 
-	dlua_setmembers(script->L, lua_storage_mail_storage_flags, -1);
+	dlua_set_members(script->L, lua_storage_mail_storage_flags, -1);
 
 	/* push new metatable to stack */
 	luaL_newmetatable(script->L, LUA_SCRIPT_STORAGE);
@@ -85,4 +85,7 @@ void dlua_register_mail_storage(struct dlua_script *script)
 	lua_storage_mail_user_register(script);
 	lua_storage_mailbox_register(script);
 	lua_storage_mail_register(script);
+
+	/* pop dlua_dovecot from stack */
+	lua_pop(script->L, 1);
 }

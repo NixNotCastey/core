@@ -117,7 +117,7 @@ mailbox_internal_attribute_get_int(enum mail_attribute_type type_flags,
 		return NULL;
 	}
 	iattr = array_idx(&mailbox_internal_attributes, insert_idx-1);
-	if (!str_begins(key, iattr->key)) {
+	if (!str_begins_with(key, iattr->key)) {
 		/* iattr isn't a prefix of key */
 		return NULL;
 	} else if ((iattr->flags & MAIL_ATTRIBUTE_INTERNAL_FLAG_CHILDREN) != 0) {
@@ -155,8 +155,7 @@ mailbox_internal_attributes_add_prefixes(ARRAY_TYPE(const_string) *attrs,
 		return;
 	new_count = array_count(attrs);
 	for (unsigned int i = old_count; i < new_count; i++) {
-		const char *const *old_keyp = array_idx(attrs, i);
-		const char *old_key = *old_keyp;
+		const char *old_key = array_idx_elem(attrs, i);
 		const char *prefixed_key;
 
 		if (old_key[0] == '\0')
@@ -198,9 +197,10 @@ mailbox_internal_attributes_get(struct mailbox *box,
 	regs = array_get(&mailbox_internal_attributes, &count);
 	for (j = i; j > 0; j--) {
 		const struct mailbox_attribute_internal *attr = &regs[j-1];
+		const char *suffix;
 
 		if ((attr->flags & MAIL_ATTRIBUTE_INTERNAL_FLAG_CHILDREN) == 0 ||
-		    !str_begins(bare_prefix, attr->key))
+		    !str_begins(bare_prefix, attr->key, &suffix))
 			break;
 
 		/* For example: bare_prefix="foo/bar" and attr->key="foo/", so
@@ -208,8 +208,7 @@ mailbox_internal_attributes_get(struct mailbox *box,
 		   attrs: { "", "baz" }, which means with the full prefix:
 		   { "foo/bar", "foo/bar/baz" } */
 		if (attr->iter != NULL &&
-		    attr->iter(box, bare_prefix + strlen(attr->key),
-			       attr_pool, attrs) < 0)
+		    attr->iter(box, suffix, attr_pool, attrs) < 0)
 			ret = -1;
 	}
 
@@ -274,7 +273,7 @@ mailbox_attribute_set_common(struct mailbox_transaction_context *t,
 
 	/* allow internal server attribute only for inbox */
 	if (iattr != NULL && !t->box->inbox_any &&
-	    str_begins(key, MAILBOX_ATTRIBUTE_PREFIX_DOVECOT_PVT_SERVER))
+	    str_begins_with(key, MAILBOX_ATTRIBUTE_PREFIX_DOVECOT_PVT_SERVER))
 		iattr = NULL;
 
 	/* handle internal attribute */
@@ -369,7 +368,7 @@ mailbox_attribute_get_common(struct mailbox *box,
 
 	/* allow internal server attributes only for the inbox */
 	if (iattr != NULL && !box->inbox_user &&
-	    str_begins(key, MAILBOX_ATTRIBUTE_PREFIX_DOVECOT_PVT_SERVER))
+	    str_begins_with(key, MAILBOX_ATTRIBUTE_PREFIX_DOVECOT_PVT_SERVER))
 		iattr = NULL;
 
 	/* internal attribute */

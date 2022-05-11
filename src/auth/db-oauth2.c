@@ -9,6 +9,7 @@
 #include "settings.h"
 #include "oauth2.h"
 #include "http-client.h"
+#include "http-url.h"
 #include "iostream-ssl.h"
 #include "auth-request.h"
 #include "auth-settings.h"
@@ -54,6 +55,12 @@ struct passdb_oauth2_settings {
 	const char *local_validation_key_dict;
 	/* valid token issuers */
 	const char *issuers;
+	/* The URL for a document following the OpenID Provider Configuration
+	   Information schema, see
+
+	   https://datatracker.ietf.org/doc/html/rfc7628#section-3.2.2
+	*/
+	const char *openid_configuration_url;
 
 	/* TLS options */
 	const char *tls_ca_cert_file;
@@ -122,6 +129,7 @@ static struct setting_def setting_defs[] = {
 	DEF_STR(client_id),
 	DEF_STR(client_secret),
 	DEF_STR(issuers),
+	DEF_STR(openid_configuration_url),
 	DEF_INT(timeout_msecs),
 	DEF_INT(max_idle_time_msecs),
 	DEF_INT(max_parallel_connections),
@@ -157,6 +165,7 @@ static struct passdb_oauth2_settings default_oauth2_settings = {
 	.client_id = "",
 	.client_secret = "",
 	.issuers = "",
+	.openid_configuration_url = "",
 	.pass_attrs = "",
 	.local_validation_key_dict = "",
 	.rawlog_dir = "",
@@ -285,9 +294,7 @@ struct db_oauth2 *db_oauth2_init(const char *config_path)
 
 	if (db->oauth2_set.introspection_mode == INTROSPECTION_MODE_LOCAL) {
 		struct dict_settings dict_set = {
-			.username = "",
 			.base_dir = global_auth_settings->base_dir,
-			.value_type = DICT_DATA_TYPE_STRING,
 			.event_parent = auth_event,
 		};
 		if (dict_init(db->set.local_validation_key_dict, &dict_set,
@@ -303,6 +310,16 @@ struct db_oauth2 *db_oauth2_init(const char *config_path)
 	if (*db->set.issuers != '\0')
 		db->oauth2_set.issuers = (const char *const *)
 			p_strsplit_spaces(pool, db->set.issuers, " ");
+
+	if (*db->set.openid_configuration_url != '\0') {
+		struct http_url *parsed_url ATTR_UNUSED;
+		if (http_url_parse(db->set.openid_configuration_url, NULL, 0,
+				   pool_datastack_create(), &parsed_url,
+				   &error) < 0) {
+			i_fatal("Invalid openid_configuration_url: %s",
+				error);
+		}
+	}
 
 	DLLIST_PREPEND(&db_oauth2_head, db);
 
@@ -342,6 +359,21 @@ void db_oauth2_unref(struct db_oauth2 **_db)
 	pool_unref(&db->pool);
 }
 
+static void
+db_oauth2_add_openid_config_url(struct db_oauth2_request *req)
+{
+	/* FIXME: HORRIBLE HACK - REMOVE ME!!!
+	   It is because the mech has not been implemented properly
+	   that we need to pass the config url in this strange way.
+
+	   This **must** be moved to mech-oauth2 once the validation
+	   result et al is handled there.
+	*/
+	req->auth_request->openid_config_url =
+		p_strdup_empty(req->auth_request->pool,
+			       req->db->set.openid_configuration_url);
+}
+
 static bool
 db_oauth2_have_all_fields(struct db_oauth2_request *req)
 {
@@ -357,13 +389,13 @@ db_oauth2_have_all_fields(struct db_oauth2_request *req)
 		while(ptr != NULL) {
 			ptr = strchr(ptr, '%');
 			if (ptr != NULL) {
-				const char *field;
+				const char *field, *suffix;
 				ptr++;
 				var_get_key_range(ptr, &idx, &size);
 				ptr = ptr+idx;
 				field = t_strndup(ptr,size);
-				if (str_begins(field, "oauth2:") &&
-				    !auth_fields_exists(req->fields, ptr+8))
+				if (str_begins(field, "oauth2:", &suffix) &&
+				    !auth_fields_exists(req->fields, suffix))
 					return FALSE;
 				ptr = ptr+size;
 			}
@@ -506,6 +538,9 @@ static void db_oauth2_callback(struct db_oauth2_request *req,
 	req->callback = NULL;
 
 	i_assert(result == PASSDB_RESULT_OK || error != NULL);
+
+	if (result != PASSDB_RESULT_OK)
+		db_oauth2_add_openid_config_url(req);
 
 	/* Successful lookups were logged by the caller. Failed lookups will be
 	   logged either with e_error() or e_info() by the callback. */

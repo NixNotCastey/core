@@ -41,6 +41,7 @@ void luaL_setmetatable(lua_State *L, const char *tname)
  * Lua 5.3 added lua_isinteger() which tells us whether or not the input is
  * an integer.  In Lua 5.1 and 5.2, we have to emulate it.
  */
+#undef lua_isinteger
 int lua_isinteger(lua_State *L, int idx)
 {
 	int isnum;
@@ -102,12 +103,9 @@ lua_Integer lua_tointegerx(lua_State *L, int idx, int *isnum_r)
 		/* convert using str_to_long() */
 		str = lua_tostring(L, idx);
 
-		if (strncasecmp(str, "0x", 2) == 0) {
+		if (str_begins_icase(str, "0x", &str)) {
 			/* hex */
 			uintmax_t tmp;
-
-			/* skip over leading 0x */
-			str += 2;
 
 			if (str_to_uintmax_hex(str, &tmp) < 0)
 				break;
@@ -143,5 +141,14 @@ lua_Integer lua_tointegerx(lua_State *L, int idx, int *isnum_r)
 	/* not an integer */
 	*isnum_r = 0;
 	return 0;
+}
+#endif
+
+#if LUA_VERSION_NUM > 501 && LUA_VERSION_NUM < 504
+#  undef lua_resume
+int lua_resume_compat(lua_State *L, lua_State *from, int nargs, int *nresults)
+{
+	*nresults = 1;
+	return lua_resume(L, from, nargs);
 }
 #endif

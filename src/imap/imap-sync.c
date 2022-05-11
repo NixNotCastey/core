@@ -216,6 +216,7 @@ imap_sync_send_highestmodseq(struct imap_sync_context *ctx,
 			     struct client_command_context *sync_cmd)
 {
 	struct client *client = ctx->client;
+	const char *suffix;
 	uint64_t send_modseq = 0;
 
 	if (ctx->sync_status.sync_delayed_expunges &&
@@ -237,12 +238,12 @@ imap_sync_send_highestmodseq(struct imap_sync_context *ctx,
 		/* no sending */
 	} else if (sync_cmd->sync != NULL && /* IDLE doesn't have ->sync */
 		   sync_cmd->sync->tagline != NULL && /* NOTIFY doesn't have tagline */
-		   str_begins(sync_cmd->sync->tagline, "OK ") &&
-		   sync_cmd->sync->tagline[3] != '[') {
+		   str_begins(sync_cmd->sync->tagline, "OK ", &suffix) &&
+		   suffix[0] != '[') {
 		/* modify the tagged reply directly */
 		sync_cmd->sync->tagline = p_strdup_printf(sync_cmd->pool,
 			"OK [HIGHESTMODSEQ %"PRIu64"] %s",
-			send_modseq, sync_cmd->sync->tagline + 3);
+			send_modseq, suffix);
 	} else {
 		/* send an untagged OK reply */
 		client_send_line(client, t_strdup_printf(
@@ -430,7 +431,7 @@ static void imap_sync_vanished(struct imap_sync_context *ctx)
 		start_uid = 0; prev_uid = 0;
 		for (seq = seqs[i].seq1; seq <= seqs[i].seq2; seq++) {
 			mail_set_seq(ctx->mail, seq);
-			if (prev_uid != ctx->mail->uid - 1) {
+			if (prev_uid == 0 || prev_uid + 1 != ctx->mail->uid) {
 				if (start_uid != 0) {
 					if (!comma)
 						comma = TRUE;

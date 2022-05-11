@@ -57,7 +57,7 @@ static int auth_request_lua_var_expand(lua_State *L)
 	const char *value, *error;
 
 	if (auth_request_lua_do_var_expand(req, tpl, &value, &error) < 0) {
-		return luaL_error(L, error);
+		return luaL_error(L, "%s", error);
 	} else {
 		lua_pushstring(L, value);
 	}
@@ -107,7 +107,7 @@ static int auth_request_lua_response_from_template(lua_State *L)
 		if (value == NULL) {
 			lua_pushnil(L);
 		} else if (auth_request_lua_do_var_expand(req, value, &expanded, &error) < 0) {
-			return luaL_error(L, error);
+			return luaL_error(L, "%s", error);
 		} else {
 			lua_pushstring(L, expanded);
 		}
@@ -120,11 +120,9 @@ static int auth_request_lua_response_from_template(lua_State *L)
 
 static int auth_request_lua_log_debug(lua_State *L)
 {
-	if (global_auth_settings->debug) {
-		struct auth_request *request = auth_lua_check_auth_request(L, 1);
-		const char *msg = luaL_checkstring(L, 2);
-		e_debug(authdb_event(request), "db-lua: %s", msg);
-	}
+	struct auth_request *request = auth_lua_check_auth_request(L, 1);
+	const char *msg = luaL_checkstring(L, 2);
+	e_debug(authdb_event(request), "db-lua: %s", msg);
 	return 0;
 }
 
@@ -228,6 +226,7 @@ static int auth_request_lua_event(lua_State *L)
 	struct event *event = event_create(authdb_event(request));
 
 	dlua_push_event(L, event);
+	event_unref(&event);
 	return 1;
 }
 
@@ -302,14 +301,14 @@ static void auth_lua_push_auth_request(lua_State *L, struct auth_request *req)
 	lua_pushboolean(L, req->fields.skip_password_check);
 	lua_setfield(L, -2, "skip_password_check");
 
-#undef LUA_TABLE_SETBOOL
-#define LUA_TABLE_SETBOOL(field) \
+#undef LUA_TABLE_SET_BOOL
+#define LUA_TABLE_SET_BOOL(field) \
 	lua_pushboolean(L, req->field); \
 	lua_setfield(L, -2, #field);
 
-	LUA_TABLE_SETBOOL(passdbs_seen_user_unknown);
-	LUA_TABLE_SETBOOL(passdbs_seen_internal_failure);
-	LUA_TABLE_SETBOOL(userdbs_seen_internal_failure);
+	LUA_TABLE_SET_BOOL(passdbs_seen_user_unknown);
+	LUA_TABLE_SET_BOOL(passdbs_seen_internal_failure);
+	LUA_TABLE_SET_BOOL(userdbs_seen_internal_failure);
 }
 
 static struct auth_request *
@@ -369,12 +368,12 @@ static luaL_Reg auth_lua_dovecot_auth_methods[] = {
 
 static void auth_lua_dovecot_auth_register(lua_State *L)
 {
-	dlua_getdovecot(L);
+	dlua_get_dovecot(L);
 	/* Create new table for holding values */
 	lua_newtable(L);
 
 	/* register constants */
-	dlua_setmembers(L, auth_lua_dovecot_auth_values, -1);
+	dlua_set_members(L, auth_lua_dovecot_auth_values, -1);
 
 	/* push new metatable to stack */
 	luaL_newmetatable(L, AUTH_LUA_DOVECOT_AUTH);
@@ -759,8 +758,8 @@ void auth_lua_userdb_iterate_next(struct userdb_iterate_context *ctx)
 		return;
 	}
 
-	const char *const *user = array_idx(&actx->users, actx->idx++);
-	ctx->callback(*user, ctx->context);
+	const char *user = array_idx_elem(&actx->users, actx->idx++);
+	ctx->callback(user, ctx->context);
 }
 
 int auth_lua_userdb_iterate_deinit(struct userdb_iterate_context *ctx)

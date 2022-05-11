@@ -367,7 +367,7 @@ static void rawlog_open(enum rawlog_flags flags)
 	io_loop_destroy(&ioloop);
 
 	lib_deinit();
-	exit(0);
+	lib_exit(0);
 }
 
 int main(int argc, char *argv[])
@@ -424,5 +424,4 @@ int main(int argc, char *argv[])
 	i_fatal_status(FATAL_EXEC, "execv(%s) failed: %m", executable);
 
 	/* not reached */
-	return FATAL_EXEC;
 }

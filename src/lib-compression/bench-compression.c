@@ -96,7 +96,7 @@ static void print_usage(const char *prog)
 {
 	fprintf(stderr, "Usage: %s block_size count level\n", prog);
 	fprintf(stderr, "Runs with 1000 8k blocks using level 6 if nothing given\n");
-	exit(1);
+	lib_exit(1);
 }
 
 int main(int argc, const char *argv[])
@@ -154,7 +154,8 @@ int main(int argc, const char *argv[])
 	printf("Input data constructed          \n");
 
 	for (unsigned int i = 0; compression_handlers[i].name != NULL; i++) T_BEGIN {
-		if (compression_handlers[i].create_istream != NULL) {
+		if (compression_handlers[i].create_istream != NULL &&
+		    compression_handlers[i].create_ostream != NULL) {
 			bench_compression_speed(&compression_handlers[i], level,
 						block_count);
 		}

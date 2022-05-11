@@ -20,13 +20,16 @@
 
 #include <time.h>
 
-static const char *get_field(const struct json_tree *tree, const char *key)
+static const char *get_field(const struct json_tree *tree, const char *key,
+			     enum json_type *type_r)
 {
 	const struct json_tree_node *root = json_tree_root(tree);
 	const struct json_tree_node *value_node = json_tree_find_key(root, key);
 	if (value_node == NULL || value_node->value_type == JSON_TYPE_OBJECT ||
 	    value_node->value_type == JSON_TYPE_ARRAY)
 		return NULL;
+	if (type_r != NULL)
+		*type_r = value_node->value_type;
 	return json_tree_get_value_str(value_node);
 }
 
@@ -34,11 +37,22 @@ static int get_time_field(const struct json_tree *tree, const char *key,
 			  int64_t *value_r)
 {
 	time_t tvalue;
-	const char *value = get_field(tree, key);
+	enum json_type value_type;
+	const char *value = get_field(tree, key, &value_type);
+
 	int tz_offset ATTR_UNUSED;
 	if (value == NULL)
 		return 0;
-	if (str_to_int64(value, value_r) == 0) {
+	if (value_type == JSON_TYPE_NUMBER) {
+		/* Parse with atof() to handle the json valid exponential formats,
+		   but discard the decimal part of the fields as we are not
+		   interested in them.
+
+		   The worst case of x.99999 would appear as almost a second older
+		   than the actual x which is same as saying we processed it a
+		   second later for the purpose of JWT tokens */
+		double v = atof(value);
+		*value_r = (int64_t) v;
 		if (*value_r < 0)
 			return -1;
 		return 1;
@@ -50,6 +64,34 @@ static int get_time_field(const struct json_tree *tree, const char *key,
 		return 1;
 	}
 	return -1;
+}
+
+/* Escapes '/' and '%' in identifier to %hex */
+static const char *escape_identifier(const char *identifier)
+{
+	size_t pos = strcspn(identifier, "/%");
+	/* nothing to escape */
+	if (identifier[pos] == '\0')
+		return identifier;
+
+	size_t len = strlen(identifier);
+	string_t *new_id = t_str_new(len);
+	str_append_data(new_id, identifier, pos);
+
+	for (size_t i = pos; i < len; i++) {
+	        switch (identifier[i]) {
+	        case '/':
+	                str_append(new_id, "%2f");
+	                break;
+	        case '%':
+	                str_append(new_id, "%25");
+	                break;
+	        default:
+	                str_append_c(new_id, identifier[i]);
+	                break;
+	        }
+	}
+	return str_c(new_id);
 }
 
 static int
@@ -70,7 +112,10 @@ oauth2_lookup_hmac_key(const struct oauth2_settings *set, const char *azp,
 	/* do a synchronous dict lookup */
 	lookup_key = t_strconcat(DICT_PATH_SHARED, azp, "/", alg, "/", key_id,
 				 NULL);
-	if ((ret = dict_lookup(set->key_dict, pool_datastack_create(),
+	struct dict_op_settings dict_set = {
+		.username = NULL,
+	};
+	if ((ret = dict_lookup(set->key_dict, &dict_set, pool_datastack_create(),
 			       lookup_key, &base64_key, error_r)) < 0) {
 		return -1;
 	} else if (ret == 0) {
@@ -150,7 +195,10 @@ oauth2_lookup_pubkey(const struct oauth2_settings *set, const char *azp,
 	/* do a synchronous dict lookup */
 	lookup_key = t_strconcat(DICT_PATH_SHARED, azp, "/", alg, "/", key_id,
 				 NULL);
-	if ((ret = dict_lookup(set->key_dict, pool_datastack_create(),
+	struct dict_op_settings dict_set = {
+		.username = NULL,
+	};
+	if ((ret = dict_lookup(set->key_dict, &dict_set, pool_datastack_create(),
 			       lookup_key, &key_str, error_r)) < 0) {
 		return -1;
 	} else if (ret == 0) {
@@ -188,13 +236,13 @@ oauth2_validate_rsa_ecdsa(const struct oauth2_settings *set,
 		return -1;
 	}
 
-	if (str_begins(alg, "RS")) {
+	if (str_begins_with(alg, "RS")) {
 		padding = DCRYPT_PADDING_RSA_PKCS1;
 		sig_format = DCRYPT_SIGNATURE_FORMAT_DSS;
-	} else if (str_begins(alg, "PS")) {
+	} else if (str_begins_with(alg, "PS")) {
 		padding = DCRYPT_PADDING_RSA_PKCS1_PSS;
 		sig_format = DCRYPT_SIGNATURE_FORMAT_DSS;
-	} else if (str_begins(alg, "ES")) {
+	} else if (str_begins_with(alg, "ES")) {
 		padding = DCRYPT_PADDING_DEFAULT;
 		sig_format = DCRYPT_SIGNATURE_FORMAT_X962;
 	} else {
@@ -241,11 +289,12 @@ oauth2_validate_signature(const struct oauth2_settings *set, const char *azp,
 			  const char *alg, const char *key_id,
 			  const char *const *blobs, const char **error_r)
 {
-	if (str_begins(alg, "HS")) {
+	if (str_begins_with(alg, "HS")) {
 		return oauth2_validate_hmac(set, azp, alg, key_id, blobs,
 					    error_r);
-	} else if (str_begins(alg, "RS") || str_begins(alg, "PS") ||
-		   str_begins(alg, "ES")) {
+	} else if (str_begins_with(alg, "RS") ||
+		   str_begins_with(alg, "PS") ||
+		   str_begins_with(alg, "ES")) {
 		return oauth2_validate_rsa_ecdsa(set, azp, alg, key_id, blobs,
 						 error_r);
 	}
@@ -288,9 +337,9 @@ static int
 oauth2_jwt_header_process(struct json_tree *tree, const char **alg_r,
 			  const char **kid_r, const char **error_r)
 {
-	const char *typ = get_field(tree, "typ");
-	const char *alg = get_field(tree, "alg");
-	const char *kid = get_field(tree, "kid");
+	const char *typ = get_field(tree, "typ", NULL);
+	const char *alg = get_field(tree, "alg", NULL);
+	const char *kid = get_field(tree, "kid", NULL);
 
 	if (null_strcmp(typ, "JWT") != 0) {
 		*error_r = "Cannot find 'typ' field";
@@ -315,7 +364,7 @@ oauth2_jwt_body_process(const struct oauth2_settings *set, const char *alg,
 			struct json_tree *tree, const char *const *blobs,
 			const char **error_r)
 {
-	const char *sub = get_field(tree, "sub");
+	const char *sub = get_field(tree, "sub", NULL);
 
 	int ret;
 	int64_t t0 = time(NULL);
@@ -360,14 +409,13 @@ oauth2_jwt_body_process(const struct oauth2_settings *set, const char *alg,
 	}
 
 	/* ensure token dates are not conflicting */
-	if (nbf < iat ||
-	    exp < iat ||
+	if (exp < iat ||
 	    exp < nbf) {
 		*error_r = "Token time values are conflicting";
 		return -1;
 	}
 
-	const char *iss = get_field(tree, "iss");
+	const char *iss = get_field(tree, "iss", NULL);
 	if (set->issuers != NULL && *set->issuers != NULL) {
 		if (iss == NULL) {
 			*error_r = "Token is missing 'iss' field";
@@ -381,9 +429,11 @@ oauth2_jwt_body_process(const struct oauth2_settings *set, const char *alg,
 	}
 
 	/* see if there is azp */
-	const char *azp = get_field(tree, "azp");
+	const char *azp = get_field(tree, "azp", NULL);
 	if (azp == NULL)
 		azp = "default";
+	else
+		azp = escape_identifier(azp);
 
 	if (oauth2_validate_signature(set, azp, alg, kid, blobs, error_r) < 0)
 		return -1;
@@ -436,32 +486,8 @@ int oauth2_try_parse_jwt(const struct oauth2_settings *set,
 	else if (*kid == '\0') {
 		*error_r = "'kid' field is empty";
 		return -1;
-	}
-
-	size_t pos = strcspn(kid, "./%");
-	if (pos < strlen(kid)) {
-		/* sanitize kid, cannot allow dots or / in it, so we encode them
-		 */
-		string_t *new_kid = t_str_new(strlen(kid));
-		/* put initial data */
-		str_append_data(new_kid, kid, pos);
-		for (const char *c = kid+pos; *c != '\0'; c++) {
-			switch (*c) {
-			case '.':
-				str_append(new_kid, "%2e");
-				break;
-			case '/':
-				str_append(new_kid, "%2f");
-				break;
-			case '%':
-				str_append(new_kid, "%25");
-				break;
-			default:
-				str_append_c(new_kid, *c);
-				break;
-			}
-		}
-		kid = str_c(new_kid);
+	} else {
+		kid = escape_identifier(kid);
 	}
 
 	/* parse body */

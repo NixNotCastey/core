@@ -63,7 +63,7 @@ static int imapc_mailbox_run_status(struct mailbox *box,
 				    enum mailbox_status_items items,
 				    struct mailbox_status *status_r);
 
-bool imap_resp_text_code_parse(const char *str, enum mail_error *error_r)
+bool imapc_resp_text_code_parse(const char *str, enum mail_error *error_r)
 {
 	unsigned int i;
 
@@ -73,6 +73,19 @@ bool imap_resp_text_code_parse(const char *str, enum mail_error *error_r)
 	for (i = 0; i < N_ELEMENTS(imapc_resp_code_map); i++) {
 		if (strcmp(imapc_resp_code_map[i].code, str) == 0) {
 			*error_r = imapc_resp_code_map[i].error;
+			return TRUE;
+		}
+	}
+	return FALSE;
+}
+
+bool imapc_mail_error_to_resp_text_code(enum mail_error error, const char **str_r)
+{
+	unsigned int i;
+
+	for (i = 0; i < N_ELEMENTS(imapc_resp_code_map); i++) {
+		if (imapc_resp_code_map[i].error == error) {
+			*str_r = imapc_resp_code_map[i].code;
 			return TRUE;
 		}
 	}
@@ -105,7 +118,7 @@ void imapc_copy_error_from_reply(struct imapc_storage *storage,
 {
 	enum mail_error error;
 
-	if (imap_resp_text_code_parse(reply->resp_text_key, &error)) {
+	if (imapc_resp_text_code_parse(reply->resp_text_key, &error)) {
 		mail_storage_set_error(&storage->storage, error,
 				       reply->text_without_resp);
 	} else {
@@ -474,6 +487,22 @@ void imapc_storage_client_register_untagged(struct imapc_storage_client *client,
 	cb->callback = callback;
 }
 
+void imapc_storage_client_unregister_untagged(struct imapc_storage_client *client,
+					      const char *name)
+{
+	struct imapc_storage_event_callback *cb;
+	unsigned int idx;
+	array_foreach_modifiable(&client->untagged_callbacks, cb) {
+		if (strcmp(cb->name, name) == 0) {
+			 idx = array_foreach_idx(&client->untagged_callbacks, cb);
+			 i_free(cb->name);
+			 array_delete(&client->untagged_callbacks, idx, 1);
+			 return;
+		}
+	}
+	i_unreached();
+}
+
 static void
 imapc_storage_get_list_settings(const struct mail_namespace *ns ATTR_UNUSED,
 				struct mailbox_list_settings *set)
@@ -509,8 +538,11 @@ imapc_mailbox_alloc(struct mail_storage *storage, struct mailbox_list *list,
 	p_array_init(&mbox->untagged_callbacks, pool, 16);
 	p_array_init(&mbox->resp_text_callbacks, pool, 16);
 	p_array_init(&mbox->fetch_requests, pool, 16);
+	p_array_init(&mbox->untagged_fetch_contexts, pool, 16);
 	p_array_init(&mbox->delayed_expunged_uids, pool, 16);
+	p_array_init(&mbox->copy_rollback_expunge_uids, pool, 16);
 	mbox->pending_fetch_cmd = str_new(pool, 128);
+	mbox->pending_copy_cmd = str_new(pool, 128);
 	mbox->prev_mail_cache.fd = -1;
 	imapc_mailbox_register_callbacks(mbox);
 	return &mbox->box;
@@ -820,6 +852,16 @@ static void imapc_mailbox_close(struct mailbox *box)
 
 	(void)imapc_mailbox_commit_delayed_trans(mbox, FALSE, &changes);
 	imapc_mail_fetch_flush(mbox);
+
+	/* Arriving here we may have fetch contexts still unprocessed,
+	   if there have been no mailbox_sync() after receiving the untagged replies.
+	   Losing these changes isn't a problem, since the same changes will be found
+	   out after connecting to the server the next time. */
+	struct imapc_untagged_fetch_ctx *untagged_fetch_context;
+	array_foreach_elem(&mbox->untagged_fetch_contexts, untagged_fetch_context)
+		imapc_untagged_fetch_ctx_free(&untagged_fetch_context);
+	array_clear(&mbox->untagged_fetch_contexts);
+
 	if (mbox->client_box != NULL)
 		imapc_client_mailbox_close(&mbox->client_box);
 	if (array_is_created(&mbox->rseq_modseqs))
@@ -890,16 +932,9 @@ static void imapc_untagged_status(const struct imapc_untagged_reply *reply,
 	if (storage->cur_status_box == NULL)
 		return;
 
-	const char *cur_status_remote_name =
-		imapc_mailbox_get_remote_name(storage->cur_status_box);
-	if (strcmp(cur_status_remote_name, remote_name) == 0) {
-		/* match */
-	} else if (strcasecmp(storage->cur_status_box->box.name, "INBOX") == 0 &&
-		   strcasecmp(remote_name, "INBOX") == 0) {
-		/* case-insensitive INBOX */
-	} else {
+	if (!imapc_mailbox_name_equals(storage->cur_status_box,
+				       remote_name))
 		return;
-	}
 
 	status = storage->cur_status;
 	for (i = 0; list[i].type != IMAP_ARG_EOL; i += 2) {
@@ -1107,7 +1142,7 @@ imapc_namespace_find_mailbox(struct imapc_storage *storage,
 
 	array_foreach(&storage->remote_namespaces, ns) {
 		len = strlen(ns->prefix);
-		if (str_begins(remote_name, ns->prefix)) {
+		if (str_begins_with(remote_name, ns->prefix)) {
 			if (best_len > len) {
 				best_ns = ns;
 				best_len = len;
@@ -1231,7 +1266,8 @@ static bool imapc_is_inconsistent(struct mailbox *box)
 struct mail_storage imapc_storage = {
 	.name = IMAPC_STORAGE_NAME,
 	.class_flags = MAIL_STORAGE_CLASS_FLAG_NO_ROOT |
-		       MAIL_STORAGE_CLASS_FLAG_UNIQUE_ROOT,
+		       MAIL_STORAGE_CLASS_FLAG_UNIQUE_ROOT |
+		       MAIL_STORAGE_CLASS_FLAG_SECONDARY_INDEX,
 	.event_category = &event_category_imapc,
 
 	.v = {
@@ -1247,6 +1283,15 @@ struct mail_storage imapc_storage = {
 		NULL,
 	}
 };
+
+static int
+imapc_mailbox_transaction_commit(struct mailbox_transaction_context *t,
+				 struct mail_transaction_commit_changes *changes_r)
+{
+	int ret = imapc_transaction_save_commit(t);
+	int ret2 = index_transaction_commit(t, changes_r);
+	return ret >= 0 && ret2 >= 0 ? 0 : -1;
+}
 
 struct mailbox imapc_mailbox = {
 	.v = {
@@ -1276,7 +1321,7 @@ struct mailbox imapc_mailbox = {
 		NULL,
 		imapc_notify_changes,
 		index_transaction_begin,
-		index_transaction_commit,
+		imapc_mailbox_transaction_commit,
 		index_transaction_rollback,
 		NULL,
 		imapc_mail_alloc,
@@ -1284,6 +1329,7 @@ struct mailbox imapc_mailbox = {
 		imapc_search_deinit,
 		index_storage_search_next_nonblock,
 		imapc_search_next_update_seq,
+		index_storage_search_next_match_mail,
 		imapc_save_alloc,
 		imapc_save_begin,
 		imapc_save_continue,
