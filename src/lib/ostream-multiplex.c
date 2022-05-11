@@ -39,38 +39,38 @@ struct multiplex_ostream {
 static struct multiplex_ochannel *
 get_channel(struct multiplex_ostream *mstream, uint8_t cid)
 {
-	struct multiplex_ochannel **channelp;
+	struct multiplex_ochannel *channel;
 	i_assert(mstream != NULL);
-	array_foreach_modifiable(&mstream->channels, channelp) {
-		if (*channelp != NULL && (*channelp)->cid == cid)
-			return *channelp;
+	array_foreach_elem(&mstream->channels, channel) {
+		if (channel != NULL && channel->cid == cid)
+			return channel;
 	}
 	return NULL;
 }
 
 static void propagate_error(struct multiplex_ostream *mstream, int stream_errno)
 {
-	struct multiplex_ochannel **channelp;
-	array_foreach_modifiable(&mstream->channels, channelp)
-		if (*channelp != NULL)
-			(*channelp)->ostream.ostream.stream_errno = stream_errno;
+	struct multiplex_ochannel *channel;
+	array_foreach_elem(&mstream->channels, channel)
+		if (channel != NULL)
+			channel->ostream.ostream.stream_errno = stream_errno;
 }
 
 static struct multiplex_ochannel *get_next_channel(struct multiplex_ostream *mstream)
 {
-	struct multiplex_ochannel *channel = NULL;
-	struct multiplex_ochannel **channelp;
+	struct multiplex_ochannel *oldest_channel = NULL;
+	struct multiplex_ochannel *channel;
 	uint64_t last_counter = mstream->send_counter;
 
-	array_foreach_modifiable(&mstream->channels, channelp) {
-		if (*channelp != NULL &&
-		   (*channelp)->last_sent_counter <= last_counter &&
-		    (*channelp)->buf->used > 0) {
-			last_counter = (*channelp)->last_sent_counter;
-			channel = *channelp;
+	array_foreach_elem(&mstream->channels, channel) {
+		if (channel != NULL &&
+		    channel->last_sent_counter <= last_counter &&
+		    channel->buf->used > 0) {
+			last_counter = channel->last_sent_counter;
+			oldest_channel = channel;
 		}
 	}
-	return channel;
+	return oldest_channel;
 }
 
 static bool
@@ -121,25 +121,26 @@ static int o_stream_multiplex_flush(struct multiplex_ostream *mstream)
 	int ret = o_stream_flush(mstream->parent);
 	if (ret >= 0) {
 		if (!o_stream_multiplex_sendv(mstream))
-			ret = 0;
+			return 0;
 	}
-	if (ret <= 0)
-		return ret;
 
-	/* Everything is flushed. See if one of the callbacks' flush callbacks
-	   wants to write more data. */
-	struct multiplex_ochannel **channelp;
+	/* a) Everything is flushed. See if one of the callbacks' flush
+	   callbacks wants to write more data.
+	   b) ostream failed. Notify the callbacks in case they need to know. */
+	struct multiplex_ochannel *channel;
 	bool unfinished = FALSE;
-	array_foreach_modifiable(&mstream->channels, channelp) {
-		if (*channelp != NULL && (*channelp)->ostream.callback != NULL) {
-			ret = (*channelp)->ostream.callback((*channelp)->ostream.context);
+	bool failed = FALSE;
+	array_foreach_elem(&mstream->channels, channel) {
+		if (channel != NULL && channel->ostream.callback != NULL) {
+			ret = channel->ostream.callback(channel->ostream.context);
 			if (ret < 0)
-				return -1;
-			if (ret == 0)
+				failed = TRUE;
+			else if (ret == 0)
 				unfinished = TRUE;
 		}
 	}
-	return unfinished ? 0 : 1;
+	return failed ? -1 :
+		(unfinished ? 0 : 1);
 }
 
 static int o_stream_multiplex_ochannel_flush(struct ostream_private *stream)
@@ -252,14 +253,14 @@ o_stream_multiplex_ochannel_get_buffer_avail_size(const struct ostream_private *
 static void
 o_stream_multiplex_ochannel_close(struct iostream_private *stream, bool close_parent)
 {
-	struct multiplex_ochannel *const *channelp;
+	struct multiplex_ochannel *arr_channel;
 	struct multiplex_ochannel *channel =
 		container_of(stream, struct multiplex_ochannel, ostream.iostream);
 
 	channel->closed = TRUE;
 	if (close_parent) {
-		array_foreach(&channel->mstream->channels, channelp)
-			if (*channelp !=NULL && !(*channelp)->closed)
+		array_foreach_elem(&channel->mstream->channels, arr_channel)
+			if (arr_channel != NULL && !arr_channel->closed)
 				return;
 		o_stream_close(channel->mstream->parent);
 	}
@@ -267,10 +268,10 @@ o_stream_multiplex_ochannel_close(struct iostream_private *stream, bool close_pa
 
 static void o_stream_multiplex_try_destroy(struct multiplex_ostream *mstream)
 {
-	struct multiplex_ochannel **channelp;
+	struct multiplex_ochannel *channel;
 	/* can't do anything until they are all closed */
-	array_foreach_modifiable(&mstream->channels, channelp)
-		if (*channelp != NULL)
+	array_foreach_elem(&mstream->channels, channel)
+		if (channel != NULL)
 			return;
 
 	i_assert(mstream->parent->real_stream->callback ==

@@ -9,6 +9,16 @@
 #include <openssl/err.h>
 #include <arpa/inet.h>
 
+#define SSL_TXT_ANY "ANY"
+
+#ifndef TLS_ANY_VERSION
+#  define TLS_ANY_VERSION TLS1_VERSION
+#endif
+
+#ifndef TLS_MAX_VERSION
+#  define TLS_MAX_VERSION 0
+#endif
+
 /* openssl_min_protocol_to_options() scans this array for name and returns
    version and opt. opt is used with SSL_set_options() and version is used with
    SSL_set_min_proto_version(). Using either method should enable the same
@@ -18,18 +28,27 @@ static const struct {
 	int version;
 	long opt;
 } protocol_versions[] = {
-	{ SSL_TXT_SSLV3,   SSL3_VERSION,   0 },
-	{ SSL_TXT_TLSV1,   TLS1_VERSION,   SSL_OP_NO_SSLv3 },
-	{ SSL_TXT_TLSV1_1, TLS1_1_VERSION, SSL_OP_NO_SSLv3 | SSL_OP_NO_TLSv1 },
-	{ SSL_TXT_TLSV1_2, TLS1_2_VERSION,
-		SSL_OP_NO_SSLv3 | SSL_OP_NO_TLSv1 | SSL_OP_NO_TLSv1_1 },
+	{ SSL_TXT_ANY,	   TLS_ANY_VERSION, SSL_OP_NO_SSLv3 },
+	{ SSL_TXT_TLSV1,   TLS1_VERSION,    SSL_OP_NO_SSLv3 },
+	{ SSL_TXT_TLSV1_1, TLS1_1_VERSION,  SSL_OP_NO_SSLv3 | SSL_OP_NO_TLSv1 },
+	{ SSL_TXT_TLSV1_2, TLS1_2_VERSION,  SSL_OP_NO_SSLv3 | SSL_OP_NO_TLSv1 |
+					    SSL_OP_NO_TLSv1_1 },
+#if defined(TLS1_3_VERSION)
+	{ "TLSv1.3",	   TLS1_3_VERSION,  SSL_OP_NO_SSLv3   | SSL_OP_NO_TLSv1 |
+					    SSL_OP_NO_TLSv1_1 | SSL_OP_NO_TLSv1_2 },
+#endif
+	/* Use latest protocol version. If this is used on some
+	   ancient system which does not support ssl_min_protocol,
+	   ensure only TLSv1.2 is supported. */
+	{ "LATEST",	   TLS_MAX_VERSION, SSL_OP_NO_SSLv3 | SSL_OP_NO_TLSv1 |
+					    SSL_OP_NO_TLSv1_1 },
 };
 int openssl_min_protocol_to_options(const char *min_protocol, long *opt_r,
 				    int *version_r)
 {
 	unsigned i = 0;
 	for (; i < N_ELEMENTS(protocol_versions); i++) {
-		if (strcmp(protocol_versions[i].name, min_protocol) == 0)
+		if (strcasecmp(protocol_versions[i].name, min_protocol) == 0)
 			break;
 	}
 	if (i >= N_ELEMENTS(protocol_versions))
@@ -164,13 +183,7 @@ bool openssl_cert_match_name(SSL *ssl, const char *verify_name,
 	gnames = X509_get_ext_d2i(cert, NID_subject_alt_name, NULL, NULL);
 	count = gnames == NULL ? 0 : sk_GENERAL_NAME_num(gnames);
 
-	i_zero(&ip);
-	/* try to convert verify_name to IP */
-	if (inet_pton(AF_INET6, verify_name, &ip.u.ip6) == 1)
-		ip.family = AF_INET6;
-	else if (inet_pton(AF_INET, verify_name, &ip.u.ip4) == 1)
-		ip.family = AF_INET;
-	else
+	if (net_addr2ip(verify_name, &ip) < 0)
 		i_zero(&ip);
 
 	for (i = 0; i < count; i++) {

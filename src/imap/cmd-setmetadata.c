@@ -181,7 +181,9 @@ cmd_setmetadata_entry(struct imap_setmetadata_context *ctx,
 		   Dovecot has traditionally supported it this is kept for
 		   backwards compatibility just in case some client is
 		   using it. */
-		if (!imap_arg_get_atom(entry_value, &value.value))
+		if (entry_value->type == IMAP_ARG_NIL)
+			;
+		else if (!imap_arg_get_atom(entry_value, &value.value))
 			value.value = imap_arg_as_nstring(entry_value);
 		ret = imap_metadata_set(ctx->trans, entry_name, &value);
 		if (ret < 0) {
@@ -322,7 +324,6 @@ cmd_setmetadata_mailbox(struct imap_setmetadata_context *ctx,
 	else {
 		ctx->box = mailbox_alloc(ns->list, mailbox,
 					 MAILBOX_FLAG_ATTRIBUTE_SESSION);
-		mailbox_set_reason(ctx->box, "SETMETADATA");
 		enum mailbox_existence existence;
 		if (mailbox_exists(ctx->box, TRUE, &existence) < 0) {
 			client_send_box_error(cmd, ctx->box);
@@ -337,7 +338,8 @@ cmd_setmetadata_mailbox(struct imap_setmetadata_context *ctx,
 			return TRUE;
 		}
 	}
-	event_add_str(ctx->cmd->event, "mailbox", mailbox_get_vname(ctx->box));
+	event_add_str(ctx->cmd->global_event, "mailbox",
+		      mailbox_get_vname(ctx->box));
 	ctx->trans = imap_metadata_transaction_begin(ctx->box);
 	return cmd_setmetadata_start(ctx);
 }

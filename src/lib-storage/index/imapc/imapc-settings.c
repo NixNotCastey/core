@@ -105,6 +105,7 @@ static const struct imapc_feature_list imapc_feature_list[] = {
 	{ "send-id", IMAPC_FEATURE_SEND_ID },
 	{ "fetch-empty-is-expunged", IMAPC_FEATURE_FETCH_EMPTY_IS_EXPUNGED },
 	{ "no-msn-updates", IMAPC_FEATURE_NO_MSN_UPDATES },
+	{ "acl", IMAPC_FEATURE_ACL },
 	{ NULL, 0 }
 };
 
@@ -131,7 +132,7 @@ imapc_settings_parse_features(struct imapc_settings *set,
 {
         enum imapc_features features = 0;
         const struct imapc_feature_list *list;
-	const char *const *str;
+	const char *const *str, *value;
 
         str = t_strsplit_spaces(set->imapc_features, " ,");
 	for (; *str != NULL; str++) {
@@ -142,8 +143,8 @@ imapc_settings_parse_features(struct imapc_settings *set,
 				break;
 			}
 		}
-		if (strncasecmp(*str, "throttle:", 9) == 0) {
-			if (imapc_settings_parse_throttle(set, *str + 9, error_r) < 0)
+		if (str_begins_icase(*str, "throttle:", &value)) {
+			if (imapc_settings_parse_throttle(set, value, error_r) < 0)
 				return -1;
 			continue;
 		}

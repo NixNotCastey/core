@@ -137,7 +137,7 @@ int mail_crypt_private_key_id_match(struct dcrypt_private_key *key,
 					   hash, pubid);
 		return 0;
 	}
-	return 1;		
+	return 1;
 }
 
 int mail_crypt_public_key_id_match(struct dcrypt_public_key *key,
@@ -434,8 +434,8 @@ int mail_crypt_set_private_key(struct mailbox_transaction_context *t,
 	}
 
 	/* export key */
-	if (!dcrypt_key_store_private(key, DCRYPT_FORMAT_DOVECOT, algo, data,
-				      pw, enc_key, error_r)) {
+	if (!dcrypt_key_store_private(key, MAIL_CRYPT_KEY_ATTRIBUTE_FORMAT,
+				      algo, data, pw, enc_key, error_r)) {
 		return -1;
 	}
 
@@ -482,7 +482,10 @@ int mail_crypt_user_set_private_key(struct mail_user *user, const char *pubid,
 		dcrypt_key_unref_private(&env_key);
 	}
 
-	if (mail_user_plugin_getenv(user, MAIL_CRYPT_REQUIRE_ENCRYPTED_USER_KEY) != NULL &&
+	bool require_encrypted_user_key =
+		mail_user_plugin_getenv_bool(user, MAIL_CRYPT_REQUIRE_ENCRYPTED_USER_KEY);
+
+	if (require_encrypted_user_key &&
 	    mail_user_plugin_getenv(user, MAIL_CRYPT_USERENV_PASSWORD) == NULL &&
 	    mail_user_plugin_getenv(user, MAIL_CRYPT_USERENV_KEY) == NULL)
 	{
@@ -671,7 +674,7 @@ int mail_crypt_set_public_key(struct mailbox_transaction_context *t,
 	struct mail_attribute_value value;
 
 	/* export key */
-	if (!dcrypt_key_store_public(key, DCRYPT_FORMAT_DOVECOT, data,
+	if (!dcrypt_key_store_public(key, MAIL_CRYPT_KEY_ATTRIBUTE_FORMAT, data,
 				     error_r)) {
 		return -1;
 	}
@@ -903,7 +906,7 @@ int mail_crypt_box_set_shared_key(struct mailbox_transaction_context *t,
 				      NULL, user_key, error_r)) {
 		return -1;
 	}
-	
+
 	value.value_stream = NULL;
 	value.value = str_c(data);
 	value.last_change = 0;
@@ -1115,12 +1118,11 @@ int mail_crypt_box_share_private_keys(struct mailbox_transaction_context *t,
 {
 	i_assert(dest_user == NULL || dest_pub_key != NULL);
 
-	struct dcrypt_private_key *const *priv_keyp, *priv_key;
+	struct dcrypt_private_key *priv_key;
 	buffer_t *key_id = t_str_new(MAIL_CRYPT_HASH_BUF_SIZE);
 	int ret = 0;
 
-	array_foreach(priv_keys, priv_keyp) {
-		priv_key = *priv_keyp;
+	array_foreach_elem(priv_keys, priv_key) {
 		ret = -1;
 		if (!dcrypt_key_id_private(priv_key, MAIL_CRYPT_KEY_ID_ALGORITHM,
 					   key_id, error_r) ||
@@ -1190,31 +1192,6 @@ mail_crypt_box_get_or_gen_public_key(struct mailbox *box,
 	} else
 		return ret;
 	return 0;
-}
-
-bool mail_crypt_acl_secure_sharing_enabled(struct mail_user *user)
-{
-	const char *env =
-		mail_user_plugin_getenv(user, MAIL_CRYPT_ACL_SECURE_SHARE_SETTING);
-
-	/* disabled by default */
-	bool ret = FALSE;
-
-	if (env != NULL) {
-		/* enable unless specifically
-		     requested not to */
-		ret = TRUE;
-		switch (env[0]) {
-			case 'n':
-			case 'N':
-			case '0':
-			case 'f':
-			case 'F':
-			ret = FALSE;
-		}
-	}
-
-	return ret;
 }
 
 static const struct mailbox_attribute_internal mailbox_internal_attributes[] = {

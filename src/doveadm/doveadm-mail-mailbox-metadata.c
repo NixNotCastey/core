@@ -66,7 +66,6 @@ cmd_mailbox_metadata_get_mailbox(struct metadata_cmd_context *mctx,
 		*box_r = mailbox_alloc((*ns_r)->list, mctx->mailbox,
 				       MAILBOX_FLAG_ATTRIBUTE_SESSION);
 	}
-	mailbox_set_reason(*box_r, mctx->ctx.cmd->name);
 
 	if (op == DOVEADM_METADATA_OP_SET &&
 	    mailbox_open(*box_r) < 0) {
@@ -125,12 +124,10 @@ cmd_mailbox_metadata_parse_key(const char *arg,
 {
 	arg = t_str_lcase(arg);
 
-	if (str_begins(arg, "/private/")) {
+	if (str_begins(arg, "/private/", key_r)) {
 		*type_r = MAIL_ATTRIBUTE_TYPE_PRIVATE;
-		*key_r = arg + 9;
-	} else if (str_begins(arg, "/shared/")) {
+	} else if (str_begins(arg, "/shared/", key_r)) {
 		*type_r = MAIL_ATTRIBUTE_TYPE_SHARED;
-		*key_r = arg + 8;
 	} else if (strcmp(arg, "/private") == 0) {
 		*type_r = MAIL_ATTRIBUTE_TYPE_PRIVATE;
 		*key_r = "";

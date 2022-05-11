@@ -10,6 +10,15 @@
 
 #include <unistd.h>
 
+/* Dovecot attempts to detect also when time suddenly jumps forwards.
+   This is done by getting the minimum timeout wait in epoll() (or similar)
+   and then seeing if the current time after epoll() is past the timeout.
+   This can't be very exact, so likely the difference is always at least
+   1 microsecond. In high load situations it can be somewhat higher.
+   Dovecot generally doesn't have very important short timeouts, so to avoid
+   logging many warnings about this, use a rather high value. */
+#define IOLOOP_TIME_MOVED_FORWARDS_MIN_USECS (100000)
+
 time_t ioloop_time = 0;
 struct timeval ioloop_timeval;
 struct ioloop *current_ioloop = NULL;
@@ -18,6 +27,8 @@ uint64_t ioloop_global_wait_usecs = 0;
 static ARRAY(io_switch_callback_t *) io_switch_callbacks = ARRAY_INIT;
 static ARRAY(io_destroy_callback_t *) io_destroy_callbacks = ARRAY_INIT;
 static bool panic_on_leak = FALSE, panic_on_leak_set = FALSE;
+
+static time_t data_stack_last_free_unused = 0;
 
 static void io_loop_initialize_handler(struct ioloop *ioloop)
 {
@@ -468,6 +479,7 @@ static int timeout_get_wait_time(struct timeout *timeout, struct timeval *tv_r,
 	if (tv_r->tv_sec == 0 && tv_r->tv_usec == 1 && !in_timeout_loop) {
 		/* Possibly 0 ms timeout. Don't wait for a full millisecond
 		   for it to trigger. */
+		tv_r->tv_usec = 0;
 		return 0;
 	}
 	if (tv_r->tv_sec > INT_MAX/1000-1)
@@ -562,15 +574,14 @@ io_loop_default_time_moved(const struct timeval *old_time,
 
 static void io_loop_timeouts_start_new(struct ioloop *ioloop)
 {
-	struct timeout *const *to_idx;
+	struct timeout *timeout;
 
 	if (array_count(&ioloop->timeouts_new) == 0)
 		return;
 	
 	io_loop_time_refresh();
 
-	array_foreach(&ioloop->timeouts_new, to_idx) {
-		struct timeout *timeout= *to_idx;
+	array_foreach_elem(&ioloop->timeouts_new, timeout) {
 		i_assert(timeout->next_run.tv_sec == 0 &&
 			timeout->next_run.tv_usec == 0);
 		i_assert(!timeout->one_shot);
@@ -645,9 +656,9 @@ static void io_loop_handle_timeouts_real(struct ioloop *ioloop)
 	} else {
 		diff_usecs = timeval_diff_usecs(&ioloop->next_max_time,
 						&ioloop_timeval);
-		if (unlikely(diff_usecs < 0)) {
+		if (unlikely(-diff_usecs >= IOLOOP_TIME_MOVED_FORWARDS_MIN_USECS)) {
 			io_loops_timeouts_update(-diff_usecs);
-			/* time moved forwards */
+			/* time moved forward */
 			ioloop->time_moved_callback(&ioloop->next_max_time,
 						    &ioloop_timeval);
 			i_assert(ioloop == current_ioloop);
@@ -695,6 +706,17 @@ void io_loop_handle_timeouts(struct ioloop *ioloop)
 	T_BEGIN {
 		io_loop_handle_timeouts_real(ioloop);
 	} T_END;
+
+	/* Free the unused memory in data stack once per second. This way if
+	   the data stack has grown excessively large temporarily, it won't
+	   permanently waste memory. And if the data stack grows back to the
+	   same large size, re-allocating it once per second doesn't cause
+	   performance problems. */
+	if (data_stack_last_free_unused != ioloop_time) {
+		if (data_stack_last_free_unused != 0)
+			data_stack_free_unused();
+		data_stack_last_free_unused = ioloop_time;
+	}
 }
 
 void io_loop_call_io(struct io *io)
@@ -833,7 +855,7 @@ struct ioloop *io_loop_create(void)
 void io_loop_destroy(struct ioloop **_ioloop)
 {
 	struct ioloop *ioloop = *_ioloop;
-	struct timeout *const *to_idx;
+	struct timeout *to;
 	struct priorityq_item *item;
 	bool leaks = FALSE;
 
@@ -842,9 +864,10 @@ void io_loop_destroy(struct ioloop **_ioloop)
 	/* ->prev won't work unless loops are destroyed in create order */
         i_assert(ioloop == current_ioloop);
 	if (array_is_created(&io_destroy_callbacks)) {
-		io_destroy_callback_t *const *callbackp;
-		array_foreach(&io_destroy_callbacks, callbackp)
-			(*callbackp)(current_ioloop);
+		io_destroy_callback_t *callback;
+		array_foreach_elem(&io_destroy_callbacks, callback) T_BEGIN {
+			callback(current_ioloop);
+		} T_END;
 	}
 
 	io_loop_set_current(current_ioloop->prev);
@@ -870,8 +893,7 @@ void io_loop_destroy(struct ioloop **_ioloop)
 	}
 	i_assert(ioloop->io_pending_count == 0);
 
-	array_foreach(&ioloop->timeouts_new, to_idx) {
-		struct timeout *to = *to_idx;
+	array_foreach_elem(&ioloop->timeouts_new, to) {
 		const char *error = t_strdup_printf(
 			"Timeout leak: %p (%s:%u)", (void *)to->callback,
 			to->source_filename,
@@ -925,8 +947,8 @@ void io_loop_destroy(struct ioloop **_ioloop)
 
 	if (ioloop->handler_context != NULL)
 		io_loop_handler_deinit(ioloop);
-
-	i_assert(ioloop->cur_ctx == NULL);
+	if (ioloop->cur_ctx != NULL)
+		io_loop_context_unref(&ioloop->cur_ctx);
 	i_free(ioloop);
 }
 
@@ -948,7 +970,7 @@ static void io_destroy_callbacks_free(void)
 
 void io_loop_set_current(struct ioloop *ioloop)
 {
-	io_switch_callback_t *const *callbackp;
+	io_switch_callback_t *callback;
 	struct ioloop *prev_ioloop = current_ioloop;
 
 	if (ioloop == current_ioloop)
@@ -956,8 +978,9 @@ void io_loop_set_current(struct ioloop *ioloop)
 
 	current_ioloop = ioloop;
 	if (array_is_created(&io_switch_callbacks)) {
-		array_foreach(&io_switch_callbacks, callbackp)
-			(*callbackp)(prev_ioloop);
+		array_foreach_elem(&io_switch_callbacks, callback) T_BEGIN {
+			callback(prev_ioloop);
+		} T_END;
 	}
 }
 
@@ -1050,6 +1073,7 @@ void io_loop_context_unref(struct ioloop_context **_ctx)
 	i_assert(ctx->ioloop->cur_ctx != ctx);
 
 	array_free(&ctx->callbacks);
+	array_free(&ctx->global_event_stack);
 	i_free(ctx);
 }
 
@@ -1106,6 +1130,48 @@ io_loop_context_remove_deleted_callbacks(struct ioloop_context *ctx)
 	}
 }
 
+static void io_loop_context_push_global_events(struct ioloop_context *ctx)
+{
+	struct event *const *events;
+	unsigned int i, count;
+
+	ctx->root_global_event = event_get_global();
+
+	if (!array_is_created(&ctx->global_event_stack))
+		return;
+
+	/* push the global events from stack in reverse order */
+	events = array_get(&ctx->global_event_stack, &count);
+	if (count == 0)
+		return;
+
+	/* Remember the oldest global event. We're going to pop until that
+	   event when deactivating the context. */
+	for (i = count; i > 0; i--)
+		event_push_global(events[i-1]);
+	array_clear(&ctx->global_event_stack);
+}
+
+static void io_loop_context_pop_global_events(struct ioloop_context *ctx)
+{
+	struct event *event;
+
+	/* ioloop context is always global, so we can't push one ioloop context
+	   on top of another one. We'll need to rewind the global event stack
+	   until we've reached the event that started this context. We'll push
+	   these global events back when the ioloop context is activated
+	   again. (We'll assert-crash if the root event is freed before these
+	   global events have been popped.) */
+	while ((event = event_get_global()) != ctx->root_global_event) {
+		i_assert(event != NULL);
+		if (!array_is_created(&ctx->global_event_stack))
+			i_array_init(&ctx->global_event_stack, 4);
+		array_push_back(&ctx->global_event_stack, &event);
+		event_pop_global(event);
+	}
+	ctx->root_global_event = NULL;
+}
+
 void io_loop_context_activate(struct ioloop_context *ctx)
 {
 	struct ioloop_context_callback *cb;
@@ -1113,11 +1179,13 @@ void io_loop_context_activate(struct ioloop_context *ctx)
 	i_assert(ctx->ioloop->cur_ctx == NULL);
 
 	ctx->ioloop->cur_ctx = ctx;
+	io_loop_context_push_global_events(ctx);
 	io_loop_context_ref(ctx);
 	array_foreach_modifiable(&ctx->callbacks, cb) {
 		i_assert(!cb->activated);
-		if (cb->activate != NULL)
+		if (cb->activate != NULL) T_BEGIN {
 			cb->activate(cb->context);
+		} T_END;
 		cb->activated = TRUE;
 	}
 }
@@ -1133,12 +1201,14 @@ void io_loop_context_deactivate(struct ioloop_context *ctx)
 			/* we just added this callback. don't deactivate it
 			   before it gets first activated. */
 		} else {
-			if (cb->deactivate != NULL)
+			if (cb->deactivate != NULL) T_BEGIN {
 				cb->deactivate(cb->context);
+			} T_END;
 			cb->activated = FALSE;
 		}
 	}
 	ctx->ioloop->cur_ctx = NULL;
+	io_loop_context_pop_global_events(ctx);
 	io_loop_context_remove_deleted_callbacks(ctx);
 	io_loop_context_unref(&ctx);
 }
@@ -1229,6 +1299,13 @@ bool io_loop_have_immediate_timeouts(struct ioloop *ioloop)
 	return io_loop_get_wait_time(ioloop, &tv) == 0;
 }
 
+bool io_loop_is_empty(struct ioloop *ioloop)
+{
+	return ioloop->io_files == NULL &&
+		priorityq_count(ioloop->timeouts) == 0 &&
+		array_count(&ioloop->timeouts_new) == 0;
+}
+
 uint64_t io_loop_get_wait_usecs(struct ioloop *ioloop)
 {
 	return ioloop->ioloop_wait_usecs;
@@ -1300,4 +1377,13 @@ void io_wait_timer_remove(struct io_wait_timer **_timer)
 uint64_t io_wait_timer_get_usecs(struct io_wait_timer *timer)
 {
 	return timer->usecs;
+}
+
+struct event *io_loop_get_active_global_root(void)
+{
+	if (current_ioloop == NULL)
+		return NULL;
+	if (current_ioloop->cur_ctx == NULL)
+		return NULL;
+	return current_ioloop->cur_ctx->root_global_event;
 }

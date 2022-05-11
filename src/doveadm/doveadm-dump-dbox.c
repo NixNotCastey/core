@@ -189,19 +189,19 @@ static bool dump_msg(struct istream *input, unsigned int hdr_size)
 	return TRUE;
 }
 
-static void cmd_dump_dbox(int argc ATTR_UNUSED, char *argv[])
+static void cmd_dump_dbox(const char *path, const char *const *args ATTR_UNUSED)
 {
 	struct istream *input;
 	int fd;
 	unsigned int hdr_size;
 	bool ret;
 
-	fd = open(argv[1], O_RDONLY);
+	fd = open(path, O_RDONLY);
 	if (fd < 0)
-		i_fatal("open(%s) failed: %m", argv[1]);
+		i_fatal("open(%s) failed: %m", path);
 
 	input = i_stream_create_fd_autoclose(&fd, SIZE_MAX);
-	i_stream_set_name(input, argv[1]);
+	i_stream_set_name(input, path);
 	hdr_size = dump_file_hdr(input);
 	do {
 		printf("\n");
@@ -221,7 +221,7 @@ static bool test_dump_dbox(const char *path)
 		p = path;
 	else
 		p++;
-	return str_begins(p, "m.") || str_begins(p, "u.");
+	return str_begins_with(p, "m.") || str_begins_with(p, "u.");
 }
 
 struct doveadm_cmd_dump doveadm_cmd_dump_dbox = {

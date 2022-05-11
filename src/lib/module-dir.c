@@ -279,11 +279,8 @@ static int module_name_cmp(const char *const *n1, const char *const *n2)
 {
 	const char *s1 = *n1, *s2 = *n2;
 
-	if (str_begins(s1, "lib"))
-		s1 += 3;
-	if (str_begins(s2, "lib"))
-		s2 += 3;
-
+	(void)str_begins(s1, "lib", &s1);
+	(void)str_begins(s2, "lib", &s2);
 	return strcmp(s1, s2);
 }
 
@@ -314,13 +311,13 @@ static void check_duplicates(ARRAY_TYPE(const_string) *names,
 
 	base_name = module_file_get_name(name);
 	names_p = array_get(names, &count);
-	for (i = 0; i < count; i++) {
+	for (i = 0; i < count; i++) T_BEGIN {
 		tmp = module_file_get_name(names_p[i]);
 
 		if (strcmp(tmp, base_name) == 0)
 			i_fatal("Multiple files for module %s: %s/%s, %s/%s",
 				base_name, dir, name, dir, names_p[i]);
-	}
+	} T_END;
 }
 
 struct module *module_dir_find(struct module *modules, const char *name)
@@ -575,7 +572,9 @@ void module_dir_deinit(struct module *modules)
 		for (i = 0; i < count; i++) {
 			module = rev[i];
 
-			module->deinit();
+			T_BEGIN {
+				module->deinit();
+			} T_END;
 			module->initialized = FALSE;
 		}
 	} T_END;
@@ -662,8 +661,7 @@ const char *module_file_get_name(const char *fname)
 	const char *p;
 
 	/* [lib][nn_]name(.so) */
-	if (str_begins(fname, "lib"))
-		fname += 3;
+	(void)str_begins(fname, "lib", &fname);
 
 	for (p = fname; *p != '\0'; p++) {
 		if (*p < '0' || *p > '9')

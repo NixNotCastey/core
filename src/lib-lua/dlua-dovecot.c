@@ -270,6 +270,7 @@ void dlua_push_event(lua_State *L, struct event *event)
 	/* we need to attach gc to userdata to support older lua*/
 	struct event **ptr = lua_newuserdata(L, sizeof(struct event*));
 	*ptr = event;
+	event_ref(event);
 	lua_createtable(L, 0, 1);
 	lua_pushcfunction(L, dlua_event_gc);
 	lua_setfield(L, -2, "__gc");
@@ -471,6 +472,7 @@ static int dlua_event_new(lua_State *L)
 	dlua_get_file_line(L, 1, &file, &line);
 	event = event_create(parent, file, line);
 	dlua_push_event(L, event);
+	event_unref(&event);
 	return 1;
 }
 
@@ -570,6 +572,52 @@ static int dlua_clear_flag(lua_State *L)
 	return 1;
 }
 
+static int dlua_script_strict_index(lua_State *L)
+{
+	DLUA_REQUIRE_ARGS(L, 2);
+	const char *name = luaL_checkstring(L, 2);
+	return luaL_error(L, "attempt to write to read undeclared global variable %s",
+			  name);
+}
+
+static int dlua_script_strict_newindex(lua_State *L)
+{
+	DLUA_REQUIRE_ARGS(L, 3);
+	if (lua_type(L, 3) == LUA_TFUNCTION) {
+		/* allow defining global functions */
+		lua_rawset(L, 1);
+	} else {
+		const char *name = luaL_checkstring(L, 2);
+		return luaL_error(L, "attempt to write to undeclared global variable %s",
+				  name);
+	}
+	return 0;
+}
+
+static luaL_Reg env_strict_metamethods[] = {
+	{ "__index", dlua_script_strict_index },
+	{ "__newindex", dlua_script_strict_newindex },
+	{ NULL, NULL }
+};
+
+static int dlua_restrict_global_variables(lua_State *L)
+{
+	DLUA_REQUIRE_ARGS(L, 1);
+
+	if (lua_toboolean(L, 1)) {
+		/* disable defining global variables */
+		lua_getglobal(L, "_G");
+		lua_newtable(L);
+		luaL_setfuncs(L, env_strict_metamethods, 0);
+	} else {
+		/* revert restrictions */
+		lua_getglobal(L, "_G");
+		lua_newtable(L);
+	}
+	lua_setmetatable(L, -2);
+	lua_pop(L, 1);
+	return 0;
+}
 
 static luaL_Reg lua_dovecot_methods[] = {
 	{ "i_debug", dlua_i_debug },
@@ -580,10 +628,11 @@ static luaL_Reg lua_dovecot_methods[] = {
 	{ "has_flag", dlua_has_flag },
 	{ "set_flag", dlua_set_flag },
 	{ "clear_flag", dlua_clear_flag },
+	{ "restrict_global_variables", dlua_restrict_global_variables },
 	{ NULL, NULL }
 };
 
-void dlua_getdovecot(lua_State *L)
+void dlua_get_dovecot(lua_State *L)
 {
 	lua_getglobal(L, LUA_SCRIPT_DOVECOT);
 }
@@ -609,6 +658,9 @@ void dlua_dovecot_register(struct dlua_script *script)
 
 	/* register table as global */
 	lua_setglobal(script->L, LUA_SCRIPT_DOVECOT);
+
+	/* register http methods */
+	dlua_dovecot_http_register(script);
 }
 
 #undef event_want_level

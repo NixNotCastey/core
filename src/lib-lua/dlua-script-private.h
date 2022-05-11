@@ -11,6 +11,7 @@
 #define lua_isnumber(L, n) (lua_isnumber((L), (n)) == 1)
 #define lua_toboolean(L, n) (lua_toboolean((L), (n)) == 1)
 #define lua_pushboolean(L, b) lua_pushboolean((L), (b) ? 1 : 0)
+#define lua_isinteger(L, n) (lua_isinteger((L), (n)) == 1)
 
 #define DLUA_TABLE_STRING(n, val) { .name = (n),\
 				    .type = DLUA_TABLE_VALUE_STRING, .v.s = (val) }
@@ -90,16 +91,27 @@ struct dlua_script *dlua_script_from_state(lua_State *L);
 void dlua_dovecot_register(struct dlua_script *script);
 
 /* push 'dovecot' global on top of stack */
-void dlua_getdovecot(lua_State *L);
+void dlua_get_dovecot(lua_State *L);
+
+/* register 'http' methods to 'dovecot' */
+void dlua_dovecot_http_register(struct dlua_script *script);
 
 /* assign values to table on idx */
-void dlua_setmembers(lua_State *L, const struct dlua_table_values *values, int idx);
+void dlua_set_members(lua_State *L, const struct dlua_table_values *values, int idx);
 
 /* push event to top of stack */
 void dlua_push_event(lua_State *L, struct event *event);
 
 /* get event from given stack position */
 struct event *dlua_check_event(lua_State *L, int arg);
+
+/* improved lua_pushfstring, can handle full C format support */
+const char *dlua_push_vfstring(lua_State *L, const char *fmt, va_list argp) ATTR_FORMAT(2, 0);
+const char *dlua_push_fstring(lua_State *L, const char *fmt, ...) ATTR_FORMAT(2, 3);
+
+/* improved luaL_error, can handle full C format support */
+int dluaL_error(lua_State *L, const char *fmt, ...) ATTR_FORMAT(2, 3);
+#define luaL_error(...) dluaL_error(__VA_ARGS__)
 
 /*
  * Returns field from a Lua table
@@ -214,7 +226,7 @@ int dlua_pcall_yieldable(lua_State *L, const char *func_name, int nargs,
 			 dlua_pcall_yieldable_callback_t *callback,
 			 void *context, const char **error_r);
 #define dlua_pcall_yieldable(L, func_name, nargs, callback, context, error_r) \
-	dlua_pcall_yieldable(L, func_name + \
+	dlua_pcall_yieldable(L, TRUE ? func_name : \
 		CALLBACK_TYPECHECK(callback, void (*)(lua_State *, typeof(context), int)), \
 		nargs, (dlua_pcall_yieldable_callback_t *)callback, context, error_r)
 /*

@@ -91,7 +91,7 @@ void process_exec(const char *cmd)
 	/* prefix with dovecot/ */
 	argv[0] = t_strdup_printf("%s/%s", services->set->instance_name,
 				  argv[0]);
-	if (!str_begins(argv[0], PACKAGE))
+	if (!str_begins_with(argv[0], PACKAGE))
 		argv[0] = t_strconcat(PACKAGE"-", argv[0], NULL);
 	execv_const(executable, argv);
 }
@@ -467,7 +467,6 @@ static void sig_die(const siginfo_t *si, void *context ATTR_UNUSED)
 	services->destroying = TRUE;
 	i_sd_notify(0, "STOPPING=1\nSTATUS=Dovecot stopping...");
 	master_service_stop(master_service);
-	i_sd_notify(0, "STATUS=Dovecot stopped");
 }
 
 static struct master_settings *master_settings_read(void)
@@ -515,7 +514,7 @@ static void main_log_startup(char **protocols)
 
 static void master_set_process_limit(void)
 {
-	struct service *const *servicep;
+	struct service *service;
 	unsigned int process_limit = 0;
 	rlim_t nproc;
 
@@ -526,8 +525,8 @@ static void master_set_process_limit(void)
 	   guess: mail processes should probably be counted together for a
 	   common vmail user (unless system users are being used), but
 	   we can't really guess what the mail processes are. */
-	array_foreach(&services->services, servicep)
-		process_limit += (*servicep)->process_limit;
+	array_foreach_elem(&services->services, service)
+		process_limit += service->process_limit;
 
 	if (restrict_get_process_limit(&nproc) == 0 &&
 	    process_limit > nproc)
@@ -593,6 +592,8 @@ static void main_deinit(void)
 
 	service_anvil_global_deinit();
 	service_pids_deinit();
+	/* notify systemd that we are done */
+	i_sd_notify(0, "STATUS=Dovecot stopped");
 }
 
 static const char *get_full_config_path(struct service_list *list)
@@ -617,12 +618,16 @@ master_time_moved(const struct timeval *old_time,
 	long long diff = timeval_diff_usecs(old_time, new_time);
 	unsigned int msecs;
 
-	if (diff < 0)
+	if (diff < 0) {
+		diff = -diff;
+		i_warning("Time moved forward by %lld.%06lld seconds - adjusting timeouts.",
+			  diff / 1000000, diff % 1000000);
 		return;
+	}
 	msecs = (unsigned int)(diff/1000);
 
 	/* time moved backwards. disable launching new service processes
-	   until  */
+	   until the throttling timeout has reached. */
 	if (msecs > SERVICE_TIME_MOVED_BACKWARDS_MAX_THROTTLE_MSECS)
 		msecs = SERVICE_TIME_MOVED_BACKWARDS_MAX_THROTTLE_MSECS;
 	services_throttle_time_sensitives(services, msecs);
@@ -705,9 +710,6 @@ static void print_build_options(void)
 #ifdef PASSDB_BSDAUTH
 		" bsdauth"
 #endif
-#ifdef PASSDB_CHECKPASSWORD
-		" checkpassword"
-#endif
 #ifdef PASSDB_LDAP
 		" ldap"
 #endif
@@ -720,16 +722,10 @@ static void print_build_options(void)
 #ifdef PASSDB_PASSWD_FILE
 		" passwd-file"
 #endif
-#ifdef PASSDB_SHADOW 
-		" shadow"
-#endif
 #ifdef PASSDB_SQL 
 		" sql"
 #endif
 	"\nUserdb:"
-#ifdef USERDB_CHECKPASSWORD
-		" checkpassword"
-#endif
 #ifdef USERDB_LDAP
 		" ldap"
 #ifndef BUILTIN_LDAP
@@ -773,7 +769,7 @@ int main(int argc, char *argv[])
 	/* drop -- prefix from all --args. ugly, but the only way that it
 	   works with standard getopt() in all OSes.. */
 	for (i = 1; i < argc; i++) {
-		if (str_begins(argv[i], "--")) {
+		if (str_begins_with(argv[i], "--")) {
 			if (argv[i][2] == '\0')
 				break;
 			argv[i] += 2;
@@ -786,7 +782,8 @@ int main(int argc, char *argv[])
 				MASTER_SERVICE_FLAG_STANDALONE |
 				MASTER_SERVICE_FLAG_DONT_SEND_STATS |
 				MASTER_SERVICE_FLAG_DONT_LOG_TO_STDERR |
-				MASTER_SERVICE_FLAG_NO_INIT_DATASTACK_FRAME,
+				MASTER_SERVICE_FLAG_NO_INIT_DATASTACK_FRAME |
+				MASTER_SERVICE_FLAG_DISABLE_SSL_SET,
 				&argc, &argv, "+Fanp");
 	i_unset_failure_prefix();
 
@@ -818,7 +815,7 @@ int main(int argc, char *argv[])
 			if (!master_service_parse_option(master_service,
 							 c, optarg)) {
 				print_help();
-				exit(FATAL_DEFAULT);
+				lib_exit(FATAL_DEFAULT);
 			}
 			break;
 		}
@@ -884,6 +881,7 @@ int main(int argc, char *argv[])
 	pidfile_path =
 		i_strconcat(set->base_dir, "/"MASTER_PID_FILE_NAME, NULL);
 
+	lib_set_clean_exit(TRUE);
 	master_service_init_log(master_service);
 	startup_early_errors_flush();
 	i_get_failure_handlers(&orig_fatal_callback, &orig_error_callback,

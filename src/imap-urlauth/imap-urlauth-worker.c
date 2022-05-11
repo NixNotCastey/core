@@ -31,8 +31,6 @@
 #include <unistd.h>
 #include <sysexits.h>
 
-#define MAX_CTRL_HANDSHAKE 255
-
 /* max. length of input lines (URLs) */
 #define MAX_INBUF_SIZE 2048
 
@@ -217,7 +215,7 @@ static void client_abort(struct client *client, const char *reason)
 
 static void client_destroy(struct client *client)
 {
-	char **app;
+	char *app;
 
 	i_set_failure_prefix("imap-urlauth[%s](%s): ",
 			     my_pid, client->access_user);
@@ -257,8 +255,8 @@ static void client_destroy(struct client *client)
 		mail_storage_service_user_unref(&client->service_user);
 	i_free(client->access_user);
 	i_free(client->access_service);
-	array_foreach_modifiable(&client->access_apps, app)
-		i_free(*app);
+	array_foreach_elem(&client->access_apps, app)
+		i_free(app);
 	array_free(&client->access_apps);
 	i_free(client);
 
@@ -797,7 +795,7 @@ client_ctrl_read_fds(struct client *client)
 static void client_ctrl_input(struct client *client)
 {
 	const char *const *args;
-	const char *line;
+	const char *line, *value;
 	int ret;
 
 	timeout_reset(client->to_idle);
@@ -883,9 +881,9 @@ static void client_ctrl_input(struct client *client)
 		if (strcasecmp(*args, "debug") == 0) {
 			client->debug = TRUE;
 		/* apps=<access-application>[,<access-application,...] */
-		} else if (strncasecmp(*args, "apps=", 5) == 0 &&
-			   (*args)[5] != '\0') {
-			const char *const *apps = t_strsplit(*args+5, ",");
+		} else if (str_begins_icase(*args, "apps=", &value) &&
+			   value[0] != '\0') {
+			const char *const *apps = t_strsplit(value, ",");
 
 			while (*apps != NULL) {
 				char *app = i_strdup(*apps);

@@ -16,7 +16,6 @@
 #include <time.h>
 
 #define PENALTY_DEFAULT_EXPIRE_SECS (60*60)
-#define PENALTY_CHECKSUM_SAVE_COUNT
 #define CHECKSUM_VALUE_COUNT 2
 #define CHECKSUM_VALUE_PTR_COUNT 10
 
@@ -218,7 +217,7 @@ void penalty_inc(struct penalty *penalty, const char *ident,
 		rec->last_update = (1 << LAST_UPDATE_BITS) - 1;
 		rec->last_penalty = ioloop_time - rec->last_update;
 	} else {
-		rec->last_update = diff;
+		rec->last_update = time_to_uint32(diff);
 	}
 
 	DLLIST2_APPEND(&penalty->oldest, &penalty->newest, rec);

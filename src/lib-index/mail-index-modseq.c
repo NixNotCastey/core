@@ -91,6 +91,16 @@ bool mail_index_have_modseq_tracking(struct mail_index *index)
 	return mail_index_map_get_modseq_header(index->map) != NULL;
 }
 
+void mail_index_modseq_hdr_snapshot_update(struct mail_index_map *map)
+{
+	const struct mail_index_modseq_header *hdr =
+		mail_index_map_get_modseq_header(map);
+	if (hdr != NULL)
+		map->modseq_hdr_snapshot = *hdr;
+	else
+		i_zero(&map->modseq_hdr_snapshot);
+}
+
 const struct mail_index_modseq_header *
 mail_index_map_get_modseq_header(struct mail_index_map *map)
 {
@@ -104,7 +114,7 @@ mail_index_map_get_modseq_header(struct mail_index_map *map)
 	if (ext->hdr_size != sizeof(struct mail_index_modseq_header))
 		return NULL;
 
-	return CONST_PTR_OFFSET(map->hdr_base, ext->hdr_offset);
+	return MAIL_INDEX_MAP_HDR_OFFSET(map, ext->hdr_offset);
 }
 
 uint64_t mail_index_map_modseq_get_highest(struct mail_index_map *map)
@@ -161,7 +171,7 @@ uint64_t mail_index_modseq_lookup(struct mail_index_view *view, uint32_t seq)
 	if (mmap == NULL)
 		return mail_index_modseq_get_head(view->index);
 
-	rec = mail_index_lookup_full(view, seq, &map);
+	rec = mail_index_lookup_full(view, seq, &map, NULL);
 	if (!mail_index_map_get_ext_idx(map, view->index->modseq_ext_id,
 					&ext_map_idx)) {
 		/* not enabled yet */
@@ -406,7 +416,7 @@ static void mail_index_modseq_sync_init(struct mail_index_modseq_sync *ctx)
 	ext = array_idx(&map->extensions, ext_map_idx);
 
 	/* get the current highest_modseq. don't change any modseq below it. */
-	hdr = CONST_PTR_OFFSET(map->hdr_base, ext->hdr_offset);
+	hdr = MAIL_INDEX_MAP_HDR_OFFSET(map, ext->hdr_offset);
 
 	/* Scan logs for updates between ext_hdr.log_* .. view position.
 	   There are two reasons why there could be any:
@@ -498,7 +508,7 @@ static void mail_index_modseq_update_header(struct mail_index_modseq_sync *ctx)
 	highest_modseq = mail_transaction_log_view_get_prev_modseq(view->log_view);
 
 	ext = array_idx(&map->extensions, ext_map_idx);
-	old_modseq_hdr = CONST_PTR_OFFSET(map->hdr_base, ext->hdr_offset);
+	old_modseq_hdr = MAIL_INDEX_MAP_HDR_OFFSET(map, ext->hdr_offset);
 
 	if (old_modseq_hdr->log_seq < log_seq ||
 	    (old_modseq_hdr->log_seq == log_seq &&
@@ -510,7 +520,6 @@ static void mail_index_modseq_update_header(struct mail_index_modseq_sync *ctx)
 
 		buffer_write(map->hdr_copy_buf, ext->hdr_offset,
 			     &new_modseq_hdr, sizeof(new_modseq_hdr));
-		map->hdr_base = map->hdr_copy_buf->data;
 		i_assert(map->hdr_copy_buf->used == map->hdr.header_size);
 	}
 }

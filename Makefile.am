@@ -21,30 +21,34 @@ EXTRA_DIST = \
 	run-test-valgrind.supp \
 	dovecot.service.in \
 	dovecot.socket \
+	version \
 	$(conf_DATA)
 
 noinst_DATA = dovecot-config
 
 nodist_pkginclude_HEADERS = config.h
 
+version:
+	$(AM_V_GEN)$(top_srcdir)/build-aux/git-version-gen > $@
+
 README: README.md
-	$(PANDOC) -f markdown_github -t plain -o $@ $<
+	$(AM_V_GEN)$(PANDOC) -f markdown_github -t plain -o $@ $<
 
 INSTALL: INSTALL.md
-	$(PANDOC) -f markdown_github -t plain -o $@ $<
+	$(AM_V_GEN)$(PANDOC) -f markdown_github -t plain -o $@ $<
 
 ChangeLog:
-	git log --name-status --pretty="format:%ai %aN <%aE> (%h)%n%n%w(80,4,4)%s%n%n%b" 5d5c4f2bfb812c767084c0338dae692db476da10^.. > ChangeLog || rm -f ChangeLog
+	$(AM_V_GEN)git log --name-status --pretty="format:%ai %aN <%aE> (%h)%n%n%w(80,4,4)%s%n%n%b" 5d5c4f2bfb812c767084c0338dae692db476da10^.. > ChangeLog || rm -f ChangeLog
 
 aclocal_DATA = m4/dovecot.m4
 
 dovecot-version.h: noop
-	$(SHELL) $(top_srcdir)/update-version.sh $(top_srcdir) $(top_builddir)
+	$(AM_V_GEN)$(SHELL) $(top_srcdir)/update-version.sh $(top_srcdir) $(top_builddir)
 
 noop:
 
 dovecot-config: dovecot-config.in Makefile
-	old=`pwd` && cd $(top_builddir) && abs_builddir=`pwd` && cd $$old && \
+	$(AM_V_GEN)old=`pwd` && cd $(top_builddir) && abs_builddir=`pwd` && cd $$old && \
 	cd $(top_srcdir) && abs_srcdir=`pwd` && cd $$old && \
 	(echo "DOVECOT_INSTALLED=no"; cat dovecot-config.in | sed \
 	-e "s|\$$(top_builddir)|$$abs_builddir|g" \
@@ -59,10 +63,14 @@ dovecot-config: dovecot-config.in Makefile
 	-e "s|^\(dovecot_statedir\)=|\1=$(statedir)|" \
 	) > dovecot-config
 
-if HAVE_LIBSYSTEMD
 %.service: %.service.in
-	$(AM_V_GEN)sed -e 's,@sbindir\@,$(sbindir),g' -e 's,@bindir\@,$(bindir),g' -e 's,@rundir\@,$(rundir),g' $< > $@
+	$(AM_V_GEN)sed -e 's,@sbindir\@,$(sbindir),g' \
+	-e 's,@bindir\@,$(bindir),g' \
+	-e 's,@rundir\@,$(rundir),g' \
+	-e 's,@systemdservicetype\@,$(systemdservicetype),g' \
+	$< > $@
 
+if WANT_SYSTEMD
 systemdsystemunit_DATA = \
         dovecot.socket \
         dovecot.service
@@ -88,7 +96,7 @@ install-exec-hook:
 uninstall-hook:
 	rm $(DESTDIR)$(pkglibdir)/dovecot-config
 
-if HAVE_LIBSYSTEMD
+if WANT_SYSTEMD
 CLEANFILES = dovecot.service
 endif
 
@@ -100,7 +108,7 @@ DISTCLEANFILES = \
 distcheck-hook:
 	if which scan-build > /dev/null; then \
 	  cd $(distdir)/_build; \
-	  scan-build -o scan-reports ../configure --with-ldap=auto --with-pgsql=auto --with-mysql=auto --with-sqlite=auto --with-solr=auto --with-gssapi=auto --with-libwrap=auto; \
+	  scan-build -o scan-reports ../configure --with-ldap=auto --with-pgsql=auto --with-mysql=auto --with-sqlite=auto --with-solr=auto --with-cassandra=auto --with-lua=auto --with-gssapi=auto --with-libwrap=auto --enable-static-checker; \
 	  rm -rf scan-reports; \
 	  scan-build -o scan-reports make 2>&1 || exit 1; \
 	  if ! rmdir scan-reports 2>/dev/null; then \

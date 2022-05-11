@@ -81,25 +81,30 @@ enum client_auth_result {
 	CLIENT_AUTH_RESULT_ANONYMOUS_DENIED
 };
 
-struct client_auth_reply {
-	const char *master_user, *reason;
-	enum client_auth_fail_code fail_code;
+enum client_list_type {
+	CLIENT_LIST_TYPE_NONE = 0,
+	/* clients (disconnected=FALSE, fd_proxying=FALSE, destroyed=FALSE) */
+	CLIENT_LIST_TYPE_ACTIVE,
+	/* destroyed_clients (destroyed=TRUE, fd_proxying=FALSE). Either the
+	   client will soon be freed or it's only referenced via
+	   "login_proxies". */
+	CLIENT_LIST_TYPE_DESTROYED,
+	/* client_fd_proxies (fd_proxying=TRUE) */
+	CLIENT_LIST_TYPE_FD_PROXY,
+};
 
-	/* for proxying */
-	const char *host, *hostip, *source_ip;
-	const char *destuser, *password, *proxy_mech;
-	in_port_t port;
-	unsigned int proxy_timeout_msecs;
+struct client_auth_reply {
+	const char *reason;
+	enum client_auth_fail_code fail_code;
+	ARRAY_TYPE(const_string) alt_usernames;
+
+	struct auth_proxy_settings proxy;
 	unsigned int proxy_refresh_secs;
 	unsigned int proxy_host_immediate_failure_after_secs;
-	enum login_proxy_ssl_flags ssl_flags;
 
 	/* all the key=value fields returned by passdb */
 	const char *const *all_fields;
 
-	bool proxy:1;
-	bool proxy_nopipelining:1;
-	bool proxy_not_trusted:1;
 	bool nologin:1;
 };
 
@@ -139,11 +144,9 @@ struct client_vfuncs {
 };
 
 struct client {
-	/* If disconnected=FALSE, the client is in "clients" list.
-	   If fd_proxying=TRUE, the client is in "client_fd_proxies" list.
-	   Otherwise, either the client will soon be freed or it's only
-	   referenced via "login_proxies" which doesn't use these pointers. */
 	struct client *prev, *next;
+	/* Specifies which linked list the client is in */
+	enum client_list_type list_type;
 
 	pool_t pool;
 	/* this pool gets free'd once proxying starts */
@@ -163,6 +166,7 @@ struct client {
 	struct ssl_iostream *ssl_iostream;
 	const struct login_settings *set;
 	const struct master_service_ssl_settings *ssl_set;
+	const struct master_service_ssl_server_settings *ssl_server_set;
 	const char *session_id, *listener_name, *postlogin_socket_path;
 	const char *local_name;
 	const char *client_cert_common_name;
@@ -188,12 +192,15 @@ struct client {
 	unsigned int proxy_ttl;
 
 	char *auth_mech_name;
+	enum sasl_server_auth_flags auth_flags;
 	struct auth_client_request *auth_request;
+	struct auth_client_request *reauth_request;
 	string_t *auth_response;
 	time_t auth_first_started, auth_finished;
 	const char *sasl_final_resp;
 	const char *const *auth_passdb_args;
 	struct anvil_query *anvil_query;
+	struct anvil_request *anvil_request;
 
 	unsigned int master_auth_id;
 	unsigned int master_tag;
@@ -235,9 +242,12 @@ struct client {
 	bool auth_initializing:1;
 	bool auth_process_comm_fail:1;
 	bool auth_anonymous:1;
+	bool auth_nologin_referral:1;
 	bool proxy_auth_failed:1;
+	bool proxy_noauth:1;
 	bool proxy_nopipelining:1;
 	bool proxy_not_trusted:1;
+	bool proxy_redirect_reauth:1;
 	bool auth_waiting:1;
 	bool notified_auth_ready:1;
 	bool notified_disconnect:1;
@@ -266,7 +276,8 @@ struct client *
 client_alloc(int fd, pool_t pool,
 	     const struct master_service_connection *conn,
 	     const struct login_settings *set,
-	     const struct master_service_ssl_settings *ssl_set);
+	     const struct master_service_ssl_settings *ssl_set,
+	     const struct master_service_ssl_server_settings *ssl_server_set);
 void client_init(struct client *client, void **other_sets);
 void client_disconnect(struct client *client, const char *reason,
 		       bool add_disconnected_prefix);
@@ -331,6 +342,8 @@ int client_auth_begin(struct client *client, const char *mech_name,
 		      const char *init_resp);
 int client_auth_begin_private(struct client *client, const char *mech_name,
 			      const char *init_resp);
+int client_auth_begin_implicit(struct client *client, const char *mech_name,
+			       const char *init_resp);
 bool client_check_plaintext_auth(struct client *client, bool pass_sent);
 int client_auth_read_line(struct client *client);
 

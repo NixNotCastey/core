@@ -251,6 +251,8 @@ body_header_fields_parse(struct imap_fetch_init_context *ctx,
 	const char *value;
 	size_t i;
 
+	ctx->fetch_ctx->fetch_header_fields = TRUE;
+
 	str = str_new(ctx->pool, 128);
 	str_append(str, prefix);
 	str_append(str, " (");
@@ -326,14 +328,12 @@ bool imap_fetch_body_section_init(struct imap_fetch_init_context *ctx)
 	unsigned int list_count;
 	const char *str, *p, *error;
 
-	i_assert(str_begins(ctx->name, "BODY"));
-	p = ctx->name + 4;
+	if (!str_begins(ctx->name, "BODY", &p))
+		i_unreached();
 
 	body = p_new(ctx->pool, struct imap_fetch_body_data, 1);
 
-	if (str_begins(p, ".PEEK"))
-		p += 5;
-	else
+	if (!str_begins(p, ".PEEK", &p))
 		ctx->fetch_ctx->flags_update_seen = TRUE;
 	if (*p != '[') {
 		ctx->error = "Invalid BODY[..] parameter: Missing '['";
@@ -391,19 +391,16 @@ bool imap_fetch_binary_init(struct imap_fetch_init_context *ctx)
 	unsigned int list_count;
 	const char *str, *p, *error;
 
-	i_assert(str_begins(ctx->name, "BINARY"));
-	p = ctx->name + 6;
+	if (!str_begins(ctx->name, "BINARY", &p))
+		i_unreached();
 
 	body = p_new(ctx->pool, struct imap_fetch_body_data, 1);
 	body->binary = TRUE;
 
-	if (str_begins(p, ".SIZE")) {
+	if (str_begins(p, ".SIZE", &p)) {
 		/* fetch decoded size of the section */
-		p += 5;
 		body->binary_size = TRUE;
-	} else if (str_begins(p, ".PEEK")) {
-		p += 5;
-	} else {
+	} else if (!str_begins(p, ".PEEK", &p)) {
 		ctx->fetch_ctx->flags_update_seen = TRUE;
 	}
 	if (*p != '[') {
@@ -648,6 +645,7 @@ fetch_snippet(struct imap_fetch_context *ctx, struct mail *mail,
 		str_append(ctx->state.cur_str, "NIL");
 	if (preview->old_standard)
 		str_append(ctx->state.cur_str, ")");
+	str_append_c(ctx->state.cur_str, ' ');
 
 	return 1;
 }

@@ -1,6 +1,8 @@
 #ifndef EVENT_FILTER_PRIVATE_H
 #define EVENT_FILTER_PRIVATE_H
 
+#include "event-filter.h"
+
 enum event_filter_node_op {
 	/* leaf nodes */
 	EVENT_FILTER_OP_CMP_EQ = 1,
@@ -15,15 +17,28 @@ enum event_filter_node_op {
 	EVENT_FILTER_OP_NOT,
 };
 
+struct event_filter {
+	struct event_filter *prev, *next;
+
+	pool_t pool;
+	int refcount;
+	ARRAY(struct event_filter_query_internal) queries;
+
+	bool fragment;
+	bool named_queries_only;
+};
+
 enum event_filter_node_type {
 	/* internal nodes */
 	EVENT_FILTER_NODE_TYPE_LOGIC = 1, /* children */
 
 	/* leaf nodes */
-	EVENT_FILTER_NODE_TYPE_EVENT_NAME, /* str */
+	EVENT_FILTER_NODE_TYPE_EVENT_NAME_EXACT, /* str */
+	EVENT_FILTER_NODE_TYPE_EVENT_NAME_WILDCARD, /* str */
 	EVENT_FILTER_NODE_TYPE_EVENT_SOURCE_LOCATION, /* str + int */
 	EVENT_FILTER_NODE_TYPE_EVENT_CATEGORY, /* cat */
-	EVENT_FILTER_NODE_TYPE_EVENT_FIELD, /* field */
+	EVENT_FILTER_NODE_TYPE_EVENT_FIELD_EXACT, /* field */
+	EVENT_FILTER_NODE_TYPE_EVENT_FIELD_WILDCARD, /* field */
 };
 
 enum event_filter_log_type {

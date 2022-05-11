@@ -343,8 +343,14 @@ test_auth_handshake_auth_plain(struct server_connection *conn, unsigned int id,
 		return FALSE;
 	}
 
-	if (authenid == NULL)
-		authenid = authid;
+	i_assert(authenid != NULL);
+	if (strcmp(authid, "supremelordoftheuniverse") != 0) {
+		/* unexpected authorization ID */
+		o_stream_nsend_str(
+			conn->conn.output,
+			t_strdup_printf("FAIL\t%u\tuser=%s\n", id, authenid));
+		return TRUE;
+	}
 	if (strcmp(authenid, "harrie") == 0 && strcmp(pass, "frop") == 0) {
 		o_stream_nsend_str(
 			conn->conn.output,
@@ -449,14 +455,12 @@ test_auth_handshake_auth(struct server_connection *conn, unsigned int id,
 	mech = args[0];
 	resp = NULL;
 	for (i = 1; args[i] != NULL; i++) {
-		if (str_begins(args[i], "resp=")) {
-			resp = t_strdup(args[i] + 5);
+		if (str_begins(args[i], "resp=", &resp))
 			break;
-		}
 	}
 	data = t_buffer_create(256);
 	if (resp != NULL) {
-		if (base64_decode(resp, strlen(resp), NULL, data) < 0) {
+		if (base64_decode(resp, strlen(resp), data) < 0) {
 			i_error("Bad AUTH request: Bad base64");
 			return FALSE;
 		}
@@ -490,7 +494,7 @@ test_auth_handshake_cont(struct server_connection *conn, unsigned int id,
 	resp = args[0];
 	data = t_buffer_create(256);
 	if (resp != NULL) {
-		if (base64_decode(resp, strlen(resp), NULL, data) < 0) {
+		if (base64_decode(resp, strlen(resp), data) < 0) {
 			i_error("Bad CONT request: Bad base64");
 			return FALSE;
 		}
@@ -530,7 +534,7 @@ static void test_auth_handshake_input(struct server_connection *conn)
 
 		switch (ctx->state) {
 		case AUTH_HANDSHAKE_STATE_VERSION:
-			if (!str_begins(line, "VERSION\t")) {
+			if (!str_begins_with(line, "VERSION\t")) {
 				i_error("Bad VERSION");
 				server_connection_deinit(&conn);
 				return;

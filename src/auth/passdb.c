@@ -3,7 +3,7 @@
 #include "auth-common.h"
 #include "array.h"
 #include "password-scheme.h"
-#include "auth-worker-server.h"
+#include "auth-worker-connection.h"
 #include "passdb.h"
 
 static ARRAY(struct passdb_module_interface *) passdb_interfaces;
@@ -15,11 +15,9 @@ static const struct passdb_module_interface passdb_iface_deinit = {
 
 static struct passdb_module_interface *passdb_interface_find(const char *name)
 {
-	struct passdb_module_interface *const *ifaces;
+	struct passdb_module_interface *iface;
 
-	array_foreach(&passdb_interfaces, ifaces) {
-		struct passdb_module_interface *iface = *ifaces;
-
+	array_foreach_elem(&passdb_interfaces, iface) {
 		if (strcmp(iface->name, name) == 0)
 			return iface;
 	}
@@ -317,10 +315,8 @@ extern struct passdb_module_interface passdb_dict;
 #ifdef HAVE_LUA
 extern struct passdb_module_interface passdb_lua;
 #endif
-extern struct passdb_module_interface passdb_shadow;
 extern struct passdb_module_interface passdb_passwd_file;
 extern struct passdb_module_interface passdb_pam;
-extern struct passdb_module_interface passdb_checkpassword;
 extern struct passdb_module_interface passdb_ldap;
 extern struct passdb_module_interface passdb_sql;
 extern struct passdb_module_interface passdb_static;
@@ -338,8 +334,6 @@ void passdbs_init(void)
 #endif
 	passdb_register_module(&passdb_passwd_file);
 	passdb_register_module(&passdb_pam);
-	passdb_register_module(&passdb_checkpassword);
-	passdb_register_module(&passdb_shadow);
 	passdb_register_module(&passdb_ldap);
 	passdb_register_module(&passdb_sql);
 	passdb_register_module(&passdb_static);

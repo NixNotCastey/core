@@ -206,8 +206,11 @@ static int fetch_body_field(struct fetch_cmd_context *ctx)
 	bool binary;
 	int ret;
 
-	binary = str_begins(name, "binary.");
-	name += binary ? 7 : 5;
+	binary = str_begins(name, "binary.", &name);
+	if (!binary) {
+		if (!str_begins(name, "body.", &name))
+			i_unreached();
+	}
 	if (imap_msgpart_parse(name, &msgpart) < 0)
 		i_unreached(); /* we already verified this was ok */
 	if (binary)
@@ -530,7 +533,7 @@ static void print_fetch_fields(void)
 
 static void parse_fetch_fields(struct fetch_cmd_context *ctx, const char *str)
 {
-	const char *const *fields, *name;
+	const char *const *fields, *name, *section;
 	const struct fetch_field *field;
 	struct fetch_field hdr_field, body_field;
 	struct imap_msgpart *msgpart;
@@ -551,21 +554,18 @@ static void parse_fetch_fields(struct fetch_cmd_context *ctx, const char *str)
 		if ((field = fetch_field_find(name)) != NULL) {
 			ctx->wanted_fields |= field->wanted_fields;
 			array_push_back(&ctx->fields, field);
-		} else if (str_begins(name, "hdr.")) {
-			name += 4;
+		} else if (str_begins(name, "hdr.", &name)) {
 			hdr_field.name = name;
 			array_push_back(&ctx->fields, &hdr_field);
 			name = t_strcut(name, '.');
 			array_push_back(&ctx->header_fields, &name);
-		} else if (str_begins(name, "body.") ||
-			   str_begins(name, "binary.")) {
-			bool binary = str_begins(name, "binary.");
+		} else if (str_begins(name, "body.", &section) ||
+			   str_begins(name, "binary.", &section)) {
 			body_field.name = t_strarray_join(t_strsplit(name, ","), " ");
 
-			name += binary ? 7 : 5;
-			if (imap_msgpart_parse(name, &msgpart) < 0) {
+			if (imap_msgpart_parse(section, &msgpart) < 0) {
 				print_fetch_fields();
-				i_fatal("Unknown fetch section: %s", name);
+				i_fatal("Unknown fetch section: %s", section);
 			}
 			array_push_back(&ctx->fields, &body_field);
 			ctx->wanted_fields |= imap_msgpart_get_fetch_data(msgpart);
@@ -604,15 +604,16 @@ static int
 cmd_fetch_box(struct fetch_cmd_context *ctx, const struct mailbox_info *info)
 {
 	struct doveadm_mail_iter *iter;
-	int ret = 0;
 
-	if (doveadm_mail_iter_init(&ctx->ctx, info, ctx->ctx.search_args,
-				   ctx->wanted_fields,
-				   array_front(&ctx->header_fields),
-				   FALSE,
-				   &iter) < 0)
-		return -1;
+	int ret = doveadm_mail_iter_init(&ctx->ctx, info, ctx->ctx.search_args,
+					 ctx->wanted_fields,
+					 array_front(&ctx->header_fields),
+					 DOVEADM_MAIL_ITER_FLAG_STOP_WITH_CLIENT,
+					 &iter);
+	if (ret <= 0)
+		return ret;
 
+	ret = 0;
 	while (doveadm_mail_iter_next(iter, &ctx->mail)) {
 		T_BEGIN {
 			if (cmd_fetch_mail(ctx) < 0)

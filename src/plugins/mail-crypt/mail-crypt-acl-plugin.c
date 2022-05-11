@@ -10,6 +10,7 @@
 #include "mail-namespace.h"
 #include "mail-storage-hooks.h"
 #include "mail-storage-service.h"
+#include "mail-user.h"
 #include "acl-plugin.h"
 #include "acl-api-private.h"
 #include "mail-crypt-common.h"
@@ -110,14 +111,14 @@ mail_crypt_acl_unset_private_keys(struct mailbox *src_box,
 	struct mailbox_transaction_context *t;
 	t = mailbox_transaction_begin(src_box, 0, __func__);
 
-	const char *const *hash;
-	array_foreach(&digests, hash) {
+	const char *hash;
+	array_foreach_elem(&digests, hash) {
 		const char *ptr;
 		/* if the id contains username part, skip to key public id */
-		if ((ptr = strchr(*hash, '/')) != NULL)
+		if ((ptr = strchr(hash, '/')) != NULL)
 			ptr++;
 		else
-			ptr = *hash;
+			ptr = hash;
 		if ((ret = mail_crypt_box_unset_shared_key(t, ptr, dest_user,
 							   error_r)) < 0) {
 			ret = -1;
@@ -180,7 +181,7 @@ mail_crypt_acl_update_private_key(struct mailbox *src_box,
 				  const char **error_r)
 {
 	struct dcrypt_public_key *key = NULL;
-	struct dcrypt_private_key **keyp;
+	struct dcrypt_private_key *priv_key;
 	int ret = 0;
 
 	if (!set) {
@@ -225,9 +226,8 @@ mail_crypt_acl_update_private_key(struct mailbox *src_box,
 		dcrypt_key_unref_public(&key);
 
 	if (ret >= 0) {
-		array_foreach_modifiable(&keys, keyp) {
-			dcrypt_key_unref_private(keyp);
-		}
+		array_foreach_elem(&keys, priv_key)
+			dcrypt_key_unref_private(&priv_key);
 	}
 
 	if (mailbox_transaction_commit(&t) < 0) {
@@ -255,7 +255,8 @@ static int mail_crypt_acl_object_update(struct acl_object *aclobj,
 		return -1;
 
 	bool disallow_insecure =
-		mail_crypt_acl_secure_sharing_enabled(aclobj->backend->list->ns->user);
+		mail_user_plugin_getenv_bool(aclobj->backend->list->ns->user,
+					     MAIL_CRYPT_ACL_SECURE_SHARE_SETTING);
 
 	const char *box_name = mailbox_list_get_vname(aclobj->backend->list,
 						      aclobj->name);

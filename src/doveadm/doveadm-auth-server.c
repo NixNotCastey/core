@@ -141,19 +141,21 @@ cmd_user_input(struct auth_master_connection *conn,
 
 static void auth_user_info_parse(struct auth_user_info *info, const char *arg)
 {
-	if (str_begins(arg, "service="))
-		info->service = arg + 8;
-	else if (str_begins(arg, "lip=")) {
-		if (net_addr2ip(arg + 4, &info->local_ip) < 0)
+	const char *value;
+
+	if (str_begins(arg, "service=", &value))
+		info->service = value;
+	else if (str_begins(arg, "lip=", &value)) {
+		if (net_addr2ip(value, &info->local_ip) < 0)
 			i_fatal("lip: Invalid ip");
-	} else if (str_begins(arg, "rip=")) {
-		if (net_addr2ip(arg + 4, &info->remote_ip) < 0)
+	} else if (str_begins(arg, "rip=", &value)) {
+		if (net_addr2ip(value, &info->remote_ip) < 0)
 			i_fatal("rip: Invalid ip");
-	} else if (str_begins(arg, "lport=")) {
-		if (net_str2port(arg + 6, &info->local_port) < 0)
+	} else if (str_begins(arg, "lport=", &value)) {
+		if (net_str2port(value, &info->local_port) < 0)
 			i_fatal("lport: Invalid port number");
-	} else if (str_begins(arg, "rport=")) {
-		if (net_str2port(arg + 6, &info->remote_port) < 0)
+	} else if (str_begins(arg, "rport=", &value)) {
+		if (net_str2port(value, &info->remote_port) < 0)
 			i_fatal("rport: Invalid port number");
 	} else {
 		i_fatal("Unknown -x argument: %s", arg);
@@ -202,32 +204,21 @@ cmd_user_list(struct auth_master_connection *conn,
 	o_stream_nsend_str(doveadm_print_ostream, "]}");
 }
 
-static void cmd_auth_cache_flush(int argc, char *argv[])
+static void cmd_auth_cache_flush(struct doveadm_cmd_context *cctx)
 {
-	const char *master_socket_path = NULL;
+	const char *master_socket_path, *const *users;
 	struct auth_master_connection *conn;
 	unsigned int count;
-	int c;
 
-	while ((c = getopt(argc, argv, "a:")) > 0) {
-		switch (c) {
-		case 'a':
-			master_socket_path = optarg;
-			break;
-		default:
-			doveadm_exit_code = EX_USAGE;
-			return;
-		}
-	}
-	argv += optind;
-
-	if (master_socket_path == NULL) {
+	if (!doveadm_cmd_param_str(cctx, "socket-path", &master_socket_path)) {
 		master_socket_path = t_strconcat(doveadm_settings->base_dir,
 						 "/auth-master", NULL);
 	}
+	if (!doveadm_cmd_param_array(cctx, "user", &users))
+		i_fatal("Missing user parameter");
 
 	conn = doveadm_get_auth_master_conn(master_socket_path);
-	if (auth_master_cache_flush(conn, (void *)argv, &count) < 0) {
+	if (auth_master_cache_flush(conn, users, &count) < 0) {
 		i_error("Cache flush failed");
 		doveadm_exit_code = EX_TEMPFAIL;
 	} else {
@@ -495,7 +486,7 @@ static
 struct doveadm_cmd_ver2 doveadm_cmd_auth_server[] = {
 {
 	.name = "auth cache flush",
-	.old_cmd = cmd_auth_cache_flush,
+	.cmd = cmd_auth_cache_flush,
 	.usage = "[-a <master socket path>] [<user> [...]]",
 DOVEADM_CMD_PARAMS_START
 DOVEADM_CMD_PARAM('a', "socket-path", CMD_PARAM_STR, 0)

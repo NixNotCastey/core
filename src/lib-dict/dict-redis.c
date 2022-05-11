@@ -47,7 +47,7 @@ struct redis_dict_reply {
 
 struct redis_dict {
 	struct dict dict;
-	char *username, *password, *key_prefix, *expire_value;
+	char *password, *key_prefix, *expire_value;
 	unsigned int timeout_msecs, db_id;
 
 	struct redis_connection conn;
@@ -79,6 +79,17 @@ static void redis_input_state_remove(struct redis_dict *dict)
 	array_pop_front(&dict->input_states);
 }
 
+static void redis_reply_callback(struct redis_connection *conn,
+				 const struct redis_dict_reply *reply,
+				 const struct dict_commit_result *result)
+{
+	if (conn->dict->dict.prev_ioloop != NULL)
+		io_loop_set_current(conn->dict->dict.prev_ioloop);
+	reply->callback(result, reply->context);
+	if (conn->dict->dict.prev_ioloop != NULL)
+		io_loop_set_current(conn->dict->dict.ioloop);
+}
+
 static void
 redis_disconnected(struct redis_connection *conn, const char *reason)
 {
@@ -92,7 +103,7 @@ redis_disconnected(struct redis_connection *conn, const char *reason)
 	connection_disconnect(&conn->conn);
 
 	array_foreach(&conn->dict->replies, reply)
-		reply->callback(&result, reply->context);
+		redis_reply_callback(conn, reply, &result);
 	array_clear(&conn->dict->replies);
 	array_clear(&conn->dict->input_states);
 
@@ -247,7 +258,7 @@ redis_conn_input_more(struct redis_connection *conn, const char **error_r)
 			const struct dict_commit_result result = {
 				DICT_COMMIT_RET_OK, NULL
 			};
-			reply->callback(&result, reply->context);
+			redis_reply_callback(conn, reply, &result);
 			array_pop_front(&dict->replies);
 			/* if we're running in a dict-ioloop, we're handling a
 			   synchronous commit and need to stop now */
@@ -340,7 +351,7 @@ redis_dict_init(struct dict *driver, const char *uri,
 	struct ip_addr ip;
 	unsigned int secs;
 	in_port_t port = REDIS_DEFAULT_PORT;
-	const char *const *args, *unix_path = NULL;
+	const char *const *args, *value, *unix_path = NULL;
 	int ret = 0;
 
 	if (redis_connections == NULL) {
@@ -358,32 +369,30 @@ redis_dict_init(struct dict *driver, const char *uri,
 
 	args = t_strsplit(uri, ":");
 	for (; *args != NULL; args++) {
-		if (str_begins(*args, "path=")) {
-			unix_path = *args + 5;
-		} else if (str_begins(*args, "host=")) {
-			if (net_addr2ip(*args+5, &ip) < 0) {
+		if (str_begins(*args, "path=", &value)) {
+			unix_path = value;
+		} else if (str_begins(*args, "host=", &value)) {
+			if (net_addr2ip(value, &ip) < 0) {
 				*error_r = t_strdup_printf("Invalid IP: %s",
-							   *args+5);
+							   value);
 				ret = -1;
 			}
-		} else if (str_begins(*args, "port=")) {
-			if (net_str2port(*args+5, &port) < 0) {
+		} else if (str_begins(*args, "port=", &value)) {
+			if (net_str2port(value, &port) < 0) {
 				*error_r = t_strdup_printf("Invalid port: %s",
-							   *args+5);
+							   value);
 				ret = -1;
 			}
-		} else if (str_begins(*args, "prefix=")) {
+		} else if (str_begins(*args, "prefix=", &value)) {
 			i_free(dict->key_prefix);
-			dict->key_prefix = i_strdup(*args + 7);
-		} else if (str_begins(*args, "db=")) {
-			if (str_to_uint(*args+3, &dict->db_id) < 0) {
+			dict->key_prefix = i_strdup(value);
+		} else if (str_begins(*args, "db=", &value)) {
+			if (str_to_uint(value, &dict->db_id) < 0) {
 				*error_r = t_strdup_printf(
-					"Invalid db number: %s", *args+3);
+					"Invalid db number: %s", value);
 				ret = -1;
 			}
-		} else if (str_begins(*args, "expire_secs=")) {
-			const char *value = *args + 12;
-
+		} else if (str_begins(*args, "expire_secs=", &value)) {
 			if (str_to_uint(value, &secs) < 0 || secs == 0) {
 				*error_r = t_strdup_printf(
 					"Invalid expire_secs: %s", value);
@@ -391,15 +400,15 @@ redis_dict_init(struct dict *driver, const char *uri,
 			}
 			i_free(dict->expire_value);
 			dict->expire_value = i_strdup(value);
-		} else if (str_begins(*args, "timeout_msecs=")) {
-			if (str_to_uint(*args+14, &dict->timeout_msecs) < 0) {
+		} else if (str_begins(*args, "timeout_msecs=", &value)) {
+			if (str_to_uint(value, &dict->timeout_msecs) < 0) {
 				*error_r = t_strdup_printf(
-					"Invalid timeout_msecs: %s", *args+14);
+					"Invalid timeout_msecs: %s", value);
 				ret = -1;
 			}
-		} else if (str_begins(*args, "password=")) {
+		} else if (str_begins(*args, "password=", &value)) {
 			i_free(dict->password);
-			dict->password = i_strdup(*args + 9);
+			dict->password = i_strdup(value);
 		} else {
 			*error_r = t_strdup_printf("Unknown parameter: %s",
 						   *args);
@@ -429,12 +438,6 @@ redis_dict_init(struct dict *driver, const char *uri,
 
 	i_array_init(&dict->input_states, 4);
 	i_array_init(&dict->replies, 4);
-	if (strchr(set->username, DICT_USERNAME_SEPARATOR) == NULL)
-		dict->username = i_strdup(set->username);
-	else {
-		/* escape the username */
-		dict->username = i_strdup(redis_escape_username(set->username));
-	}
 
 	*dict_r = &dict->dict;
 	return 0;
@@ -455,7 +458,6 @@ static void redis_dict_deinit(struct dict *_dict)
 	i_free(dict->expire_value);
 	i_free(dict->key_prefix);
 	i_free(dict->password);
-	i_free(dict->username);
 	i_free(dict);
 
 	if (redis_connections->connections == NULL)
@@ -479,14 +481,18 @@ static void redis_dict_lookup_timeout(struct redis_dict *dict)
 }
 
 static const char *
-redis_dict_get_full_key(struct redis_dict *dict, const char *key)
+redis_dict_get_full_key(struct redis_dict *dict, const char *username,
+			const char *key)
 {
-	if (str_begins(key, DICT_PATH_SHARED))
-		key += strlen(DICT_PATH_SHARED);
-	else if (str_begins(key, DICT_PATH_PRIVATE)) {
-		key = t_strdup_printf("%s%c%s", dict->username,
-				      DICT_USERNAME_SEPARATOR,
-				      key + strlen(DICT_PATH_PRIVATE));
+	const char *username_sp = strchr(username, DICT_USERNAME_SEPARATOR);
+
+	if (str_begins(key, DICT_PATH_SHARED, &key))
+		;
+	else if (str_begins(key, DICT_PATH_PRIVATE, &key)) {
+		key = t_strdup_printf("%s%c%s",
+				      username_sp == NULL ? username :
+						redis_escape_username(username),
+				      DICT_USERNAME_SEPARATOR, key);
 	} else {
 		i_unreached();
 	}
@@ -526,14 +532,16 @@ static void redis_dict_select_db(struct redis_dict *dict)
 	redis_input_state_add(dict, REDIS_INPUT_STATE_SELECT);
 }
 
-static int redis_dict_lookup(struct dict *_dict, pool_t pool, const char *key,
-			     const char **value_r, const char **error_r)
+static int redis_dict_lookup(struct dict *_dict,
+			     const struct dict_op_settings *set,
+			     pool_t pool, const char *key,
+			     const char *const **values_r, const char **error_r)
 {
 	struct redis_dict *dict = (struct redis_dict *)_dict;
 	struct timeout *to;
 	const char *cmd;
 
-	key = redis_dict_get_full_key(dict, key);
+	key = redis_dict_get_full_key(dict, set->username, key);
 
 	dict->conn.value_received = FALSE;
 	dict->conn.value_not_found = FALSE;
@@ -589,7 +597,9 @@ static int redis_dict_lookup(struct dict *_dict, pool_t pool, const char *key,
 	if (dict->conn.value_not_found)
 		return 0;
 
-	*value_r = p_strdup(pool, str_c(dict->conn.last_reply));
+	const char **values = p_new(pool, const char *, 2);
+	values[0] = p_strdup(pool, str_c(dict->conn.last_reply));
+	*values_r = values;
 	return 1;
 }
 
@@ -732,12 +742,13 @@ static void redis_set(struct dict_transaction_context *_ctx,
 	struct redis_dict_transaction_context *ctx =
 		(struct redis_dict_transaction_context *)_ctx;
 	struct redis_dict *dict = (struct redis_dict *)_ctx->dict;
+	const struct dict_op_settings_private *set = &_ctx->set;
 	string_t *cmd;
 
 	if (redis_check_transaction(ctx) < 0)
 		return;
 
-	key = redis_dict_get_full_key(dict, key);
+	key = redis_dict_get_full_key(dict, set->username, key);
 	cmd = t_str_new(128);
 	str_printfa(cmd, "*3\r\n$3\r\nSET\r\n$%u\r\n%s\r\n$%u\r\n%s\r\n",
 		    (unsigned int)strlen(key), key,
@@ -757,12 +768,13 @@ static void redis_unset(struct dict_transaction_context *_ctx,
 	struct redis_dict_transaction_context *ctx =
 		(struct redis_dict_transaction_context *)_ctx;
 	struct redis_dict *dict = (struct redis_dict *)_ctx->dict;
+	const struct dict_op_settings_private *set = &_ctx->set;
 	const char *cmd;
 
 	if (redis_check_transaction(ctx) < 0)
 		return;
 
-	key = redis_dict_get_full_key(dict, key);
+	key = redis_dict_get_full_key(dict, set->username, key);
 	cmd = t_strdup_printf("*2\r\n$3\r\nDEL\r\n$%u\r\n%s\r\n",
 			      (unsigned int)strlen(key), key);
 	if (o_stream_send_str(dict->conn.conn.output, cmd) < 0) {
@@ -779,13 +791,14 @@ static void redis_atomic_inc(struct dict_transaction_context *_ctx,
 	struct redis_dict_transaction_context *ctx =
 		(struct redis_dict_transaction_context *)_ctx;
 	struct redis_dict *dict = (struct redis_dict *)_ctx->dict;
+	const struct dict_op_settings_private *set = &_ctx->set;
 	const char *diffstr;
 	string_t *cmd;
 
 	if (redis_check_transaction(ctx) < 0)
 		return;
 
-	key = redis_dict_get_full_key(dict, key);
+	key = redis_dict_get_full_key(dict, set->username, key);
 	diffstr = t_strdup_printf("%lld", diff);
 	cmd = t_str_new(128);
 	str_printfa(cmd, "*3\r\n$6\r\nINCRBY\r\n$%u\r\n%s\r\n$%u\r\n%s\r\n",

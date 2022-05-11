@@ -41,6 +41,7 @@ struct item {
 			const struct dsync_mailbox_delete *deletes;
 			unsigned int count;
 			char hierarchy_sep;
+			char escape_char;
 		} mailbox_delete;
 		struct {
 			const char *error;
@@ -141,7 +142,7 @@ static void dsync_ibc_pipe_deinit(struct dsync_ibc *ibc)
 {
 	struct dsync_ibc_pipe *pipe = (struct dsync_ibc_pipe *)ibc;
 	struct item *item;
-	pool_t *poolp;
+	pool_t pool;
 
 	if (pipe->remote != NULL) {
 		i_assert(pipe->remote->remote == pipe);
@@ -152,8 +153,8 @@ static void dsync_ibc_pipe_deinit(struct dsync_ibc *ibc)
 	array_foreach_modifiable(&pipe->item_queue, item) {
 		pool_unref(&item->pool);
 	}
-	array_foreach_modifiable(&pipe->pools, poolp)
-		pool_unref(poolp);
+	array_foreach_elem(&pipe->pools, pool)
+		pool_unref(&pool);
 	array_free(&pipe->pools);
 	array_free(&pipe->item_queue);
 	i_free(pipe);
@@ -289,7 +290,8 @@ dsync_ibc_pipe_recv_mailbox_tree_node(struct dsync_ibc *ibc,
 static void
 dsync_ibc_pipe_send_mailbox_deletes(struct dsync_ibc *ibc,
 				    const struct dsync_mailbox_delete *deletes,
-				    unsigned int count, char hierarchy_sep)
+				    unsigned int count, char hierarchy_sep,
+				    char escape_char)
 {
 	struct dsync_ibc_pipe *pipe = (struct dsync_ibc_pipe *)ibc;
 	struct item *item;
@@ -301,13 +303,15 @@ dsync_ibc_pipe_send_mailbox_deletes(struct dsync_ibc *ibc,
 	item->u.mailbox_delete.deletes = deletes;
 	item->u.mailbox_delete.count = count;
 	item->u.mailbox_delete.hierarchy_sep = hierarchy_sep;
+	item->u.mailbox_delete.escape_char = escape_char;
 }
 
 static enum dsync_ibc_recv_ret
 dsync_ibc_pipe_recv_mailbox_deletes(struct dsync_ibc *ibc,
 				    const struct dsync_mailbox_delete **deletes_r,
 				    unsigned int *count_r,
-				    char *hierarchy_sep_r)
+				    char *hierarchy_sep_r,
+				    char *escape_char_r)
 {
 	struct dsync_ibc_pipe *pipe = (struct dsync_ibc_pipe *)ibc;
 	struct item *item;
@@ -322,6 +326,7 @@ dsync_ibc_pipe_recv_mailbox_deletes(struct dsync_ibc *ibc,
 	*deletes_r = item->u.mailbox_delete.deletes;
 	*count_r = item->u.mailbox_delete.count;
 	*hierarchy_sep_r = item->u.mailbox_delete.hierarchy_sep;
+	*escape_char_r = item->u.mailbox_delete.escape_char;
 	return DSYNC_IBC_RECV_RET_OK;
 }
 

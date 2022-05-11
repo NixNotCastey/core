@@ -160,7 +160,7 @@ static int lua_storage_mailbox_sync(lua_State *L)
 static int lua_storage_mailbox_status(lua_State *L)
 {
 	struct mailbox_status status;
-	const char *const *keyword;
+	const char *keyword;
 	struct mailbox *mbox = lua_check_storage_mailbox(L, 1);
 	/* get items as list of parameters */
 	enum mailbox_status_items items = 0;
@@ -174,7 +174,7 @@ static int lua_storage_mailbox_status(lua_State *L)
 	if (mailbox_get_status(mbox, items, &status) < 0) {
 		const char *error = mailbox_get_last_error(mbox, NULL);
 		return luaL_error(L, "mailbox_get_status(%s, %u) failed: %s",
-				  mbox, items, error);
+				  mailbox_get_vname(mbox), items, error);
 	}
 	/* returns a table */
 	lua_createtable(L, 0, 20);
@@ -182,41 +182,41 @@ static int lua_storage_mailbox_status(lua_State *L)
 	lua_pushstring(L, mailbox_get_vname(mbox));
 	lua_setfield(L, -2, "mailbox");
 
-#undef LUA_TABLE_SETNUMBER
-#define LUA_TABLE_SETNUMBER(field) \
+#undef LUA_TABLE_SET_NUMBER
+#define LUA_TABLE_SET_NUMBER(field) \
 	lua_pushnumber(L, status.field); \
 	lua_setfield(L, -2, #field);
-#undef LUA_TABLE_SETBOOL
-#define LUA_TABLE_SETBOOL(field) \
+#undef LUA_TABLE_SET_BOOL
+#define LUA_TABLE_SET_BOOL(field) \
 	lua_pushboolean(L, status.field); \
 	lua_setfield(L, -2, #field);
 
-	LUA_TABLE_SETNUMBER(messages);
-	LUA_TABLE_SETNUMBER(recent);
-	LUA_TABLE_SETNUMBER(unseen);
-	LUA_TABLE_SETNUMBER(uidvalidity);
-	LUA_TABLE_SETNUMBER(uidnext);
-	LUA_TABLE_SETNUMBER(first_unseen_seq);
-	LUA_TABLE_SETNUMBER(first_recent_uid);
-	LUA_TABLE_SETNUMBER(highest_modseq);
-	LUA_TABLE_SETNUMBER(highest_pvt_modseq);
+	LUA_TABLE_SET_NUMBER(messages);
+	LUA_TABLE_SET_NUMBER(recent);
+	LUA_TABLE_SET_NUMBER(unseen);
+	LUA_TABLE_SET_NUMBER(uidvalidity);
+	LUA_TABLE_SET_NUMBER(uidnext);
+	LUA_TABLE_SET_NUMBER(first_unseen_seq);
+	LUA_TABLE_SET_NUMBER(first_recent_uid);
+	LUA_TABLE_SET_NUMBER(highest_modseq);
+	LUA_TABLE_SET_NUMBER(highest_pvt_modseq);
 
-	LUA_TABLE_SETNUMBER(permanent_flags);
-	LUA_TABLE_SETNUMBER(flags);
+	LUA_TABLE_SET_NUMBER(permanent_flags);
+	LUA_TABLE_SET_NUMBER(flags);
 
-	LUA_TABLE_SETBOOL(permanent_keywords);
-	LUA_TABLE_SETBOOL(allow_new_keywords);
-	LUA_TABLE_SETBOOL(nonpermanent_modseqs);
-	LUA_TABLE_SETBOOL(no_modseq_tracking);
-	LUA_TABLE_SETBOOL(have_guids);
-	LUA_TABLE_SETBOOL(have_save_guids);
-	LUA_TABLE_SETBOOL(have_only_guid128);
+	LUA_TABLE_SET_BOOL(permanent_keywords);
+	LUA_TABLE_SET_BOOL(allow_new_keywords);
+	LUA_TABLE_SET_BOOL(nonpermanent_modseqs);
+	LUA_TABLE_SET_BOOL(no_modseq_tracking);
+	LUA_TABLE_SET_BOOL(have_guids);
+	LUA_TABLE_SET_BOOL(have_save_guids);
+	LUA_TABLE_SET_BOOL(have_only_guid128);
 
 	if (status.keywords != NULL && array_is_created(status.keywords)) {
 		int i = 1;
 		lua_createtable(L, array_count(status.keywords), 0);
-		array_foreach(status.keywords, keyword) {
-			lua_pushstring(L, *keyword);
+		array_foreach_elem(status.keywords, keyword) {
+			lua_pushstring(L, keyword);
 			lua_rawseti(L, -2, i++);
 		}
 		lua_setfield(L, -2, "keywords");
@@ -272,8 +272,7 @@ static int lua_storage_mailbox_metadata_set(lua_State *L)
 	value = lua_tolstring(L, 3, &value_len);
 
 	if (lua_storage_mailbox_attribute_set(mbox, key, value, value_len, &error) < 0)
-		return luaL_error(L,
-				  t_strdup_printf("Cannot set attribute: %s", error));
+		return luaL_error(L, "Cannot set attribute: %s", error);
 
 	return 0;
 }
@@ -286,8 +285,7 @@ static int lua_storage_mailbox_metadata_unset(lua_State *L)
 	const char *error;
 
 	if (lua_storage_mailbox_attribute_set(mbox, key, NULL, 0,  &error) < 0)
-		return luaL_error(L,
-				  t_strdup_printf("Cannot unset attribute: %s", error));
+		return luaL_error(L, "Cannot unset attribute: %s", error);
 
 	return 0;
 }

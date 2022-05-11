@@ -147,21 +147,21 @@ imap_master_client_parse_input(const char *const *args, pool_t pool,
 			input_r->userdb_fields =
 				t_strsplit_tabescaped(value);
 		} else if (strcmp(key, "client_input") == 0) {
-			if (base64_decode(value, strlen(value), NULL,
+			if (base64_decode(value, strlen(value),
 					  master_input_r->client_input) < 0) {
 				*error_r = t_strdup_printf(
 					"Invalid client_input base64 value: %s", value);
 				return -1;
 			}
 		} else if (strcmp(key, "client_output") == 0) {
-			if (base64_decode(value, strlen(value), NULL,
+			if (base64_decode(value, strlen(value),
 					  master_input_r->client_output) < 0) {
 				*error_r = t_strdup_printf(
 					"Invalid client_output base64 value: %s", value);
 				return -1;
 			}
 		} else if (strcmp(key, "state") == 0) {
-			if (base64_decode(value, strlen(value), NULL,
+			if (base64_decode(value, strlen(value),
 					  master_input_r->state) < 0) {
 				*error_r = t_strdup_printf(
 					"Invalid state base64 value: %s", value);
@@ -218,7 +218,7 @@ imap_master_client_input_args(struct connection *conn, const char *const *args,
 	struct client *imap_client;
 	struct mail_storage_service_input input;
 	struct imap_master_input master_input;
-	const char *error, *reason;
+	const char *error = NULL, *reason;
 	int ret;
 
 	if (imap_master_client_parse_input(args, pool, &input, &master_input,
@@ -240,7 +240,7 @@ imap_master_client_input_args(struct connection *conn, const char *const *args,
 	/* NOTE: before client_create_from_input() on failures we need to close
 	   fd_client, but afterward it gets closed by client_destroy() */
 	ret = client_create_from_input(&input, fd_client, fd_client,
-				       &imap_client, &error);
+				       TRUE, &imap_client, &error);
 	if (ret < 0) {
 		e_error(conn->event,
 			"imap-master(%s): Failed to create client: %s",
@@ -281,6 +281,13 @@ imap_master_client_input_args(struct connection *conn, const char *const *args,
 	o_stream_nsend_str(conn->output, "+\n");
 	(void)o_stream_flush(conn->output);
 
+	if (master_input.client_input->used > 0) {
+		client_add_istream_prefix(imap_client,
+					  master_input.client_input->data,
+					  master_input.client_input->used);
+	}
+
+	client_create_finish_io(imap_client);
 	if (client_create_finish(imap_client, &error) < 0) {
 		event_add_str(event, "error", error);
 		e_error(event, "imap-master: %s", error);
@@ -294,22 +301,13 @@ imap_master_client_input_args(struct connection *conn, const char *const *args,
 	o_stream_nsend(imap_client->output,
 		       master_input.client_output->data,
 		       master_input.client_output->used);
-	if (master_input.client_input->used > 0 &&
-	    !i_stream_add_data(imap_client->input,
-			       master_input.client_input->data,
-			       master_input.client_input->used)) {
-		error = t_strdup_printf(
-			"Couldn't add %zu bytes to client's input stream",
-			master_input.client_input->used);
-		event_add_str(event, "error", error);
-		e_error(event, "imap-master: %s", error);
-		event_unref(&event);
-		client_destroy(imap_client, "Client initialization failed");
-		return -1;
-	}
 
+	struct event_reason *event_reason =
+		event_reason_begin("imap:unhibernate");
 	ret = imap_state_import_internal(imap_client, master_input.state->data,
 					 master_input.state->used, &error);
+	event_reason_end(&event_reason);
+
 	if (ret <= 0) {
 		error = t_strdup_printf("Failed to import client state: %s", error);
 		event_add_str(event, "error", error);

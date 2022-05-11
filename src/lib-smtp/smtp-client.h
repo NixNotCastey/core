@@ -37,6 +37,15 @@ enum smtp_client_command_error {
 	SMTP_CLIENT_COMMAND_ERROR_TIMED_OUT
 };
 
+struct smtp_client_capability_extra {
+	const char *name;
+
+	/* Send these additional custom MAIL parameters if available. */
+	const char *const *mail_param_extensions;
+	/* Send these additional custom RCPT parameters if available. */
+	const char *const *rcpt_param_extensions;
+};
+
 struct smtp_client_settings {
 	struct ip_addr my_ip;
 	const char *my_hostname;
@@ -67,7 +76,7 @@ struct smtp_client_settings {
 	   sent or received.
 	   (default = unlimited) */
 	unsigned int command_timeout_msecs;
-	/* Timeout for loggging in
+	/* Timeout for logging in
 		(default = cmd_timeout_msecs) */
 	unsigned int connect_timeout_msecs;
 
@@ -106,6 +115,9 @@ struct smtp_client_settings {
 	/* sending even broken MAIL command path (otherwise a broken address
 	   is sent as <>) */
 	bool mail_send_broken_path;
+	/* Yield verbose user-visible errors for commands and connections that
+	   failed locally. */
+	bool verbose_user_errors;
 };
 
 struct smtp_client *smtp_client_init(const struct smtp_client_settings *set);

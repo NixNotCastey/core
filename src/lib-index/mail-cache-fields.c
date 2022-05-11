@@ -437,7 +437,14 @@ int mail_cache_header_fields_read(struct mail_cache *cache)
 		cache->field_file_map[fidx] = i;
 		cache->file_field_map[i] = fidx;
 
-		/* update last_used if it's newer than ours */
+		/* Update last_used if it's newer than ours. Note that the
+		   last_used may have been overwritten while we were reading
+		   this cache header. In theory this can mean that the
+		   last_used field is only half-updated and contains garbage.
+		   This practically won't matter, since the worst that can
+		   happen is that we trigger a purge earlier than necessary.
+		   The purging re-reads the last_used while cache is locked and
+		   correctly figures out whether to drop the field. */
 		if ((time_t)last_used[i] > cache->fields[fidx].field.last_used)
 			cache->fields[fidx].field.last_used = last_used[i];
 
@@ -517,6 +524,19 @@ static void copy_to_buf_byte(struct mail_cache *cache, buffer_t *dest,
 	}
 }
 
+static void
+copy_to_buf_last_used(struct mail_cache *cache, buffer_t *dest, bool add_new)
+{
+	size_t offset = offsetof(struct mail_cache_field, last_used);
+#if defined(WORDS_BIGENDIAN) && SIZEOF_VOID_P == 8
+	/* 64bit time_t with big endian CPUs: copy the last 32 bits instead of
+	   the first 32 bits (that are always 0). The 32 bits are enough until
+	   year 2106, so we're not in a hurry to use 64 bits on disk. */
+	offset += sizeof(uint32_t);
+#endif
+	copy_to_buf(cache, dest, add_new, offset, sizeof(uint32_t));
+}
+
 static int mail_cache_header_fields_update_locked(struct mail_cache *cache)
 {
 	buffer_t *buffer;
@@ -529,9 +549,7 @@ static int mail_cache_header_fields_update_locked(struct mail_cache *cache)
 
 	buffer = t_buffer_create(256);
 
-	copy_to_buf(cache, buffer, FALSE,
-		    offsetof(struct mail_cache_field, last_used),
-		    sizeof(uint32_t));
+	copy_to_buf_last_used(cache, buffer, FALSE);
 	ret = mail_cache_write(cache, buffer->data, buffer->used,
 			       offset + MAIL_CACHE_FIELD_LAST_USED());
 	if (ret == 0) {
@@ -592,9 +610,7 @@ void mail_cache_header_fields_get(struct mail_cache *cache, buffer_t *dest)
 	buffer_append(dest, &hdr, sizeof(hdr));
 
 	/* we have to keep the field order for the existing fields. */
-	copy_to_buf(cache, dest, TRUE,
-		    offsetof(struct mail_cache_field, last_used),
-		    sizeof(uint32_t));
+	copy_to_buf_last_used(cache, dest, TRUE);
 	copy_to_buf(cache, dest, TRUE,
 		    offsetof(struct mail_cache_field, field_size),
 		    sizeof(uint32_t));

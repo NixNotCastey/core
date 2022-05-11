@@ -99,24 +99,9 @@ struct mail_index *mail_index_view_get_index(struct mail_index_view *view)
 	return view->index;
 }
 
-unsigned int
-mail_index_view_get_transaction_count(struct mail_index_view *view)
+bool mail_index_view_have_transactions(struct mail_index_view *view)
 {
-	i_assert(view->transactions >= 0);
-
-	return view->transactions;
-}
-
-void mail_index_view_transaction_ref(struct mail_index_view *view)
-{
-	view->transactions++;
-}
-
-void mail_index_view_transaction_unref(struct mail_index_view *view)
-{
-	i_assert(view->transactions > 0);
-
-	view->transactions--;
+	return view->transactions_list != NULL;
 }
 
 static void mail_index_view_ref_map(struct mail_index_view *view,
@@ -401,7 +386,7 @@ static void view_get_header_ext(struct mail_index_view *view,
 	}
 
 	ext = array_idx(&map->extensions, idx);
-	*data_r = CONST_PTR_OFFSET(map->hdr_base, ext->hdr_offset);
+	*data_r = MAIL_INDEX_MAP_HDR_OFFSET(map, ext->hdr_offset);
 	*data_size_r = ext->hdr_size;
 }
 
@@ -428,7 +413,7 @@ void mail_index_view_close(struct mail_index_view **_view)
 	if (--view->refcount > 0)
 		return;
 
-	i_assert(view->transactions == 0);
+	i_assert(view->transactions_list == NULL);
 
 	view->v.close(view);
 }
@@ -449,14 +434,14 @@ mail_index_lookup(struct mail_index_view *view, uint32_t seq)
 {
 	struct mail_index_map *map;
 
-	return mail_index_lookup_full(view, seq, &map);
+	return mail_index_lookup_full(view, seq, &map, NULL);
 }
 
 const struct mail_index_record *
 mail_index_lookup_full(struct mail_index_view *view, uint32_t seq,
-		       struct mail_index_map **map_r)
+		       struct mail_index_map **map_r, bool *expunged_r)
 {
-	return view->v.lookup_full(view, seq, map_r, NULL);
+	return view->v.lookup_full(view, seq, map_r, expunged_r);
 }
 
 bool mail_index_is_expunged(struct mail_index_view *view, uint32_t seq)

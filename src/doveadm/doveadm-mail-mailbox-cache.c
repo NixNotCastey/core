@@ -247,11 +247,12 @@ static int cmd_mailbox_cache_remove_box(struct mailbox_cache_cmd_context *ctx,
 	struct mailbox *box;
 	struct mail *mail;
 	void *empty = NULL;
-	int ret = 0, count = 0;
+	int count = 0;
 
-	if (doveadm_mail_iter_init(&ctx->ctx, info, ctx->ctx.search_args,
-				   0, NULL, FALSE, &iter) < 0)
-		return -1;
+	int ret = doveadm_mail_iter_init(&ctx->ctx, info, ctx->ctx.search_args,
+					 0, NULL, 0, &iter);
+	if (ret <= 0)
+		return ret;
 
 	box = doveadm_mail_iter_get_mailbox(iter);
 
@@ -264,11 +265,12 @@ static int cmd_mailbox_cache_remove_box(struct mailbox_cache_cmd_context *ctx,
 		count++;
 		doveadm_print(mailbox_get_vname(box));
 		doveadm_print(dec2str(mail->uid));
-	        /* drop cache pointer */
-	        mail_index_update_ext(t, mail->seq, view->cache->ext_id, &empty, NULL);
+		/* drop cache pointer */
+		mail_index_update_ext(t, mail->seq, view->cache->ext_id, &empty, NULL);
 		doveadm_print("ok");
 	}
 
+	ret = 0;
 	if (mail_index_transaction_commit(&t) < 0) {
 		i_error("mail_index_transaction_commit() failed: %s",
 			mailbox_get_last_internal_error(box, NULL));

@@ -32,13 +32,21 @@ enum dict_data_type {
 };
 
 struct dict_settings {
-	enum dict_data_type value_type;
-	const char *username;
 	const char *base_dir;
-	/* home directory for the user, if known */
-	const char *home_dir;
 	/* set to parent event, if exists */
 	struct event *event_parent;
+};
+
+struct dict_op_settings {
+	const char *username;
+	/* home directory for the user, if known */
+	const char *home_dir;
+
+	/* Don't log a warning if the transaction commit took a long time.
+	   This is needed if there are no guarantees that an asynchronous
+	   commit will finish up anytime soon. Mainly useful for transactions
+	   which aren't especially important whether they finish or not. */
+	bool no_slowness_warning;
 };
 
 struct dict_lookup_result {
@@ -91,19 +99,28 @@ int dict_init(const char *uri, const struct dict_settings *set,
 void dict_deinit(struct dict **dict);
 /* Wait for all pending asynchronous operations to finish. */
 void dict_wait(struct dict *dict);
+/* Returns TRUE if there are any pending async operations. */
+bool dict_have_async_operations(struct dict *dict);
 /* Switch the dict to the current ioloop. This can be used to do dict_wait()
    among other IO work. Returns TRUE if there is actually some work that can
    be waited on. */
 bool dict_switch_ioloop(struct dict *dict) ATTR_NOWARN_UNUSED_RESULT;
 
-/* Lookup value for key. Set it to NULL if it's not found.
+/* Lookup the first value for the key. Set it to NULL if it's not found.
    Returns 1 if found, 0 if not found and -1 if lookup failed. */
-int dict_lookup(struct dict *dict, pool_t pool,
+int dict_lookup(struct dict *dict, const struct dict_op_settings *set, pool_t pool,
 		const char *key, const char **value_r, const char **error_r);
-void dict_lookup_async(struct dict *dict, const char *key,
-		       dict_lookup_callback_t *callback, void *context);
-#define dict_lookup_async(dict, key, callback, context) \
-	dict_lookup_async(dict, key, (dict_lookup_callback_t *)(callback), \
+/* Lookup all the values for the key. Set it to NULL if it's not found.
+   Returns 1 if found, 0 if not found and -1 if lookup failed. */
+int dict_lookup_values(struct dict *dict, const struct dict_op_settings *set,
+		       pool_t pool, const char *key,
+		       const char *const **values_r, const char **error_r);
+/* Asynchronously lookup values for the key. */
+void dict_lookup_async(struct dict *dict, const struct dict_op_settings *set,
+		       const char *key, dict_lookup_callback_t *callback,
+		       void *context);
+#define dict_lookup_async(dict, set, key, callback, context) \
+	dict_lookup_async(dict, set, key, (dict_lookup_callback_t *)(callback), \
 		1 ? (context) : \
 		CALLBACK_TYPECHECK(callback, \
 			void (*)(const struct dict_lookup_result *, typeof(context))))
@@ -111,11 +128,8 @@ void dict_lookup_async(struct dict *dict, const char *key,
 /* Iterate through all values in a path. flag indicates how iteration
    is carried out */
 struct dict_iterate_context *
-dict_iterate_init(struct dict *dict, const char *path, 
-		  enum dict_iterate_flags flags);
-struct dict_iterate_context *
-dict_iterate_init_multiple(struct dict *dict, const char *const *paths,
-			   enum dict_iterate_flags flags);
+dict_iterate_init(struct dict *dict, const struct dict_op_settings *set,
+		  const char *path, enum dict_iterate_flags flags);
 /* Set async callback. Note that if dict_iterate_init() already did all the
    work, this callback may never be called. So after dict_iterate_init() you
    should call dict_iterate() in any case to see if all the results are
@@ -145,12 +159,8 @@ bool dict_iterate_values(struct dict_iterate_context *ctx,
 int dict_iterate_deinit(struct dict_iterate_context **ctx, const char **error_r);
 
 /* Start a new dictionary transaction. */
-struct dict_transaction_context *dict_transaction_begin(struct dict *dict);
-/* Don't log a warning if the transaction commit took a long time.
-   This is needed if there are no guarantees that an asynchronous commit will
-   finish up anytime soon. Mainly useful for transactions which aren't
-   especially important whether they finish or not. */
-void dict_transaction_no_slowness_warning(struct dict_transaction_context *ctx);
+struct dict_transaction_context *
+dict_transaction_begin(struct dict *dict, const struct dict_op_settings *set);
 /* Set write timestamp for the entire transaction. This must be set before
    any changes are done and can't be changed afterwards. Currently only
    dict-sql with Cassandra backend does anything with this. */

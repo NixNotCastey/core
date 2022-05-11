@@ -119,6 +119,8 @@ http_client_request_new(struct http_client *client, const char *method,
 	req->context = context;
 	req->date = (time_t)-1;
 	req->event = event_create(client->event);
+	event_strlist_copy_recursive(req->event, event_get_global(),
+				     EVENT_REASON_CODE);
 
 	/* Default to client-wide settings: */
 	req->max_attempts = client->set.max_attempts;
@@ -242,6 +244,8 @@ void http_client_request_set_event(struct http_client_request *req,
 	event_unref(&req->event);
 	req->event = event_create(event);
 	event_set_forced_debug(req->event, req->client->set.debug);
+	event_strlist_copy_recursive(req->event, event_get_global(),
+				     EVENT_REASON_CODE);
 	http_client_request_update_event(req);
 }
 
@@ -690,9 +694,9 @@ int http_client_request_delay_from_response(
 		return 0;  /* no delay */
 	if (retry_after < ioloop_time)
 		return 0;  /* delay already expired */
-	max = (req->client->set.max_auto_retry_delay == 0 ?
+	max = (req->client->set.max_auto_retry_delay_secs == 0 ?
 	       req->attempt_timeout_msecs / 1000 :
-	       req->client->set.max_auto_retry_delay);
+	       req->client->set.max_auto_retry_delay_secs);
 	if ((unsigned int)(retry_after - ioloop_time) > max)
 		return -1; /* delay too long */
 	req->release_time.tv_sec = retry_after;
