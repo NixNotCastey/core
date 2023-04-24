@@ -117,8 +117,25 @@ service_dup_fds(struct service *service)
 					str_append(listener_settings, "\tssl");
 				if (listeners[i]->set.inetset.set->haproxy)
 					str_append(listener_settings, "\thaproxy");
+				if (listeners[i]->set.inetset.set->type != NULL &&
+				    *listeners[i]->set.inetset.set->type != '\0') {
+					str_append(listener_settings, "\ttype=");
+					str_append_tabescaped(
+						listener_settings,
+						listeners[i]->set.inetset.set->type);
+				}
 			}
-			
+			if (listeners[i]->type == SERVICE_LISTENER_FIFO ||
+			    listeners[i]->type == SERVICE_LISTENER_UNIX) {
+				if (listeners[i]->set.fileset.set->type != NULL &&
+				    *listeners[i]->set.fileset.set->type != '\0') {
+					str_append(listener_settings, "\ttype=");
+					str_append_tabescaped(
+						listener_settings,
+						listeners[i]->set.fileset.set->type);
+				}
+			}
+
 			dup2_append(&dups, listeners[i]->fd, fd++);
 
 			env_put(t_strdup_printf("SOCKET%d_SETTINGS",
@@ -201,6 +218,17 @@ service_dup_fds(struct service *service)
 		i_set_failure_internal();
 	}
 
+	if (service->type == SERVICE_TYPE_LOG) {
+		/* Pass our config fd to the log process, so it won't depend
+		   on config process. Note that we don't want to do this for
+		   other processes, since it prevents config reload. */
+		i_assert(global_config_fd != -1);
+		if (lseek(global_config_fd, 0, SEEK_SET) < 0)
+			i_fatal("lseek(config fd, 0) failed: %m");
+		dup2_append(&dups, global_config_fd, MASTER_CONFIG_FD);
+		env_put(DOVECOT_CONFIG_FD_ENV, dec2str(MASTER_CONFIG_FD));
+	}
+
 	/* Switch log writing back to stderr before the log fds are closed.
 	   There's no guarantee that writing to stderr is visible anywhere, but
 	   it's better than the process just dying with FATAL_LOGWRITE. */
@@ -253,25 +281,9 @@ drop_privileges(struct service *service)
 
 static void service_process_setup_config_environment(struct service *service)
 {
-	const struct master_service_settings *set = service->list->service_set;
-
 	switch (service->type) {
 	case SERVICE_TYPE_CONFIG:
 		env_put(MASTER_CONFIG_FILE_ENV, service->config_file_path);
-		break;
-	case SERVICE_TYPE_LOG:
-		/* give the log's configuration directly, so it won't depend
-		   on config process */
-		env_put("DOVECONF_ENV", "1");
-		env_put("LOG_PATH", set->log_path);
-		env_put("INFO_LOG_PATH", set->info_log_path);
-		env_put("DEBUG_LOG_PATH", set->debug_log_path);
-		env_put("LOG_TIMESTAMP", set->log_timestamp);
-		env_put("SYSLOG_FACILITY", set->syslog_facility);
-		env_put("INSTANCE_NAME", set->instance_name);
-		if (set->verbose_proctitle)
-			env_put("VERBOSE_PROCTITLE", "1");
-		env_put("SSL", "no");
 		break;
 	default:
 		env_put(MASTER_CONFIG_FILE_ENV,
@@ -304,6 +316,8 @@ service_process_setup_environment(struct service *service, unsigned int uid,
 	env_put(MY_HOSTNAME_ENV, my_hostname);
 	env_put(MY_HOSTDOMAIN_ENV, hostdomain);
 
+	if (service_set->verbose_proctitle)
+		env_put(MASTER_VERBOSE_PROCTITLE_ENV, "1");
 	if (!service->set->master_set->version_ignore)
 		env_put(MASTER_DOVECOT_VERSION_ENV, PACKAGE_VERSION);
 
@@ -332,13 +346,13 @@ service_process_setup_environment(struct service *service, unsigned int uid,
 
 static void service_process_status_timeout(struct service_process *process)
 {
-	service_error(process->service,
-		      "Initial status notification not received in %d "
-		      "seconds, killing the process",
-		      SERVICE_FIRST_STATUS_TIMEOUT_SECS);
+	e_error(process->service->event,
+		"Initial status notification not received in %d "
+		"seconds, killing the process",
+		SERVICE_FIRST_STATUS_TIMEOUT_SECS);
 	if (kill(process->pid, SIGKILL) < 0 && errno != ESRCH) {
-		service_error(process->service, "kill(%s, SIGKILL) failed: %m",
-			      dec2str(process->pid));
+		e_error(process->service->event, "kill(%s, SIGKILL) failed: %m",
+			dec2str(process->pid));
 	}
 	timeout_remove(&process->to_status);
 }
@@ -389,7 +403,7 @@ struct service_process *service_process_create(struct service *service)
 						    (unsigned long long)limit);
 		}
 		errno = fork_errno;
-		service_error(service, "fork() failed: %m%s", limit_str);
+		e_error(service->event, "fork() failed: %m%s", limit_str);
 		return NULL;
 	}
 	if (pid == 0) {
@@ -415,10 +429,13 @@ struct service_process *service_process_create(struct service *service)
 	}
 
 	process->available_count = service->client_limit;
+	process->idle_start = ioloop_time;
 	service->process_count_total++;
 	service->process_count++;
 	service->process_avail++;
-	DLLIST_PREPEND(&service->processes, process);
+	service->process_idling++;
+	DLLIST2_APPEND(&service->idle_processes_head,
+		       &service->idle_processes_tail, process);
 
 	service_list_ref(service->list);
 	hash_table_insert(service_pids, POINTER_CAST(process->pid), process);
@@ -446,16 +463,29 @@ void service_process_destroy(struct service_process *process)
 		}
 	}
 
-	DLLIST_REMOVE(&service->processes, process);
+	if (process->idle_start == 0)
+		DLLIST_REMOVE(&service->busy_processes, process);
+	else {
+		DLLIST2_REMOVE(&service->idle_processes_head,
+			       &service->idle_processes_tail, process);
+		i_assert(service->process_idling > 0);
+		service->process_idling--;
+		service->process_idling_lowwater_since_kills =
+			I_MIN(service->process_idling_lowwater_since_kills,
+			      service->process_idling);
+	}
 	hash_table_remove(service_pids, POINTER_CAST(process->pid));
 
-	if (process->available_count > 0)
+	if (process->available_count > 0) {
+		i_assert(service->process_avail > 0);
 		service->process_avail--;
+	}
+	i_assert(service->process_count > 0);
 	service->process_count--;
 	i_assert(service->process_avail <= service->process_count);
 
 	timeout_remove(&process->to_status);
-	timeout_remove(&process->to_idle);
+	timeout_remove(&process->to_idle_kill);
 	if (service->list->log_byes != NULL)
 		service_process_notify_add(service->list->log_byes, process);
 
@@ -521,19 +551,21 @@ get_exit_status_message(struct service *service, enum fatal_exit_status status)
 	return NULL;
 }
 
-static bool linux_proc_fs_suid_is_dumpable(unsigned int *value_r)
+static bool linux_proc_fs_suid_is_dumpable(struct event *event, unsigned int *value_r)
 {
 	int fd = open(LINUX_PROC_FS_SUID_DUMPABLE, O_RDONLY);
 	if (fd == -1) {
 		/* we already checked that it exists - shouldn't get here */
-		i_error("open(%s) failed: %m", LINUX_PROC_FS_SUID_DUMPABLE);
+		e_error(event,
+			"open(%s) failed: %m", LINUX_PROC_FS_SUID_DUMPABLE);
 		have_proc_fs_suid_dumpable = FALSE;
 		return FALSE;
 	}
 	char buf[10];
 	ssize_t ret = read(fd, buf, sizeof(buf)-1);
 	if (ret < 0) {
-		i_error("read(%s) failed: %m", LINUX_PROC_FS_SUID_DUMPABLE);
+		e_error(event,
+			"read(%s) failed: %m", LINUX_PROC_FS_SUID_DUMPABLE);
 		have_proc_fs_suid_dumpable = FALSE;
 		*value_r = 0;
 	} else {
@@ -547,19 +579,21 @@ static bool linux_proc_fs_suid_is_dumpable(unsigned int *value_r)
 	return *value_r != 0;
 }
 
-static bool linux_is_absolute_core_pattern(void)
+static bool linux_is_absolute_core_pattern(struct event *event)
 {
 	int fd = open(LINUX_PROC_SYS_KERNEL_CORE_PATTERN, O_RDONLY);
 	if (fd == -1) {
 		/* we already checked that it exists - shouldn't get here */
-		i_error("open(%s) failed: %m", LINUX_PROC_SYS_KERNEL_CORE_PATTERN);
+		e_error(event,
+			"open(%s) failed: %m", LINUX_PROC_SYS_KERNEL_CORE_PATTERN);
 		have_proc_sys_kernel_core_pattern = FALSE;
 		return FALSE;
 	}
 	char buf[10];
 	ssize_t ret = read(fd, buf, sizeof(buf)-1);
 	if (ret < 0) {
-		i_error("read(%s) failed: %m", LINUX_PROC_SYS_KERNEL_CORE_PATTERN);
+		e_error(event,
+			"read(%s) failed: %m", LINUX_PROC_SYS_KERNEL_CORE_PATTERN);
 		have_proc_sys_kernel_core_pattern = FALSE;
 		buf[0] = '\0';
 	}
@@ -595,11 +629,11 @@ log_coredump(struct service *service, string_t *str, int status)
 	   path. */
 	if (!have_proc_fs_suid_dumpable)
 		;
-	else if (!linux_proc_fs_suid_is_dumpable(&dumpable)) {
+	else if (!linux_proc_fs_suid_is_dumpable(service->event, &dumpable)) {
 		str_printfa(str, " - set %s to 2)", LINUX_PROC_FS_SUID_DUMPABLE);
 		return;
 	} else if (dumpable == 2 && have_proc_sys_kernel_core_pattern &&
-		   !linux_is_absolute_core_pattern()) {
+		   !linux_is_absolute_core_pattern(service->event)) {
 		str_printfa(str, " - set %s to absolute path)",
 			    LINUX_PROC_SYS_KERNEL_CORE_PATTERN);
 		return;
@@ -680,7 +714,7 @@ static void service_process_log(struct service_process *process,
 	const char *data;
 
 	if (process->service->log_fd[1] == -1) {
-		i_error("%s", str);
+		e_error(process->service->event, "%s", str);
 		return;
 	}
 
@@ -692,8 +726,8 @@ static void service_process_log(struct service_process *process,
 			       default_fatal ? "DEFAULT-FATAL" : "FATAL", str);
 	if (write(process->service->list->master_log_fd[1],
 		  data, strlen(data)) < 0) {
-		i_error("write(log process) failed: %m");
-		i_error("%s", str);
+		e_error(process->service->event, "write(log process) failed: %m");
+		e_error(process->service->event, "%s", str);
 	}
 }
 

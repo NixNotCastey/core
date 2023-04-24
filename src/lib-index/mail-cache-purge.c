@@ -108,7 +108,7 @@ static uint32_t get_next_file_seq(struct mail_cache *cache)
 
 	view = mail_index_view_open(cache->index);
 	ext = mail_index_view_get_ext(view, cache->ext_id);
-	file_seq = ext != NULL ? ext->reset_id + 1 : (uint32_t)ioloop_time;
+	file_seq = ext != NULL ? ext->reset_id + 1 : ioloop_time32;
 
 	if (cache->hdr != NULL && file_seq <= cache->hdr->file_seq)
 		file_seq = cache->hdr->file_seq + 1;
@@ -392,17 +392,21 @@ mail_cache_purge_write(struct mail_cache *cache,
 
 	if (mail_cache_copy(cache, trans, event, fd, reason,
 			    &file_seq, &file_size, &max_uid,
-			    &ext_first_seq, &ext_offsets) < 0)
+			    &ext_first_seq, &ext_offsets) < 0) {
+		event_unref(&event);
 		return -1;
+	}
 
 	if (fstat(fd, &st) < 0) {
 		mail_cache_set_syscall_error(cache, "fstat()");
 		array_free(&ext_offsets);
+		event_unref(&event);
 		return -1;
 	}
 	if (rename(temp_path, cache->filepath) < 0) {
 		mail_cache_set_syscall_error(cache, "rename()");
 		array_free(&ext_offsets);
+		event_unref(&event);
 		return -1;
 	}
 
@@ -651,13 +655,19 @@ bool mail_cache_need_purge(struct mail_cache *cache, const char **reason_r)
 	return TRUE;
 }
 
-void mail_cache_purge_later(struct mail_cache *cache, const char *reason)
+void mail_cache_purge_later(struct mail_cache *cache,
+			    const char *reason_format, ...)
 {
+	va_list args;
+
 	i_assert(cache->hdr != NULL);
 
+	va_start(args, reason_format);
 	cache->need_purge_file_seq = cache->hdr->file_seq;
 	i_free(cache->need_purge_reason);
-	cache->need_purge_reason = i_strdup(reason);
+	cache->need_purge_reason = i_strdup_vprintf(reason_format, args);
+
+	va_end(args);
 }
 
 void mail_cache_purge_later_reset(struct mail_cache *cache)
@@ -675,10 +685,16 @@ void mail_cache_purge_drop_init(struct mail_cache *cache,
 	if (hdr->day_stamp != 0) {
 		const struct mail_index_cache_optimization_settings *opt =
 			&cache->index->optimization_set.cache;
-		ctx_r->max_yes_downgrade_time = hdr->day_stamp -
-			opt->unaccessed_field_drop_secs;
-		ctx_r->max_temp_drop_time = hdr->day_stamp -
-			2 * opt->unaccessed_field_drop_secs;
+		long threshold = opt->unaccessed_field_drop_secs;
+
+		/* While cache max headers count is saturated, shrink the actual
+		   value of this parameter to 1/4, so that the cache can return
+		   quicker to the intended state. */
+		if (mail_cache_headers_check_capped(cache))
+			threshold /= 4;
+
+		ctx_r->max_yes_downgrade_time = hdr->day_stamp - threshold;
+		ctx_r->max_temp_drop_time     = hdr->day_stamp - 2 * threshold;
 	}
 }
 

@@ -144,7 +144,7 @@ http_client_connection_retry_requests(struct http_client_connection *conn,
 		/* Retry the request, which may drop it */
 		if (req->state < HTTP_REQUEST_STATE_FINISHED)
 			http_client_request_retry(req, status, error);
-	}	
+	}
 	array_clear(&conn->request_wait_list);
 }
 
@@ -879,7 +879,6 @@ http_client_connection_return_response(struct http_client_connection *conn,
 
 	http_client_connection_ref(conn);
 	http_client_connection_ref_request(conn, req);
-	req->state = HTTP_REQUEST_STATE_GOT_RESPONSE;
 
 	if (response->payload != NULL) {
 		/* Wrap the stream to capture the destroy event without
@@ -1446,6 +1445,7 @@ static void http_client_connection_ready(struct http_client_connection *conn)
 			struct http_response response;
 
 			conn->tunneling = TRUE;
+			req->state = HTTP_REQUEST_STATE_WAITING;
 
 			i_zero(&response);
 			response.status = 200;
@@ -1493,7 +1493,7 @@ http_client_connection_ssl_handshaked(const char **error_r, void *context)
 	return 0;
 }
 
-static int 
+static int
 http_client_connection_ssl_init(struct http_client_connection *conn,
 				const char **error_r)
 {
@@ -1515,7 +1515,7 @@ http_client_connection_ssl_init(struct http_client_connection *conn,
 
 	connection_input_halt(&conn->conn);
 	if (io_stream_create_ssl_client(ssl_ctx, pshared->addr.a.tcp.https_name,
-					&ssl_set,
+					&ssl_set, conn->event,
 					&conn->conn.input, &conn->conn.output,
 					&conn->ssl_iostream, &error) < 0) {
 		*error_r = t_strdup_printf(
@@ -1545,7 +1545,7 @@ http_client_connection_ssl_init(struct http_client_connection *conn,
 	return 0;
 }
 
-static void 
+static void
 http_client_connection_connected(struct connection *_conn, bool success)
 {
 	struct http_client_connection *conn =
@@ -1567,13 +1567,15 @@ http_client_connection_connected(struct connection *_conn, bool success)
 		if (set->socket_send_buffer_size > 0 &&
 		    net_set_send_buffer_size(
 			_conn->fd_out, set->socket_send_buffer_size) < 0) {
-			i_error("net_set_send_buffer_size(%zu) failed: %m",
+			e_error(conn->event,
+				"net_set_send_buffer_size(%zu) failed: %m",
 				set->socket_send_buffer_size);
 		}
 		if (set->socket_recv_buffer_size > 0 &&
 		    net_set_recv_buffer_size(
 			_conn->fd_in, set->socket_recv_buffer_size) < 0) {
-			i_error("net_set_recv_buffer_size(%zu) failed: %m",
+			e_error(conn->event,
+				"net_set_recv_buffer_size(%zu) failed: %m",
 				set->socket_recv_buffer_size);
 		}
 
@@ -1884,7 +1886,7 @@ bool http_client_connection_unref(struct http_client_connection **_conn)
 	ssl_iostream_destroy(&conn->ssl_iostream);
 	connection_deinit(&conn->conn);
 	io_wait_timer_remove(&conn->io_wait_timer);
-	
+
 	i_free(conn);
 
 	http_client_peer_pool_unref(&ppool);

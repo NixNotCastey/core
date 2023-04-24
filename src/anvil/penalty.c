@@ -121,9 +121,9 @@ static void penalty_add_checksum(struct penalty_rec *rec, unsigned int checksum)
 
 	if (!rec->checksum_is_pointer) {
 		if (rec->checksum.value[CHECKSUM_VALUE_COUNT-1] == 0) {
-			memcpy(rec->checksum.value + 1, rec->checksum.value,
-			       sizeof(rec->checksum.value[0]) *
-			       (CHECKSUM_VALUE_COUNT-1));
+			memmove(rec->checksum.value + 1, rec->checksum.value,
+				sizeof(rec->checksum.value[0]) *
+				(CHECKSUM_VALUE_COUNT-1));
 			rec->checksum.value[0] = checksum;
 			return;
 		}
@@ -201,14 +201,14 @@ void penalty_inc(struct penalty *penalty, const char *ident,
 
 	if (checksum == 0) {
 		rec->penalty = value;
-		rec->last_penalty = ioloop_time;
+		rec->last_penalty = time_to_uint32(ioloop_time);
 	} else {
 		if (penalty_bump_checksum(rec, checksum))
 			rec->penalty = value - 1;
 		else {
 			penalty_add_checksum(rec, checksum);
 			rec->penalty = value;
-			rec->last_penalty = ioloop_time;
+			rec->last_penalty = time_to_uint32(ioloop_time);
 		}
 	}
 

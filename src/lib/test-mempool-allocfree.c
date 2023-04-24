@@ -24,7 +24,6 @@ void test_mempool_allocfree(void)
 	unsigned int i;
 	size_t last_alloc = 0;
 	size_t used = 0;
-	size_t count = 0;
 	void *mem = NULL;
 
 	test_begin("mempool_allocfree");
@@ -36,7 +35,6 @@ void test_mempool_allocfree(void)
 			if (mem != NULL) {
 				test_assert_idx(mem_has_bytes(mem, last_alloc, SENSE), i);
 				used -= last_alloc;
-				count--;
 			}
 			last_alloc = 0;
 			p_free(pool, mem);
@@ -44,8 +42,6 @@ void test_mempool_allocfree(void)
 		} else if ((i % 5) == 0) {
 			if (mem != NULL)
 				used -= last_alloc;
-			else
-				count++;
 			mem = p_realloc(pool, mem, last_alloc, i*2);
 			if (last_alloc > 0)
 				test_assert_idx(mem_has_bytes(mem, last_alloc, SENSE), i);
@@ -56,8 +52,6 @@ void test_mempool_allocfree(void)
 		} else if ((i % 7) == 0) {
 			if (mem != NULL)
 				used -= last_alloc;
-			else
-				count++;
 			mem = p_realloc(pool, mem, last_alloc, i-2);
 			if (last_alloc > 0)
 				test_assert_idx(mem_has_bytes(mem, i-2, SENSE), i);
@@ -70,7 +64,6 @@ void test_mempool_allocfree(void)
 			/* fill it with sense marker */
 			memset(mem, SENSE, i);
 			used += i;
-			count++;
 			last_alloc = i;
 		}
 	}
@@ -114,7 +107,7 @@ enum fatal_test_state fatal_mempool_allocfree(unsigned int stage)
 		(void)p_malloc(pool, POOL_MAX_ALLOC_SIZE + 1ULL);
 		return FATAL_TEST_FAILURE;
 
-#ifdef _LP64 /* malloc(POOL_MAX_ALLOC_SIZE) may succeed with 32bit */
+#if SIZEOF_SIZE_T > 4 /* malloc(POOL_MAX_ALLOC_SIZE) may succeed with 32bit */
 	case 2: /* physically impossible size */
 		test_expect_fatal_string("Out of memory");
 		(void)p_malloc(pool, POOL_MAX_ALLOC_SIZE);

@@ -170,6 +170,7 @@ static void dns_client_cache_entry_refresh(struct dns_client *client,
 			i_unreached();
 		ctx = i_new(struct dns_cache_lookup, 1);
 		ctx->key = i_strdup(entry->cache_key);
+		ctx->client = client;
 		if (dns_client_lookup_ptr(client, &ip, client->conn.event,
 					  dns_client_cache_callback,
 					  ctx, &lookup) < 0) {
@@ -185,6 +186,7 @@ static void dns_client_cache_entry_refresh(struct dns_client *client,
 	} else if (*entry->cache_key == 'N') {
 		ctx = i_new(struct dns_cache_lookup, 1);
 		ctx->key = i_strdup(entry->cache_key);
+		ctx->client = client;
 		if (dns_client_lookup(client, entry->cache_key + 1,
 				      client->conn.event,
 				      dns_client_cache_callback,
@@ -423,7 +425,11 @@ static int dns_client_input_args(struct connection *conn, const char *const *arg
 
 static void dns_lookup_timeout(struct dns_lookup *lookup)
 {
-	lookup->result.error = "Lookup timed out";
+	int duration_msecs = timeval_diff_msecs(&ioloop_timeval,
+						&lookup->start_time);
+	lookup->result.error = t_strdup_printf("Lookup timed out in %u.%03u secs",
+					       duration_msecs / 1000,
+					       duration_msecs % 1000);
 
 	dns_lookup_callback(lookup);
 	dns_lookup_free(&lookup);

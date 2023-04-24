@@ -5,9 +5,9 @@ NOPLUGIN_LDFLAGS =
 AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib \
 	-I$(top_srcdir)/src/lib-test \
-	-DMODULE_DIR=\""$(moduledir)"\"
+	-DMODULE_DIR=\""$(moduledir)"\" \
+	$(SSL_CFLAGS)
 
-if BUILD_OPENSSL
 module_LTLIBRARIES = libssl_iostream_openssl.la
 
 libssl_iostream_openssl_la_LDFLAGS = -module -avoid-version
@@ -19,7 +19,6 @@ libssl_iostream_openssl_la_SOURCES = \
 	iostream-openssl-context.c \
 	istream-openssl.c \
 	ostream-openssl.c
-endif
 
 libssl_iostream_la_SOURCES = \
 	iostream-ssl.c \
@@ -38,7 +37,6 @@ headers = \
 pkginc_libdir=$(pkgincludedir)
 pkginc_lib_HEADERS = $(headers)
 
-if BUILD_OPENSSL
 test_libs = \
 	$(module_LTLIBRARIES) \
 	$(noinst_LTLIBRARIES) \
@@ -58,4 +56,3 @@ check-local:
 	for bin in $(test_programs); do \
 	  if ! $(RUN_TEST) ./$$bin; then exit 1; fi; \
 	done
-endif

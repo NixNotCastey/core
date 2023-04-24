@@ -31,13 +31,16 @@ static void doveadm_die(void)
 
 static void client_connected(struct master_service_connection *conn)
 {
+	const char *type;
+
 	if (doveadm_client != NULL) {
 		i_error("doveadm server can handle only a single client");
 		return;
 	}
 
 	master_service_client_connection_accept(conn);
-	if (strcmp(conn->name, "http") == 0) {
+	type = master_service_connection_get_type(conn);
+	if (strcmp(type, "http") == 0) {
 		doveadm_client = client_connection_http_create(conn->fd, conn->ssl);
 	} else {
 		doveadm_client = client_connection_tcp_create(conn->fd, conn->listen_fd,
@@ -97,7 +100,6 @@ static void main_deinit(void)
 int main(int argc, char *argv[])
 {
 	enum master_service_flags service_flags =
-		MASTER_SERVICE_FLAG_KEEP_CONFIG_OPEN |
 		MASTER_SERVICE_FLAG_HAVE_STARTTLS;
 	int c;
 

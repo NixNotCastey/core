@@ -13,7 +13,7 @@
 #include "restrict-access.h"
 #include "settings-parser.h"
 #include "master-service.h"
-#include "master-login.h"
+#include "login-server.h"
 #include "master-interface.h"
 #include "master-admin-client.h"
 #include "var-expand.h"
@@ -28,9 +28,13 @@
 #define IS_STANDALONE() \
         (getenv(MASTER_IS_PARENT_ENV) == NULL)
 
+struct event_category event_category_pop3 = {
+	.name = "pop3",
+};
+
 static bool verbose_proctitle = FALSE;
 static struct mail_storage_service_ctx *storage_service;
-static struct master_login *master_login = NULL;
+static struct login_server *login_server = NULL;
 
 pop3_client_created_func_t *hook_client_created = NULL;
 
@@ -112,13 +116,29 @@ client_create_from_input(const struct mail_storage_service_input *input,
 {
 	const char *lookup_error_str =
 		"-ERR [SYS/TEMP] "MAIL_ERRSTR_CRITICAL_MSG"\r\n";
-	struct mail_storage_service_user *user;
 	struct mail_user *mail_user;
 	struct pop3_settings *set;
-	const char *errstr;
 
-	if (mail_storage_service_lookup_next(storage_service, input,
-					     &user, &mail_user, error_r) <= 0) {
+	struct event *event = event_create(NULL);
+	event_add_category(event, &event_category_pop3);
+	event_add_fields(event, (const struct event_add_field []){
+		{ .key = "user", .value = input->username },
+		{ .key = NULL }
+	});
+	if (input->local_ip.family != 0)
+		event_add_ip(event, "local_ip", &input->local_ip);
+	if (input->local_port != 0)
+		event_add_int(event, "local_port", input->local_port);
+	if (input->remote_ip.family != 0)
+		event_add_ip(event, "remote_ip", &input->remote_ip);
+	if (input->remote_port != 0)
+		event_add_int(event, "remote_port", input->remote_port);
+
+	struct mail_storage_service_input service_input = *input;
+	service_input.event_parent = event;
+
+	if (mail_storage_service_lookup_next(storage_service, &service_input,
+					     &mail_user, error_r) <= 0) {
 		if (write(fd_out, lookup_error_str, strlen(lookup_error_str)) < 0) {
 			/* ignored */
 		}
@@ -126,20 +146,13 @@ client_create_from_input(const struct mail_storage_service_input *input,
 	}
 	restrict_access_allow_coredumps(TRUE);
 
-	set = mail_storage_service_user_get_set(user)[1];
+	set = settings_parser_get_root_set(mail_user->set_parser,
+			&pop3_setting_parser_info);
 	if (set->verbose_proctitle)
 		verbose_proctitle = TRUE;
 
-	if (settings_var_expand(&pop3_setting_parser_info, set,
-				mail_user->pool, mail_user_var_expand_table(mail_user),
-				&errstr) <= 0) {
-		*error_r = t_strdup_printf("Failed to expand settings: %s", errstr);
-		mail_user_deinit(&mail_user);
-		mail_storage_service_user_unref(&user);
-		return -1;
-	}
-
-	*client_r = client_create(fd_in, fd_out, mail_user, user, set);
+	*client_r = client_create(fd_in, fd_out, event, mail_user, set);
+	event_unref(&event);
 	return 0;
 }
 
@@ -171,7 +184,7 @@ static int init_namespaces(struct client *client, bool already_logged_in)
 		if (!already_logged_in)
 			client_send_line(client, MSG_BYE_INTERNAL_ERROR);
 
-		i_error("%s", error);
+		e_error(client->event, "%s", error);
 		client_destroy(client, error);
 		return -1;
 	}
@@ -224,7 +237,7 @@ static void client_init_session(struct client *client)
 	event_reason_end(&reason);
 
 	if (ret < 0) {
-		i_error("%s", error);
+		e_error(client->event, "%s", error);
 		client_destroy(client, error);
 	}
 }
@@ -237,7 +250,7 @@ static void main_stdio_run(const char *username)
 	const char *value, *error, *input_base64;
 
 	i_zero(&input);
-	input.module = input.service = "pop3";
+	input.service = "pop3";
 	input.username = username != NULL ? username : getenv("USER");
 	if (input.username == NULL && IS_STANDALONE())
 		input.username = getlogin();
@@ -263,17 +276,17 @@ static void main_stdio_run(const char *username)
 }
 
 static void
-login_client_connected(const struct master_login_client *login_client,
+login_request_finished(const struct login_server_request *login_client,
 		       const char *username, const char *const *extra_fields)
 {
 	struct client *client;
 	struct mail_storage_service_input input;
-	enum mail_auth_request_flags flags = login_client->auth_req.flags;
+	enum login_request_flags flags = login_client->auth_req.flags;
 	const char *error;
 	buffer_t input_buf;
 
 	i_zero(&input);
-	input.module = input.service = "pop3";
+	input.service = "pop3";
 	input.local_ip = login_client->auth_req.local_ip;
 	input.remote_ip = login_client->auth_req.remote_ip;
 	input.local_port = login_client->auth_req.local_port;
@@ -281,10 +294,8 @@ login_client_connected(const struct master_login_client *login_client,
 	input.username = username;
 	input.userdb_fields = extra_fields;
 	input.session_id = login_client->session_id;
-	if ((flags & MAIL_AUTH_REQUEST_FLAG_CONN_SECURED) != 0)
-		input.conn_secured = TRUE;
-	if ((flags & MAIL_AUTH_REQUEST_FLAG_CONN_SSL_SECURED) != 0)
-		input.conn_ssl_secured = TRUE;
+	if ((flags & LOGIN_REQUEST_FLAG_END_CLIENT_SECURED_TLS) != 0)
+		input.end_client_tls_secured = TRUE;
 
 	buffer_create_from_const_data(&input_buf, login_client->data,
 				      login_client->auth_req.data_size);
@@ -304,13 +315,13 @@ login_client_connected(const struct master_login_client *login_client,
 	/* client may be destroyed now */
 }
 
-static void login_client_failed(const struct master_login_client *client,
+static void login_request_failed(const struct login_server_request *request,
 				const char *errormsg)
 {
 	const char *msg;
 
 	msg = t_strdup_printf("-ERR [SYS/TEMP] %s\r\n", errormsg);
-	if (write(client->fd, msg, strlen(msg)) < 0) {
+	if (write(request->fd, msg, strlen(msg)) < 0) {
 		/* ignored */
 	}
 }
@@ -338,10 +349,10 @@ static const struct master_admin_client_callback admin_callbacks = {
 static void client_connected(struct master_service_connection *conn)
 {
 	/* when running standalone, we shouldn't even get here */
-	i_assert(master_login != NULL);
+	i_assert(login_server != NULL);
 
 	master_service_client_connection_accept(conn);
-	master_login_add(master_login, conn->fd);
+	login_server_add(login_server, conn->fd);
 }
 
 int main(int argc, char *argv[])
@@ -350,15 +361,15 @@ int main(int argc, char *argv[])
 		&pop3_setting_parser_info,
 		NULL
 	};
-	struct master_login_settings login_set;
+	struct login_server_settings login_set;
 	enum master_service_flags service_flags = 0;
-	enum mail_storage_service_flags storage_service_flags =
-		MAIL_STORAGE_SERVICE_FLAG_NO_SSL_CA;
+	enum mail_storage_service_flags storage_service_flags = 0;
 	const char *username = NULL, *auth_socket_path = "auth-master";
 	int c;
 
 	i_zero(&login_set);
-	login_set.postlogin_timeout_secs = MASTER_POSTLOGIN_TIMEOUT_DEFAULT;
+	login_set.postlogin_timeout_secs =
+		LOGIN_SERVER_POSTLOGIN_TIMEOUT_DEFAULT;
 
 	if (IS_STANDALONE() && getuid() == 0 &&
 	    net_getpeername(1, NULL, NULL) == 0) {
@@ -370,8 +381,6 @@ int main(int argc, char *argv[])
 	if (IS_STANDALONE()) {
 		service_flags |= MASTER_SERVICE_FLAG_STANDALONE |
 			MASTER_SERVICE_FLAG_STD_CLIENT;
-	} else {
-		service_flags |= MASTER_SERVICE_FLAG_KEEP_CONFIG_OPEN;
 	}
 
 	/*
@@ -413,10 +422,13 @@ int main(int argc, char *argv[])
 			i_fatal("t_abspath(%s) failed: %s", argv[optind], error);
 		}
 	}
-	login_set.callback = login_client_connected;
-	login_set.failure_callback = login_client_failed;
+	login_set.callback = login_request_finished;
+	login_set.failure_callback = login_request_failed;
+	login_set.update_proctitle =
+		getenv(MASTER_VERBOSE_PROCTITLE_ENV) != NULL &&
+		master_service_get_client_limit(master_service) == 1;
 	if (!IS_STANDALONE())
-		master_login = master_login_init(master_service, &login_set);
+		login_server = login_server_init(master_service, &login_set);
 
 	master_admin_clients_init(&admin_callbacks);
 	master_service_set_die_callback(master_service, pop3_die);
@@ -444,8 +456,8 @@ int main(int argc, char *argv[])
 		master_service_run(master_service, client_connected);
 	clients_destroy_all();
 
-	if (master_login != NULL)
-		master_login_deinit(&master_login);
+	if (login_server != NULL)
+		login_server_deinit(&login_server);
 	mail_storage_service_deinit(&storage_service);
 	master_service_deinit(&master_service);
 	return 0;

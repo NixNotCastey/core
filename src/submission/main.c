@@ -14,7 +14,7 @@
 #include "fd-util.h"
 #include "settings-parser.h"
 #include "master-service.h"
-#include "master-login.h"
+#include "login-server.h"
 #include "master-service-settings.h"
 #include "master-interface.h"
 #include "master-admin-client.h"
@@ -42,10 +42,14 @@ struct smtp_client *smtp_client = NULL;
 
 static bool verbose_proctitle = FALSE;
 static struct mail_storage_service_ctx *storage_service;
-static struct master_login *master_login = NULL;
+static struct login_server *login_server = NULL;
 
 submission_client_created_func_t *hook_client_created = NULL;
 bool submission_debug = FALSE;
+
+struct event_category event_category_submission = {
+	.name = "submission",
+};
 
 submission_client_created_func_t *
 submission_client_created_hook_set(submission_client_created_func_t *new_hook)
@@ -99,8 +103,8 @@ static void submission_die(void)
 }
 
 static void
-send_error(int fd_out, const char *hostname, const char *error_code,
-	   const char *error_msg)
+send_error(int fd_out, struct event *event, const char *hostname,
+	   const char *error_code, const char *error_msg)
 {
 	const char *msg;
 
@@ -108,8 +112,8 @@ send_error(int fd_out, const char *hostname, const char *error_code,
 		"421 4.3.2 %s Shutting down due to fatal error\r\n",
 		error_code, error_msg, hostname);
 	if (write(fd_out, msg, strlen(msg)) < 0) {
-		if (errno != EAGAIN && errno != EPIPE)
-			i_error("write(client) failed: %m");
+		if (errno != EAGAIN && errno != EPIPE && errno != ECONNRESET)
+			e_error(event, "write(client) failed: %m");
 	}
 }
 
@@ -141,52 +145,64 @@ extract_input_data_field(const unsigned char **data, size_t *data_len,
 
 static int
 client_create_from_input(const struct mail_storage_service_input *input,
-			 enum mail_auth_request_flags login_flags,
+			 enum login_request_flags login_flags,
 			 int fd_in, int fd_out, const buffer_t *input_buf,
 			 const char **error_r)
 {
-	struct mail_storage_service_user *user;
+	struct mail_storage_service_input service_input;
 	struct mail_user *mail_user;
 	struct submission_settings *set;
 	bool no_greeting = HAS_ALL_BITS(login_flags,
-					MAIL_AUTH_REQUEST_FLAG_IMPLICIT);
-	const char *errstr;
+					LOGIN_REQUEST_FLAG_IMPLICIT);
+	struct event *event;
 	const char *helo = NULL;
 	struct smtp_proxy_data proxy_data;
 	const unsigned char *data;
 	size_t data_len;
 
-	if (mail_storage_service_lookup_next(storage_service, input,
-					     &user, &mail_user, error_r) <= 0) {
-		send_error(fd_out, my_hostname,
+	event = event_create(NULL);
+	event_add_category(event, &event_category_submission);
+	event_add_fields(event, (const struct event_add_field []){
+		{ .key = "user", .value = input->username },
+		{ .key = NULL }
+	});
+	if (input->local_ip.family != 0)
+		event_add_ip(event, "local_ip", &input->local_ip);
+	if (input->local_port != 0)
+		event_add_int(event, "local_port", input->local_port);
+	if (input->remote_ip.family != 0)
+		event_add_ip(event, "remote_ip", &input->remote_ip);
+	if (input->remote_port != 0)
+		event_add_int(event, "remote_port", input->remote_port);
+
+	service_input = *input;
+	service_input.event_parent = event;
+	if (mail_storage_service_lookup_next(storage_service, &service_input,
+					     &mail_user, error_r) <= 0) {
+		send_error(fd_out, event, my_hostname,
 			"4.7.0", MAIL_ERRSTR_CRITICAL_MSG);
+		event_unref(&event);
 		return -1;
 	}
+	/* Add the session only after creating the user, because
+	   input->session_id may be NULL */
+	event_add_str(event, "session", mail_user->session_id);
+
 	restrict_access_allow_coredumps(TRUE);
 
-	set = mail_storage_service_user_get_set(user)[1];
+	set = settings_parser_get_root_set(mail_user->set_parser,
+			&submission_setting_parser_info);
 	if (set->verbose_proctitle)
 		verbose_proctitle = TRUE;
-
-	if (settings_var_expand(&submission_setting_parser_info, set,
-				mail_user->pool, mail_user_var_expand_table(mail_user),
-				&errstr) <= 0) {
-		*error_r = t_strdup_printf("Failed to expand settings: %s", errstr);
-		send_error(fd_out, set->hostname,
-			"4.3.5", MAIL_ERRSTR_CRITICAL_MSG);
-		mail_user_deinit(&mail_user);
-		mail_storage_service_user_unref(&user);
-		return -1;
-	}
 
 	if (set->submission_relay_host == NULL ||
 		*set->submission_relay_host == '\0') {
 		*error_r = "No relay host configured for submission proxy "
 			"(submission_relay_host is unset)";
-		send_error(fd_out, set->hostname,
-			"4.3.5", MAIL_ERRSTR_CRITICAL_MSG);
+		send_error(fd_out, event, set->hostname,
+			   "4.3.5", MAIL_ERRSTR_CRITICAL_MSG);
 		mail_user_deinit(&mail_user);
-		mail_storage_service_user_unref(&user);
+		event_unref(&event);
 		return -1;
 	}
 
@@ -209,9 +225,10 @@ client_create_from_input(const struct mail_storage_service_input *input,
 		 */
 	}
 
-	(void)client_create(fd_in, fd_out, mail_user,
-			    user, set, helo, &proxy_data, data, data_len,
+	(void)client_create(fd_in, fd_out, event, mail_user,
+			    set, helo, &proxy_data, data, data_len,
 			    no_greeting);
+	event_unref(&event);
 	return 0;
 }
 
@@ -222,7 +239,7 @@ static void main_stdio_run(const char *username)
 	const char *value, *error, *input_base64;
 
 	i_zero(&input);
-	input.module = input.service = "submission";
+	input.service = "submission";
 	input.username = username != NULL ? username : getenv("USER");
 	if (input.username == NULL && IS_STANDALONE())
 		input.username = getlogin();
@@ -243,49 +260,46 @@ static void main_stdio_run(const char *username)
 }
 
 static void
-login_client_connected(const struct master_login_client *login_client,
+login_request_finished(const struct login_server_request *request,
 		       const char *username, const char *const *extra_fields)
 {
 	struct mail_storage_service_input input;
-	enum mail_auth_request_flags flags = login_client->auth_req.flags;
+	enum login_request_flags flags = request->auth_req.flags;
 	const char *error;
 	buffer_t input_buf;
 
 	i_zero(&input);
-	input.module = input.service = "submission";
-	input.local_ip = login_client->auth_req.local_ip;
-	input.remote_ip = login_client->auth_req.remote_ip;
-	input.local_port = login_client->auth_req.local_port;
-	input.remote_port = login_client->auth_req.remote_port;
+	input.service = "submission";
+	input.local_ip = request->auth_req.local_ip;
+	input.remote_ip = request->auth_req.remote_ip;
+	input.local_port = request->auth_req.local_port;
+	input.remote_port = request->auth_req.remote_port;
 	input.username = username;
 	input.userdb_fields = extra_fields;
-	input.session_id = login_client->session_id;
-	if ((flags & MAIL_AUTH_REQUEST_FLAG_CONN_SECURED) != 0)
-		input.conn_secured = TRUE;
-	if ((flags & MAIL_AUTH_REQUEST_FLAG_CONN_SSL_SECURED) != 0)
-		input.conn_ssl_secured = TRUE;
+	input.session_id = request->session_id;
+	if ((flags & LOGIN_REQUEST_FLAG_END_CLIENT_SECURED_TLS) != 0)
+		input.end_client_tls_secured = TRUE;
 
-	buffer_create_from_const_data(&input_buf, login_client->data,
-				      login_client->auth_req.data_size);
-	if (client_create_from_input(&input, flags,
-				     login_client->fd, login_client->fd,
+	buffer_create_from_const_data(&input_buf, request->data,
+				      request->auth_req.data_size);
+	if (client_create_from_input(&input, flags, request->fd, request->fd,
 				     &input_buf, &error) < 0) {
-		int fd = login_client->fd;
+		int fd = request->fd;
 		i_error("%s", error);
 		i_close_fd(&fd);
 		master_service_client_connection_destroyed(master_service);
 	}
 }
 
-static void login_client_failed(const struct master_login_client *client,
-				const char *errormsg)
+static void login_request_failed(const struct login_server_request *request,
+				 const char *errormsg)
 {
 	const char *msg;
 
 	msg = t_strdup_printf("451 4.7.0 %s\r\n"
 		"421 4.3.2 %s Shutting down due to fatal error\r\n",
 		errormsg, my_hostname);
-	if (write(client->fd, msg, strlen(msg)) < 0) {
+	if (write(request->fd, msg, strlen(msg)) < 0) {
 		/* ignored */
 	}
 }
@@ -313,10 +327,10 @@ static const struct master_admin_client_callback admin_callbacks = {
 static void client_connected(struct master_service_connection *conn)
 {
 	/* when running standalone, we shouldn't even get here */
-	i_assert(master_login != NULL);
+	i_assert(login_server != NULL);
 
 	master_service_client_connection_accept(conn);
-	master_login_add(master_login, conn->fd);
+	login_server_add(login_server, conn->fd);
 }
 
 int main(int argc, char *argv[])
@@ -325,7 +339,7 @@ int main(int argc, char *argv[])
 		&submission_setting_parser_info,
 		NULL
 	};
-	struct master_login_settings login_set;
+	struct login_server_settings login_set;
 	enum master_service_flags service_flags = 0;
 	enum mail_storage_service_flags storage_service_flags = 0;
 	struct smtp_server_settings smtp_server_set;
@@ -336,7 +350,8 @@ int main(int argc, char *argv[])
 	int c;
 
 	i_zero(&login_set);
-	login_set.postlogin_timeout_secs = MASTER_POSTLOGIN_TIMEOUT_DEFAULT;
+	login_set.postlogin_timeout_secs =
+		LOGIN_SERVER_POSTLOGIN_TIMEOUT_DEFAULT;
 	login_set.request_auth_token = TRUE;
 
 	if (IS_STANDALONE() && getuid() == 0 &&
@@ -349,8 +364,6 @@ int main(int argc, char *argv[])
 	if (IS_STANDALONE()) {
 		service_flags |= MASTER_SERVICE_FLAG_STANDALONE |
 			MASTER_SERVICE_FLAG_STD_CLIENT;
-	} else {
-		service_flags |= MASTER_SERVICE_FLAG_KEEP_CONFIG_OPEN;
 	}
 
 	master_service = master_service_init("submission", service_flags,
@@ -391,8 +404,11 @@ int main(int argc, char *argv[])
 				argv[optind], error);
 		}
 	}
-	login_set.callback = login_client_connected;
-	login_set.failure_callback = login_client_failed;
+	login_set.callback = login_request_finished;
+	login_set.failure_callback = login_request_failed;
+	login_set.update_proctitle =
+		getenv(MASTER_VERBOSE_PROCTITLE_ENV) != NULL &&
+		master_service_get_client_limit(master_service) == 1;
 
 	master_admin_clients_init(&admin_callbacks);
 	master_service_set_die_callback(master_service, submission_die);
@@ -422,7 +438,7 @@ int main(int argc, char *argv[])
 	smtp_client = smtp_client_init(&smtp_client_set);
 
 	if (!IS_STANDALONE())
-		master_login = master_login_init(master_service, &login_set);
+		login_server = login_server_init(master_service, &login_set);
 
 	master_service_init_finish(master_service);
 	/* NOTE: login_set.*_socket_path are now invalid due to data stack
@@ -447,8 +463,8 @@ int main(int argc, char *argv[])
 	smtp_client_deinit(&smtp_client);
 	smtp_server_deinit(&smtp_server);
 
-	if (master_login != NULL)
-		master_login_deinit(&master_login);
+	if (login_server != NULL)
+		login_server_deinit(&login_server);
 	mail_storage_service_deinit(&storage_service);
 	master_service_deinit(&master_service);
 	return 0;

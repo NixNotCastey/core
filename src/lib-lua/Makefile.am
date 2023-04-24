@@ -2,6 +2,7 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib \
 	-I$(top_srcdir)/src/lib-test \
 	-I$(top_srcdir)/src/lib-dict \
+	-I$(top_srcdir)/src/lib-doveadm \
 	-I$(top_srcdir)/src/lib-dns \
 	-I$(top_srcdir)/src/lib-http \
 	-I$(top_srcdir)/src/lib-ssl-iostream \
@@ -22,9 +23,10 @@ libdovecot_lua_la_SOURCES = \
 
 test_programs = test-lua
 
-LIBDICT_LUA=
+WITH_YIELDS_LUA=
 if DLUA_WITH_YIELDS
-LIBDICT_LUA += \
+WITH_YIELDS_LUA += \
+	../lib-doveadm/libdoveadm_client_lua.la \
 	../lib-dict/libdict_lua.la \
 	../lib-dns/libdns_lua.la
 test_programs += \
@@ -35,10 +37,10 @@ endif
 # Note: the only things this lib should depend on are libdovecot and lua.
 libdovecot_lua_la_DEPENDENCIES = \
 	../lib-dovecot/libdovecot.la \
-	$(LIBDICT_LUA)
+	$(WITH_YIELDS_LUA)
 libdovecot_lua_la_LIBADD = \
 	../lib-dovecot/libdovecot.la \
-	$(LIBDICT_LUA) \
+	$(WITH_YIELDS_LUA) \
 	$(LUA_LIBS)
 libdovecot_lua_la_LDFLAGS = -export-dynamic
 

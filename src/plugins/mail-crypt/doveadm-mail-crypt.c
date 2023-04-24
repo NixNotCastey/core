@@ -11,6 +11,7 @@
 #include "ioloop-private.h"
 #include "mail-namespace.h"
 #include "mail-storage.h"
+#include "mail-storage-private.h"
 #include "mail-storage-settings.h"
 #include "mailbox-attribute.h"
 #include "mail-crypt-common.h"
@@ -37,6 +38,7 @@ ARRAY_DEFINE_TYPE(generated_keys, struct generated_key);
 struct mcp_cmd_context {
 	struct doveadm_mail_cmd_context ctx;
 
+	const char *mailbox;
 	const char *old_password;
 	const char *new_password;
 
@@ -58,10 +60,18 @@ struct mcp_key_iter_ctx {
 void doveadm_mail_crypt_plugin_init(struct module *mod ATTR_UNUSED);
 void doveadm_mail_crypt_plugin_deinit(void);
 
+static const char *const *
+p_as_null_terminated_array(pool_t pool, const char *value)
+{
+  const char **array = p_new(pool, const char *, 2);
+  *array = value;
+  return array;
+
+}
+
 static int
 mcp_user_create(struct mail_user *user, const char *dest_username,
 		struct mail_user **dest_user_r,
-		struct mail_storage_service_user **dest_service_user_r,
 		const char **error_r)
 {
 	const struct mail_storage_service_input *old_input;
@@ -71,15 +81,13 @@ mcp_user_create(struct mail_user *user, const char *dest_username,
 
 	int ret;
 
-	i_assert(user->_service_user != NULL);
-	service_ctx = mail_storage_service_user_get_service_ctx(user->_service_user);
-	old_input = mail_storage_service_user_get_input(user->_service_user);
+	service_ctx = mail_storage_service_user_get_service_ctx(user->service_user);
+	old_input = mail_storage_service_user_get_input(user->service_user);
 
 	if ((cur_ioloop_ctx = io_loop_get_current_context(current_ioloop)) != NULL)
 		io_loop_context_deactivate(cur_ioloop_ctx);
 
 	i_zero(&input);
-	input.module = old_input->module;
 	input.service = old_input->service;
 	input.username = dest_username;
 	input.session_id_prefix = user->session_id;
@@ -87,7 +95,6 @@ mcp_user_create(struct mail_user *user, const char *dest_username,
 				   MAIL_STORAGE_SERVICE_FLAG_NO_LOG_INIT;
 
 	ret = mail_storage_service_lookup_next(service_ctx, &input,
-						dest_service_user_r,
 						dest_user_r, error_r);
 
 	if (ret == 0)
@@ -103,7 +110,6 @@ mcp_update_shared_key(struct mailbox_transaction_context *t,
 {
 	const char *error;
 	struct mail_user *dest_user;
-	struct mail_storage_service_user *dest_service_user;
 	struct ioloop_context *cur_ioloop_ctx;
 	struct dcrypt_public_key *pkey;
 	const char *dest_username;
@@ -112,16 +118,15 @@ mcp_update_shared_key(struct mailbox_transaction_context *t,
 	bool disallow_insecure =
 		mail_user_plugin_getenv_bool(user, MAIL_CRYPT_ACL_SECURE_SHARE_SETTING);
 
-	ret = mcp_user_create(user, target_uid, &dest_user,
-			      &dest_service_user, &error);
+	ret = mcp_user_create(user, target_uid, &dest_user, &error);
 
 	/* to make sure we get correct logging context */
 	if (ret > 0)
-		mail_storage_service_io_deactivate_user(dest_service_user);
-	mail_storage_service_io_activate_user(user->_service_user);
+		mail_storage_service_io_deactivate_user(dest_user->service_user);
+	mail_storage_service_io_activate_user(user->service_user);
 
 	if (ret <= 0) {
-		i_error("Cannot initialize destination user %s: %s",
+		e_error(user->event, "Cannot initialize destination user %s: %s",
 			target_uid, error);
 		return ret;
 	} else {
@@ -151,20 +156,19 @@ mcp_update_shared_key(struct mailbox_transaction_context *t,
 								dest_username,
 								&keys, error_r);
 		}
-		
+
 	}
 
 	/* logging context swap again */
-	mail_storage_service_io_deactivate_user(user->_service_user);
-	mail_storage_service_io_activate_user(dest_service_user);
+	mail_storage_service_io_deactivate_user(user->service_user);
+	mail_storage_service_io_activate_user(dest_user->service_user);
 
 	mail_user_deinit(&dest_user);
-	mail_storage_service_user_unref(&dest_service_user);
 
 	if ((cur_ioloop_ctx = io_loop_get_current_context(current_ioloop)) != NULL)
 		io_loop_context_deactivate(cur_ioloop_ctx);
 
-	mail_storage_service_io_activate_user(user->_service_user);
+	mail_storage_service_io_activate_user(user->service_user);
 
 	return ret;
 }
@@ -183,8 +187,7 @@ static int mcp_update_shared_keys(struct doveadm_mail_cmd_context *ctx,
 	if (mail_crypt_box_get_pvt_digests(box, pool_datastack_create(),
 					   MAIL_ATTRIBUTE_TYPE_SHARED,
 					   &ids, &error) < 0) {
-		i_error("mail_crypt_box_get_pvt_digests(%s, /shared) failed: %s",
-			mailbox_get_vname(box),
+		e_error(box->event, "mail_crypt_box_get_pvt_digests() failed: %s",
 			error);
 		return -1;
 	}
@@ -195,7 +198,7 @@ static int mcp_update_shared_keys(struct doveadm_mail_cmd_context *ctx,
 
 	struct mailbox_transaction_context *t =
 		mailbox_transaction_begin(box, ctx->transaction_flags, __func__);
-	
+
 	ret = 0;
 
 	/* then perform sharing */
@@ -206,20 +209,18 @@ static int mcp_update_shared_keys(struct doveadm_mail_cmd_context *ctx,
 			hex_to_binary(hexuid, uid);
 			if (mcp_update_shared_key(t, user, str_c(uid), key,
 						  &error) < 0) {
-				i_error("mcp_update_shared_key(%s, %s) failed: %s",
-					mailbox_get_vname(box),
-					str_c(uid),
-					error);
+				e_error(box->event,
+					"mcp_update_shared_key(%s) failed: %s",
+					str_c(uid), error);
 				ret = -1;
 				break;
 			}
 		} else if (!found) {
 			found = TRUE;
-			if (mail_crypt_box_set_shared_key(t, pubid, key,
-							  NULL, NULL,
-							  &error) < 0) {
-				i_error("mail_crypt_box_set_shared_key(%s) failed: %s",
-					mailbox_get_vname(box),
+			if (mail_crypt_box_set_shared_key(t, pubid, key, NULL,
+							  NULL, &error) < 0) {
+				e_error(box->event,
+					"mail_crypt_box_set_shared_key() failed: %s",
 					error);
 				ret = -1;
 				break;
@@ -230,9 +231,7 @@ static int mcp_update_shared_keys(struct doveadm_mail_cmd_context *ctx,
 	if (ret < 0) {
 		mailbox_transaction_rollback(&t);
 	} else if (mailbox_transaction_commit(&t) < 0) {
-		i_error("mailbox_transaction_commit(%s) failed: %s",
-			mailbox_get_vname(box),
-			error);
+		e_error(box->event, "mailbox_transaction_commit() failed: %s", error);
 		ret = -1;
 	}
 
@@ -251,13 +250,13 @@ static int mcp_keypair_generate(struct mcp_cmd_context *ctx,
 	if ((ret = mail_crypt_box_get_public_key(box, &pair.pub, error_r)) < 0) {
 		ret = -1;
 	} else if (ret == 1 && !ctx->force) {
-		i_info("Folder key exists. Use -f to generate a new one");
+		e_info(box->event, "Folder key exists. Use -f to generate a new one");
 		buffer_t *key_id = t_str_new(MAIL_CRYPT_HASH_BUF_SIZE);
 		const char *error;
 		if (!dcrypt_key_id_public(pair.pub,
 					MAIL_CRYPT_KEY_ID_ALGORITHM,
 					key_id, &error)) {
-			i_error("dcrypt_key_id_public() failed: %s",
+			e_error(box->event, "dcrypt_key_id_public() failed: %s",
 				error);
 			return -1;
 		}
@@ -295,11 +294,12 @@ static int mcp_keypair_generate_run(struct doveadm_mail_cmd_context *_ctx,
 				    struct mail_user *user,
 				    ARRAY_TYPE(generated_keys) *result)
 {
+	struct mcp_cmd_context *ctx =
+		container_of(_ctx, struct mcp_cmd_context, ctx);
+
 	const char *error;
 	int ret;
 	struct dcrypt_public_key *user_key;
-	struct mcp_cmd_context *ctx =
-		(struct mcp_cmd_context *)_ctx;
 	const char *pubid;
 	bool user_key_generated = FALSE;
 	struct generated_key *res;
@@ -308,13 +308,15 @@ static int mcp_keypair_generate_run(struct doveadm_mail_cmd_context *_ctx,
 						  &error)) <= 0) {
 		struct dcrypt_keypair pair;
 		if (ret < 0) {
-			i_error("mail_crypt_user_get_public_key(%s) failed: %s",
+			e_error(user->event,
+				"mail_crypt_user_get_public_key(%s) failed: %s",
 				user->username,
 				error);
 		} else if (mail_crypt_user_generate_keypair(user, &pair,
 							     &pubid, &error) < 0) {
 			ret = -1;
-			i_error("mail_crypt_user_generate_keypair(%s) failed: %s",
+			e_error(user->event,
+				"mail_crypt_user_generate_keypair(%s) failed: %s",
 				user->username,
 				error);
 			res = array_append_space(result);
@@ -337,12 +339,14 @@ static int mcp_keypair_generate_run(struct doveadm_mail_cmd_context *_ctx,
 	}
 	if (ret == 1 && ctx->userkey_only && !user_key_generated) {
 		if (!ctx->force) {
-			i_info("userkey exists. Use -f to generate a new one");
+			e_info(user->event,
+			       "userkey exists. Use -f to generate a new one");
 			buffer_t *key_id = t_str_new(MAIL_CRYPT_HASH_BUF_SIZE);
 			if (!dcrypt_key_id_public(user_key,
 						MAIL_CRYPT_KEY_ID_ALGORITHM,
 						key_id, &error)) {
-				i_error("dcrypt_key_id_public() failed: %s",
+				e_error(user->event,
+					"dcrypt_key_id_public() failed: %s",
 					error);
 				dcrypt_key_unref_public(&user_key);
 				return -1;
@@ -383,16 +387,15 @@ static int mcp_keypair_generate_run(struct doveadm_mail_cmd_context *_ctx,
 	const char *const *patterns = (const char *const[]){ "*", NULL };
 
 	/* only re-encrypt all folder keys if wanted */
-	if (!ctx->recrypt_box_keys) {
-		patterns = ctx->ctx.args;
-	}
+	if (!ctx->recrypt_box_keys)
+		patterns = p_as_null_terminated_array(_ctx->pool, ctx->mailbox);
 
 	const struct mailbox_info *info;
 	struct mailbox_list_iterate_context *iter =
 		mailbox_list_iter_init_namespaces(user->namespaces,
-				 		  patterns,
+						  patterns,
 						  MAIL_NAMESPACE_TYPE_PRIVATE,
-			 			  MAILBOX_LIST_ITER_SKIP_ALIASES |
+						  MAILBOX_LIST_ITER_SKIP_ALIASES |
 						  MAILBOX_LIST_ITER_NO_AUTO_BOXES |
 						  MAILBOX_LIST_ITER_RETURN_NO_FLAGS);
 	while((info = mailbox_list_iter_next(iter)) != NULL) {
@@ -443,11 +446,25 @@ static int mcp_keypair_generate_run(struct doveadm_mail_cmd_context *_ctx,
 	return 0;
 }
 
+static void
+cmd_mcp_keypair_generate_init(struct doveadm_mail_cmd_context *ctx ATTR_UNUSED)
+{
+	doveadm_print_header("success", "  ", 0);
+	doveadm_print_header("box", "Folder", 0);
+	doveadm_print_header("pubid", "Public ID", 0);
+}
+
 static int cmd_mcp_keypair_generate_run(struct doveadm_mail_cmd_context *_ctx,
 					struct mail_user *user)
 {
+	struct doveadm_cmd_context *cctx = _ctx->cctx;
 	struct mcp_cmd_context *ctx =
-		(struct mcp_cmd_context *)_ctx;
+		container_of(_ctx, struct mcp_cmd_context, ctx);
+
+	ctx->userkey_only = doveadm_cmd_param_flag(cctx, "user-key-only");
+	ctx->recrypt_box_keys = doveadm_cmd_param_flag(cctx, "re-encrypt-box-keys");
+	ctx->force = doveadm_cmd_param_flag(cctx, "force");
+	(void)doveadm_cmd_param_str(cctx, "mailbox", &ctx->mailbox);
 
 	int ret = 0;
 
@@ -456,11 +473,6 @@ static int cmd_mcp_keypair_generate_run(struct doveadm_mail_cmd_context *_ctx,
 
 	if (mcp_keypair_generate_run(_ctx, user, &result) < 0)
 		_ctx->exit_code = EX_DATAERR;
-
-	doveadm_print_init(DOVEADM_PRINT_TYPE_TABLE);
-	doveadm_print_header("success", "  ", 0);
-	doveadm_print_header("box", "Folder", 0);
-	doveadm_print_header("pubid", "Public ID", 0);
 
 	const struct generated_key *res;
 
@@ -480,7 +492,8 @@ static int cmd_mcp_keypair_generate_run(struct doveadm_mail_cmd_context *_ctx,
 	}
 
 	if (ctx->matched_keys == 0)
-		i_warning("mailbox cryptokey generate: Nothing was matched. "
+		e_warning(user->event,
+			  "mailbox cryptokey generate: Nothing was matched. "
 			  "Use -U or specify mask?");
 	return ret;
 }
@@ -511,15 +524,15 @@ static void mcp_key_list(struct mcp_cmd_context *ctx,
 		if (mailbox_attribute_get(box, MAIL_ATTRIBUTE_TYPE_SHARED,
 					  USER_CRYPT_PREFIX ACTIVE_KEY_NAME,
 					  &value) < 0) {
-			i_error("mailbox_get_attribute(%s, %s) failed: %s",
-				mailbox_get_vname(box),
+			e_error(user->event,
+				"mailbox_get_attribute(%s) failed: %s",
 				USER_CRYPT_PREFIX ACTIVE_KEY_NAME,
 				mailbox_get_last_internal_error(box, NULL));
 		}
 
 		iter = mailbox_attribute_iter_init(box,
 						   MAIL_ATTRIBUTE_TYPE_PRIVATE,
-					  	   USER_CRYPT_PREFIX
+						   USER_CRYPT_PREFIX
 						   PRIVKEYS_PREFIX);
 		const char *key_id;
 		if (value.value == NULL)
@@ -534,8 +547,8 @@ static void mcp_key_list(struct mcp_cmd_context *ctx,
 			ctx->matched_keys++;
 		}
 		if (mailbox_attribute_iter_deinit(&iter) < 0)
-			i_error("mailbox_attribute_iter_deinit(%s) failed: %s",
-				mailbox_get_vname(box),
+			e_error(user->event,
+				"mailbox_attribute_iter_deinit failed: %s",
 				mailbox_get_last_internal_error(box, NULL));
 		mailbox_free(&box);
 		return;
@@ -543,12 +556,14 @@ static void mcp_key_list(struct mcp_cmd_context *ctx,
 
 	const struct mailbox_info *info;
 	struct mailbox_list_iterate_context *iter =
-		mailbox_list_iter_init_namespaces(user->namespaces,
-						  ctx->ctx.args,
-						  MAIL_NAMESPACE_TYPE_PRIVATE,
-						  MAILBOX_LIST_ITER_SKIP_ALIASES |
-						  MAILBOX_LIST_ITER_NO_AUTO_BOXES |
-						  MAILBOX_LIST_ITER_RETURN_NO_FLAGS);
+		mailbox_list_iter_init_namespaces(
+			user->namespaces,
+			p_as_null_terminated_array(ctx->ctx.pool,
+						   ctx->mailbox),
+			MAIL_NAMESPACE_TYPE_PRIVATE,
+			MAILBOX_LIST_ITER_SKIP_ALIASES |
+			MAILBOX_LIST_ITER_NO_AUTO_BOXES |
+			MAILBOX_LIST_ITER_RETURN_NO_FLAGS);
 
 	while((info = mailbox_list_iter_next(iter)) != NULL) {
 		if ((info->flags & MAILBOX_NOSELECT) != 0 ||
@@ -565,15 +580,15 @@ static void mcp_key_list(struct mcp_cmd_context *ctx,
 		if (mailbox_attribute_get(box, MAIL_ATTRIBUTE_TYPE_SHARED,
 					  BOX_CRYPT_PREFIX ACTIVE_KEY_NAME,
 					  &value) < 0) {
-			i_error("mailbox_get_attribute(%s, %s) failed: %s",
-				mailbox_get_vname(box),
+			e_error(user->event,
+				"mailbox_get_attribute(%s) failed: %s",
 				BOX_CRYPT_PREFIX ACTIVE_KEY_NAME,
 				mailbox_get_last_internal_error(box, NULL));
 		} else if (mail_crypt_box_get_pvt_digests(box, pool_datastack_create(),
 							  MAIL_ATTRIBUTE_TYPE_PRIVATE,
 							  &ids, &error) < 0) {
-			i_error("mail_crypt_box_get_pvt_digests(%s) failed: %s",
-				mailbox_get_vname(box),
+			e_error(user->event,
+				"mail_crypt_box_get_pvt_digests() failed: %s",
 				error);
 		} else {
 			const char *id;
@@ -608,22 +623,30 @@ static void cmd_mcp_key_list_cb(const struct generated_key *_key, void *context)
 	key->active = _key->active;
 }
 
+static void
+cmd_mcp_key_list_init(struct doveadm_mail_cmd_context *_ctx ATTR_UNUSED)
+{
+	doveadm_print_header("box", "Folder", 0);
+	doveadm_print_header("active", "Active", 0);
+	doveadm_print_header("pubid", "Public ID", 0);
+}
+
 static int cmd_mcp_key_list_run(struct doveadm_mail_cmd_context *_ctx,
 				struct mail_user *user)
 {
+	struct doveadm_cmd_context *cctx = _ctx->cctx;
 	struct mcp_cmd_context *ctx =
-		(struct mcp_cmd_context *)_ctx;
+		container_of(_ctx, struct mcp_cmd_context, ctx);
+
+	ctx->userkey_only = doveadm_cmd_param_flag(cctx, "user-key");
+	(void)doveadm_cmd_param_str(cctx, "mailbox", &ctx->mailbox);
+
 	struct mcp_key_iter_ctx iter_ctx;
 	i_zero(&iter_ctx);
 	iter_ctx.pool = _ctx->pool;
 	p_array_init(&iter_ctx.keys, _ctx->pool, 8);
 
 	mcp_key_list(ctx, user, cmd_mcp_key_list_cb, &iter_ctx);
-
-	doveadm_print_init(DOVEADM_PRINT_TYPE_TABLE);
-	doveadm_print_header("box", "Folder", 0);
-	doveadm_print_header("active", "Active", 0);
-	doveadm_print_header("pubid", "Public ID", 0);
 
 	const struct generated_key *key;
 	array_foreach(&iter_ctx.keys, key) {
@@ -633,7 +656,8 @@ static int cmd_mcp_key_list_run(struct doveadm_mail_cmd_context *_ctx,
 	}
 
 	if (ctx->matched_keys == 0)
-		i_warning("mailbox cryptokey list: Nothing was matched. "
+		e_warning(user->event,
+			  "mailbox cryptokey list: Nothing was matched. "
 			  "Use -U or specify mask?");
 
 	return 0;
@@ -673,30 +697,50 @@ static void cmd_mcp_key_export_cb(const struct generated_key *key,
 		dcrypt_key_unref_private(&pkey);
 	}
 }
-
-static int cmd_mcp_key_export_run(struct doveadm_mail_cmd_context *_ctx,
-				  struct mail_user *user)
+static void
+cmd_mcp_key_export_init(struct doveadm_mail_cmd_context *_ctx ATTR_UNUSED)
 {
-	struct mcp_cmd_context *ctx =
-		(struct mcp_cmd_context *)_ctx;
-
-	doveadm_print_init(DOVEADM_PRINT_TYPE_PAGER);
 	doveadm_print_header("box", "Folder", 0);
 	doveadm_print_header("name", "Public ID", 0);
 	doveadm_print_header("error", "Error", 0);
 	doveadm_print_header("key", "Key", 0);
+}
+
+static int cmd_mcp_key_export_run(struct doveadm_mail_cmd_context *_ctx,
+				  struct mail_user *user)
+{
+	struct doveadm_cmd_context *cctx = _ctx->cctx;
+	struct mcp_cmd_context *ctx =
+		container_of(_ctx, struct mcp_cmd_context, ctx);
+
+	ctx->userkey_only = doveadm_cmd_param_flag(cctx, "user-key");
+	(void)doveadm_cmd_param_str(cctx, "mailbox", &ctx->mailbox);
 
 	mcp_key_list(ctx, user, cmd_mcp_key_export_cb, NULL);
 
 	return 0;
 }
 
+static void
+cmd_mcp_key_password_init(struct doveadm_mail_cmd_context *_ctx ATTR_UNUSED)
+{
+	doveadm_print_header_simple("result");
+}
+
 static int cmd_mcp_key_password_run(struct doveadm_mail_cmd_context *_ctx,
 				    struct mail_user *user)
 {
+	struct doveadm_cmd_context *cctx = _ctx->cctx;
 	struct mcp_cmd_context *ctx =
-		(struct mcp_cmd_context *)_ctx;
+		container_of(_ctx, struct mcp_cmd_context, ctx);
+
 	bool cli = (_ctx->cctx->conn_type == DOVEADM_CONNECTION_TYPE_CLI);
+
+	ctx->ask_new_password = doveadm_cmd_param_flag(cctx, "ask-new-password");
+	ctx->ask_old_password = doveadm_cmd_param_flag(cctx, "ask-old-password");
+	ctx->clear_password = doveadm_cmd_param_flag(cctx, "clear-password");
+	(void)doveadm_cmd_param_str(cctx, "old-password", &ctx->old_password);
+	(void)doveadm_cmd_param_str(cctx, "new-password", &ctx->new_password);
 
 	struct raw_key {
 		const char *attr;
@@ -705,10 +749,6 @@ static int cmd_mcp_key_password_run(struct doveadm_mail_cmd_context *_ctx,
 	};
 
 	ARRAY(struct raw_key) raw_keys;
-
-	doveadm_print_init(DOVEADM_PRINT_TYPE_PAGER);
-
-	doveadm_print_header_simple("result");
 
 	if (ctx->ask_old_password) {
 		if (ctx->old_password != NULL) {
@@ -877,80 +917,14 @@ static int cmd_mcp_key_password_run(struct doveadm_mail_cmd_context *_ctx,
 	return ret;
 }
 
-
-static bool cmd_mcp_keypair_generate_parse_arg(struct doveadm_mail_cmd_context *_ctx, int c)
-{
-	struct mcp_cmd_context *ctx =
-		(struct mcp_cmd_context *)_ctx;
-
-	switch (c) {
-	case 'U':
-		ctx->userkey_only = TRUE;
-		break;
-	case 'R':
-		ctx->recrypt_box_keys = TRUE;
-		break;
-	case 'f':
-		ctx->force = TRUE;
-		break;
-	default:
-		return FALSE;
-	}
-	return TRUE;
-
-}
-
-static bool cmd_mcp_key_password_parse_arg(struct doveadm_mail_cmd_context *_ctx, int c)
-{
-	struct mcp_cmd_context *ctx =
-		(struct mcp_cmd_context *)_ctx;
-
-	switch (c) {
-	case 'N':
-		ctx->ask_new_password = TRUE;
-		break;
-	case 'O':
-		ctx->ask_old_password = TRUE;
-		break;
-	case 'C':
-		ctx->clear_password = TRUE;
-		break;
-	case 'o':
-		ctx->old_password = p_strdup(_ctx->pool, optarg);
-		break;
-	case 'n':
-		ctx->new_password = p_strdup(_ctx->pool, optarg);
-		break;
-	default:
-		return FALSE;
-	}
-	return TRUE;
-}
-
-static bool cmd_mcp_key_parse_arg(struct doveadm_mail_cmd_context *_ctx, int c)
-{
-	struct mcp_cmd_context *ctx =
-		(struct mcp_cmd_context *)_ctx;
-
-	switch (c) {
-	case 'U':
-		ctx->userkey_only = TRUE;
-		break;
-	default:
-		return FALSE;
-	}
-	return TRUE;
-
-}
-
 static struct doveadm_mail_cmd_context *cmd_mcp_keypair_generate_alloc(void)
 {
 	struct mcp_cmd_context *ctx;
 
 	ctx = doveadm_mail_cmd_alloc(struct mcp_cmd_context);
-	ctx->ctx.getopt_args = "URf";
-	ctx->ctx.v.parse_arg = cmd_mcp_keypair_generate_parse_arg;
 	ctx->ctx.v.run = cmd_mcp_keypair_generate_run;
+	ctx->ctx.v.init = cmd_mcp_keypair_generate_init;
+	doveadm_print_init(DOVEADM_PRINT_TYPE_TABLE);
 	return &ctx->ctx;
 }
 
@@ -959,9 +933,9 @@ static struct doveadm_mail_cmd_context *cmd_mcp_key_list_alloc(void)
 	struct mcp_cmd_context *ctx;
 
 	ctx = doveadm_mail_cmd_alloc(struct mcp_cmd_context);
-	ctx->ctx.getopt_args = "U";
-	ctx->ctx.v.parse_arg = cmd_mcp_key_parse_arg;
 	ctx->ctx.v.run = cmd_mcp_key_list_run;
+	ctx->ctx.v.init = cmd_mcp_key_list_init;
+	doveadm_print_init(DOVEADM_PRINT_TYPE_TABLE);
 	return &ctx->ctx;
 }
 
@@ -970,9 +944,9 @@ static struct doveadm_mail_cmd_context *cmd_mcp_key_export_alloc(void)
 	struct mcp_cmd_context *ctx;
 
 	ctx = doveadm_mail_cmd_alloc(struct mcp_cmd_context);
-	ctx->ctx.getopt_args = "U";
-	ctx->ctx.v.parse_arg = cmd_mcp_key_parse_arg;
 	ctx->ctx.v.run = cmd_mcp_key_export_run;
+	ctx->ctx.v.init = cmd_mcp_key_export_init;
+	doveadm_print_init(DOVEADM_PRINT_TYPE_PAGER);
 	return &ctx->ctx;
 }
 
@@ -981,9 +955,9 @@ static struct doveadm_mail_cmd_context *cmd_mcp_key_password_alloc(void)
 	struct mcp_cmd_context *ctx;
 
 	ctx = doveadm_mail_cmd_alloc(struct mcp_cmd_context);
-	ctx->ctx.getopt_args = "NOCo:n:";
-	ctx->ctx.v.parse_arg = cmd_mcp_key_password_parse_arg;
 	ctx->ctx.v.run = cmd_mcp_key_password_run;
+	ctx->ctx.v.init = cmd_mcp_key_password_init;
+	doveadm_print_init(DOVEADM_PRINT_TYPE_PAGER);
 	return &ctx->ctx;
 }
 

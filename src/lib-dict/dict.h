@@ -42,11 +42,17 @@ struct dict_op_settings {
 	/* home directory for the user, if known */
 	const char *home_dir;
 
+	/* If non-zero, number of seconds until the added keys expire. See the
+	   documentation how this is implemented for different drivers. */
+	unsigned int expire_secs;
+
 	/* Don't log a warning if the transaction commit took a long time.
 	   This is needed if there are no guarantees that an asynchronous
 	   commit will finish up anytime soon. Mainly useful for transactions
 	   which aren't especially important whether they finish or not. */
 	bool no_slowness_warning;
+	/* Hide values when logging about this transaction. */
+	bool hide_log_values;
 };
 
 struct dict_lookup_result {
@@ -105,6 +111,12 @@ bool dict_have_async_operations(struct dict *dict);
    among other IO work. Returns TRUE if there is actually some work that can
    be waited on. */
 bool dict_switch_ioloop(struct dict *dict) ATTR_NOWARN_UNUSED_RESULT;
+
+/* Scan the dict for expired entries and delete them. Returns 0 if dict does
+   not support expire scanning (and there is no need to call this function
+   again), 1 if expire scanning was run successfully, -1 if expire scanning
+   failed. */
+int dict_expire_scan(struct dict *dict, const char **error_r);
 
 /* Lookup the first value for the key. Set it to NULL if it's not found.
    Returns 1 if found, 0 if not found and -1 if lookup failed. */
@@ -166,6 +178,11 @@ dict_transaction_begin(struct dict *dict, const struct dict_op_settings *set);
    dict-sql with Cassandra backend does anything with this. */
 void dict_transaction_set_timestamp(struct dict_transaction_context *ctx,
 				    const struct timespec *ts);
+
+/* Set hide_log_values for the transaction. Currently only
+   dict-sql with Cassandra backend does anything with this. */
+void dict_transaction_set_hide_log_values(struct dict_transaction_context *ctx,
+					  bool hide_log_values);
 /* Commit the transaction. Returns 1 if ok, 0 if dict_atomic_inc() was used
    on a nonexistent key, -1 if failed. */
 int dict_transaction_commit(struct dict_transaction_context **ctx,

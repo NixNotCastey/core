@@ -89,8 +89,10 @@ int uni_utf8_get_char_n(const void *_input, size_t max_len, unichar_t *chr_r)
 
 	/* the following bytes must all be 10xxxxxx */
 	for (i = 1; i < len; i++) {
-		if ((input[i] & 0xc0) != 0x80)
-			return input[i] == '\0' ? 0 : -1;
+		if ((input[i] & 0xc0) != 0x80) {
+			return (max_len == SIZE_MAX && input[i] == '\0' ?
+				0 : -1);
+		}
 
 		chr <<= 6;
 		chr |= input[i] & 0x3f;
@@ -279,8 +281,8 @@ static bool uni_ucs4_decompose_uni(unichar_t *chr)
 static void uni_ucs4_decompose_hangul_utf8(unichar_t chr, buffer_t *output)
 {
 #define SBase HANGUL_FIRST
-#define LBase 0x1100 
-#define VBase 0x1161 
+#define LBase 0x1100
+#define VBase 0x1161
 #define TBase 0x11A7
 #define VCount 21
 #define TCount 28

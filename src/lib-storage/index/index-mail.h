@@ -27,8 +27,6 @@ enum index_cache_field {
 
 	MAIL_INDEX_CACHE_FIELD_COUNT
 };
-extern struct mail_cache_field
-	global_cache_fields[MAIL_INDEX_CACHE_FIELD_COUNT];
 
 #define IMAP_BODY_PLAIN_7BIT_ASCII \
 	"\"text\" \"plain\" (\"charset\" \"us-ascii\") NIL NIL \"7bit\""
@@ -131,6 +129,8 @@ struct index_mail_data {
 	bool destroy_callback_set:1;
 	bool prefetch_sent:1;
 	bool header_parser_initialized:1;
+	bool attachment_flags_updating:1;
+	bool istream_broken:1;
 	/* virtual_size and physical_size may not match the stream size.
 	   Try to avoid trusting them too much. */
 	bool inexact_total_sizes:1;
@@ -161,6 +161,8 @@ struct index_mail {
 };
 
 #define INDEX_MAIL(s)	container_of(s, struct index_mail, mail.mail)
+
+struct mail_cache_field *index_mail_global_cache_fields_dup(void);
 
 struct mail *
 index_mail_alloc(struct mailbox_transaction_context *t,
@@ -271,6 +273,16 @@ const uint32_t *index_mail_get_vsize_extension(struct mail *_mail);
 bool index_mail_want_cache(struct index_mail *mail, enum index_cache_field field);
 void index_mail_cache_add(struct index_mail *mail, enum index_cache_field field,
 			  const void *data, size_t data_size);
+static inline bool
+index_mail_cache_add_if_wanted(struct index_mail *mail, enum index_cache_field field,
+			       const void *data, size_t data_size)
+{
+	bool want = index_mail_want_cache(mail, field);
+	if (want)
+		index_mail_cache_add(mail, field, data, data_size);
+	return want;
+}
+
 void index_mail_cache_add_idx(struct index_mail *mail, unsigned int field_idx,
 			      const void *data, size_t data_size);
 

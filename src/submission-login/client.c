@@ -43,7 +43,8 @@ client_parse_backend_capabilities(struct submission_client *subm_client )
 		enum smtp_capability cap = smtp_capability_find_by_name(*str);
 
 		if (cap == SMTP_CAPABILITY_NONE) {
-			i_warning("Unknown SMTP capability in submission_backend_capabilities: "
+			e_warning(subm_client->common.event,
+				  "Unknown SMTP capability in submission_backend_capabilities: "
 				  "%s", *str);
 			continue;
 		}
@@ -65,7 +66,7 @@ static int submission_login_start_tls(void *conn_ctx,
 	struct submission_client *subm_client = conn_ctx;
 	struct client *client = &subm_client->common;
 
-	client->starttls = TRUE;
+	client->connection_used_starttls = TRUE;
 	if (client_init_ssl(client) < 0) {
 		client_notify_disconnect(client,
 			CLIENT_DISCONNECT_INTERNAL_ERROR,
@@ -109,7 +110,7 @@ static void submission_client_create(struct client *client,
 		smtp_set.capabilities |= SMTP_CAPABILITY_STARTTLS;
 	smtp_set.hostname = subm_client->set->hostname;
 	smtp_set.login_greeting = client->set->login_greeting;
-	smtp_set.tls_required = !client->secured &&
+	smtp_set.tls_required = !client->connection_secured &&
 		(strcmp(client->ssl_set->ssl, "required") == 0);
 	smtp_set.xclient_extensions = xclient_extensions;
 	smtp_set.command_limits.max_parameters_size = LOGIN_MAX_INBUF_SIZE;
@@ -187,24 +188,21 @@ client_connection_cmd_xclient(void *context,
 		client->common.session_id =
 			p_strdup(client->common.pool, data->session);
 	}
+	if (data->client_transport != NULL) {
+		client->common.end_client_tls_secured_set = TRUE;
+		client->common.end_client_tls_secured =
+			str_begins_with(data->client_transport,
+					CLIENT_TRANSPORT_TLS);
+	}
 
 	for (i = 0; i < data->extra_fields_count; i++) {
 		const char *name = data->extra_fields[i].name;
 		const char *value = data->extra_fields[i].value;
 
 		if (strcasecmp(name, "FORWARD") == 0) {
-			size_t value_len = strlen(value);
-			if (client->common.forward_fields != NULL) {
-				str_truncate(client->common.forward_fields, 0);
-			} else {
-				client->common.forward_fields =	str_new(
-					client->common.preproxy_pool,
-					MAX_BASE64_DECODED_SIZE(value_len));
-				if (base64_decode(value, value_len,
-					  client->common.forward_fields) < 0) {
-					smtp_server_reply(cmd, 501, "5.5.4",
-						"Invalid FORWARD parameter");
-				}
+			if (!client_forward_decode_base64(&client->common, value)) {
+				smtp_server_reply(cmd, 501, "5.5.4",
+						  "Invalid FORWARD parameter");
 			}
 		}
 	}
@@ -233,7 +231,7 @@ static bool client_connection_is_trusted(void *context)
 {
 	struct submission_client *client = context;
 
-	return client->common.trusted;
+	return client->common.connection_trusted;
 }
 
 static void submission_login_die(void)

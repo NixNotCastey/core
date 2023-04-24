@@ -4,6 +4,7 @@
 #include "module-context.h"
 #include "unichar.h"
 #include "file-lock.h"
+#include "str-sanitize.h"
 #include "mail-storage.h"
 #include "mail-storage-hooks.h"
 #include "mail-storage-settings.h"
@@ -101,7 +102,7 @@ enum mail_storage_class_flags {
 	   mailbox_status.have_save_guids=TRUE) */
 	MAIL_STORAGE_CLASS_FLAG_HAVE_MAIL_SAVE_GUIDS	= 0x80,
 	/* message content can be unstructured binary data
-	   (e.g. zlib plugin is allowed to compress/decompress mails) */
+	   (e.g. mail-compress plugin is allowed to compress/decompress mails) */
 	MAIL_STORAGE_CLASS_FLAG_BINARY_DATA	= 0x100,
 	/* Message GUIDs can only be 128bit (always set
 	   mailbox_status.have_only_guid128) */
@@ -128,6 +129,11 @@ struct mail_storage_error {
 	char *error_string;
 	enum mail_error error;
 	char *last_internal_error;
+	char *last_internal_error_mailbox;
+	/* Note: This is the uid of the mail that triggered the error. Use
+		 UINT32_MAX to denote 'unset', as 0 is used for mails currently
+		 being saved. */
+	uint32_t last_internal_error_mail_uid;
 	bool last_error_is_internal;
 };
 
@@ -163,6 +169,8 @@ struct mail_storage {
 
 	/* Last error set in mail_storage_set_critical(). */
 	char *last_internal_error;
+	char *last_internal_error_mailbox;
+	uint32_t last_internal_error_mail_uid;
 
 	char *error_string;
 	enum mail_error error;
@@ -500,6 +508,9 @@ struct mailbox {
 	/* mailbox_open() returned MAIL_ERROR_NOTFOUND because the mailbox
 	   doesn't have the LOOKUP ACL right. */
 	bool acl_no_lookup_right:1;
+	/* mailbox_alloc() opened a different mailbox than asked (e.g. virtual
+	   plugin opened the backend mailbox). */
+	bool mailbox_not_original:1;
 };
 
 struct mail_vfuncs {
@@ -902,6 +913,14 @@ void mailbox_save_context_deinit(struct mail_save_context *ctx);
 /* Notify that a sync should be done. */
 void mailbox_sync_notify(struct mailbox *box, uint32_t uid,
 			 enum mailbox_sync_type sync_type);
+
+static inline const char *mailbox_name_sanitize(const char *name)
+{
+	return str_sanitize(name, 128);
+}
+
+struct event *
+mail_storage_mailbox_create_event(struct event *parent, const char *vname);
 
 /* for unit testing */
 int mailbox_verify_name(struct mailbox *box);

@@ -1,4 +1,4 @@
-noinst_LTLIBRARIES = libpassword.la libauth.la
+noinst_LTLIBRARIES = libauth.la
 auth_moduledir = $(moduledir)/auth
 
 # automake seems to force making this unconditional..
@@ -38,6 +38,7 @@ pkglibexec_PROGRAMS = auth
 AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib \
 	-I$(top_srcdir)/src/lib-auth \
+	-I$(top_srcdir)/src/lib-auth-client \
 	-I$(top_srcdir)/src/lib-test \
 	-I$(top_srcdir)/src/lib-dict \
 	-I$(top_srcdir)/src/lib-dns \
@@ -46,6 +47,7 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib-settings \
 	-I$(top_srcdir)/src/lib-otp \
 	-I$(top_srcdir)/src/lib-master \
+	-I$(top_srcdir)/src/lib-login \
 	-I$(top_srcdir)/src/lib-oauth2 \
 	-I$(top_srcdir)/src/lib-ssl-iostream \
 	-I$(top_srcdir)/src/lib-lua \
@@ -59,22 +61,8 @@ AM_CPPFLAGS = \
 
 auth_LDFLAGS = -export-dynamic
 
-libpassword_la_SOURCES = \
-	crypt-blowfish.c \
-	mycrypt.c \
-	password-scheme.c \
-	password-scheme-crypt.c \
-	password-scheme-md5crypt.c \
-	password-scheme-scram.c \
-	password-scheme-otp.c \
-	password-scheme-pbkdf2.c \
-	password-scheme-sodium.c
-libpassword_la_CFLAGS = $(AM_CPPFLAGS) $(LIBSODIUM_CFLAGS)
-
 auth_libs = \
 	libauth.la \
-	libpassword.la \
-	../lib-otp/libotp.la \
 	$(AUTH_LUA_LIBS) \
 	$(LIBDOVECOT_SQL)
 
@@ -175,12 +163,10 @@ headers = \
 	db-passwd-file.h \
 	db-oauth2.h \
 	mech.h \
-	mycrypt.h \
 	passdb.h \
 	passdb-blocking.h \
 	passdb-cache.h \
 	passdb-template.h \
-	password-scheme.h \
 	userdb.h \
 	userdb-blocking.h \
 	userdb-template.h
@@ -220,30 +206,16 @@ pkginc_libdir=$(pkgincludedir)
 pkginc_lib_HEADERS = $(headers)
 
 test_programs = \
-	test-libpassword \
 	test-auth-cache \
 	test-auth \
 	test-mech
 
 noinst_PROGRAMS = $(test_programs)
 
-noinst_HEADERS = test-auth.h crypt-blowfish.h db-lua.h
+noinst_HEADERS = test-auth.h db-lua.h
 
 test_libs = \
 	../lib-dovecot/libdovecot.la
-
-test_libpassword_SOURCES = test-libpassword.c
-test_libpassword_LDADD = \
-	libpassword.la \
-        ../lib-otp/libotp.la \
-	$(CRYPT_LIBS) \
-	$(LIBDOVECOT_SQL) \
-	$(LIBSODIUM_LIBS) \
-	$(test_libs) \
-	$(BINARY_LDFLAGS)
-
-test_libpassword_DEPENDENCIES = libpassword.la
-test_libpassword_CPPFLAGS = $(AM_CPPFLAGS) $(BINARY_CFLAGS)
 
 test_auth_cache_SOURCES = auth-cache.c test-auth-cache.c
 test_auth_cache_LDADD = $(test_libs)

@@ -22,7 +22,7 @@
 #define LOG_TYPE_FLAG_PREFIX_LEN 0x40
 #define LOG_TYPE_FLAG_DISABLE_LOG_PREFIX 0x80
 
-const char *failure_log_type_prefixes[LOG_TYPE_COUNT] = {
+const char *failure_log_type_prefixes[] = {
 	"Debug: ",
 	"Info: ",
 	"Warning: ",
@@ -30,6 +30,7 @@ const char *failure_log_type_prefixes[LOG_TYPE_COUNT] = {
 	"Fatal: ",
 	"Panic: "
 };
+static_assert_array_size(failure_log_type_prefixes, LOG_TYPE_COUNT);
 
 const char *failure_log_type_names[LOG_TYPE_COUNT] = {
 	"debug", "info", "warning", "error", "fatal", "panic"
@@ -447,13 +448,13 @@ static int log_fd_write(int fd, const unsigned char *data, size_t len)
 static void ATTR_NORETURN
 default_fatal_finish(enum log_type type, int status)
 {
-	const char *backtrace;
+	const char *backtrace, *error;
 	static int recursed = 0;
 
 	recursed++;
 	if ((type == LOG_TYPE_PANIC || status == FATAL_OUTOFMEM) &&
 	    recursed == 1) {
-		if (backtrace_get(&backtrace) == 0)
+		if (backtrace_get(&backtrace, &error) == 0)
 			i_error("Raw backtrace: %s", backtrace);
 	}
 	recursed--;

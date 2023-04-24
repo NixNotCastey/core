@@ -413,7 +413,7 @@ struct mail {
 	   can't become TRUE. */
 	bool mail_stream_accessed:1;
 	/* Mail's fast metadata was accessed within this request, e.g. the mail
-	   file was stat()ed. If mail_stream_opened==TRUE, this value isn't
+	   file was stat()ed. If mail_stream_accessed==TRUE, this value isn't
 	   accurate anymore, because some backends may always set this when
 	   stream is opened and some don't. If lookup_abort is
 	   MAIL_LOOKUP_ABORT_NOT_IN_CACHE, this can't become TRUE. */
@@ -505,6 +505,10 @@ mail_storage_get_last_internal_error(struct mail_storage *storage,
 const char * ATTR_NOWARN_UNUSED_RESULT
 mailbox_get_last_internal_error(struct mailbox *box,
 				enum mail_error *error_r) ATTR_NULL(2);
+/* Wrapper for mail_storage_get_last_internal_error(); */
+const char * ATTR_NOWARN_UNUSED_RESULT
+mail_get_last_internal_error(struct mail *mail,
+			     enum mail_error *error_r) ATTR_NULL(2);
 
 /* Save the last error until it's popped. This is useful for cases where the
    storage has already failed, but the cleanup code path changes the error to
@@ -1022,8 +1026,8 @@ void mail_generate_guid_128_hash(const char *guid, guid_128_t guid_128_r);
 
    Returns 0 and timestamp on success, -1 if the string couldn't be parsed.
    Currently supported string formats: yyyy-mm-dd (utc=FALSE),
-   imap date (utc=FALSE), unix timestamp (utc=TRUE), interval (e.g. n days,
-   utc=TRUE). */
+   imap date (utc=FALSE), imap date-time (utc=TRUE), unix timestamp (utc=TRUE),
+   interval (e.g. n days, utc=TRUE). */
 int mail_parse_human_timestamp(const char *str, time_t *timestamp_r,
 			       bool *utc_r);
 

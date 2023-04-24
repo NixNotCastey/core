@@ -91,17 +91,17 @@ http_client_request_result_event(struct http_client_request *req)
 	struct event_passthrough *e = event_create_passthrough(req->event);
 	if (req->queue != NULL &&
 	    req->queue->addr.type != HTTP_CLIENT_PEER_ADDR_UNIX)
-		e->add_str("dest_ip", net_ip2addr(&req->queue->addr.a.tcp.ip));
+		e->add_ip("dest_ip", &req->queue->addr.a.tcp.ip);
 
 	return e->add_int("status_code", req->last_status)->
 		add_int("attempts", req->attempts)->
 		add_int("redirects", req->redirects)->
-		add_int("bytes_in", req->bytes_in)->
-		add_int("bytes_out", req->bytes_out);
+		add_int("net_in_bytes", req->bytes_in)->
+		add_int("net_out_bytes", req->bytes_out);
 }
 
 static struct http_client_request *
-http_client_request_new(struct http_client *client, const char *method, 
+http_client_request_new(struct http_client *client, const char *method,
 			http_client_request_callback_t *callback, void *context)
 {
 	static unsigned int id_counter = 0;
@@ -375,20 +375,23 @@ void http_client_request_destroy(struct http_client_request **_req)
 void http_client_request_set_port(struct http_client_request *req,
 				  in_port_t port)
 {
-	i_assert(req->state == HTTP_REQUEST_STATE_NEW);
+	i_assert(req->state == HTTP_REQUEST_STATE_NEW ||
+		 req->state == HTTP_REQUEST_STATE_ABORTED);
 	req->origin_url.port = port;
 	event_add_int(req->event, "port", port);
 }
 
 void http_client_request_set_ssl(struct http_client_request *req, bool ssl)
 {
-	i_assert(req->state == HTTP_REQUEST_STATE_NEW);
+	i_assert(req->state == HTTP_REQUEST_STATE_NEW ||
+		 req->state == HTTP_REQUEST_STATE_ABORTED);
 	req->origin_url.have_ssl = ssl;
 }
 
 void http_client_request_set_urgent(struct http_client_request *req)
 {
-	i_assert(req->state == HTTP_REQUEST_STATE_NEW);
+	i_assert(req->state == HTTP_REQUEST_STATE_NEW ||
+		 req->state == HTTP_REQUEST_STATE_ABORTED);
 	req->urgent = TRUE;
 }
 
@@ -534,14 +537,19 @@ const char *http_client_request_lookup_header(struct http_client_request *req,
 
 void http_client_request_set_date(struct http_client_request *req, time_t date)
 {
-	i_assert(req->state == HTTP_REQUEST_STATE_NEW);
+	i_assert(req->state == HTTP_REQUEST_STATE_NEW ||
+		 req->state == HTTP_REQUEST_STATE_ABORTED);
 	req->date = date;
 }
 
-void http_client_request_set_payload(struct http_client_request *req,
+static void
+http_client_request_set_payload_real(struct http_client_request *req,
 				     struct istream *input, bool sync)
 {
 	int ret;
+
+	if (req->state == HTTP_REQUEST_STATE_ABORTED)
+		return;
 
 	i_assert(req->state == HTTP_REQUEST_STATE_NEW);
 	i_assert(req->payload_input == NULL);
@@ -550,7 +558,7 @@ void http_client_request_set_payload(struct http_client_request *req,
 	req->payload_input = input;
 	if ((ret = i_stream_get_size(input, TRUE, &req->payload_size)) <= 0) {
 		if (ret < 0) {
-			i_error("i_stream_get_size(%s) failed: %s",
+			e_error(req->event, "i_stream_get_size(%s) failed: %s",
 				i_stream_get_name(input),
 				i_stream_get_error(input));
 		}
@@ -568,6 +576,14 @@ void http_client_request_set_payload(struct http_client_request *req,
 		req->payload_sync = TRUE;
 }
 
+void http_client_request_set_payload(struct http_client_request *req,
+				     struct istream *input, bool sync)
+{
+	input = i_stream_create_limit(input, UOFF_T_MAX);
+	http_client_request_set_payload_real(req, input, sync);
+	i_stream_unref(&input);
+}
+
 void http_client_request_set_payload_data(struct http_client_request *req,
 					  const unsigned char *data,
 					  size_t size)
@@ -575,6 +591,8 @@ void http_client_request_set_payload_data(struct http_client_request *req,
 	struct istream *input;
 	unsigned char *payload_data;
 
+	if (req->state == HTTP_REQUEST_STATE_ABORTED)
+		return;
 	if (size == 0)
 		return;
 
@@ -582,7 +600,7 @@ void http_client_request_set_payload_data(struct http_client_request *req,
 	memcpy(payload_data, data, size);
 	input = i_stream_create_from_data(payload_data, size);
 
-	http_client_request_set_payload(req, input, FALSE);
+	http_client_request_set_payload_real(req, input, FALSE);
 	i_stream_unref(&input);
 }
 
@@ -595,7 +613,8 @@ void http_client_request_set_timeout_msecs(struct http_client_request *req,
 					   unsigned int msecs)
 {
 	i_assert(req->state == HTTP_REQUEST_STATE_NEW ||
-		 req->state == HTTP_REQUEST_STATE_GOT_RESPONSE);
+		 req->state == HTTP_REQUEST_STATE_GOT_RESPONSE ||
+		 req->state == HTTP_REQUEST_STATE_ABORTED);
 
 	req->timeout_msecs = msecs;
 }
@@ -604,7 +623,8 @@ void http_client_request_set_timeout(struct http_client_request *req,
 				     const struct timeval *time)
 {
 	i_assert(req->state == HTTP_REQUEST_STATE_NEW ||
-		 req->state == HTTP_REQUEST_STATE_GOT_RESPONSE);
+		 req->state == HTTP_REQUEST_STATE_GOT_RESPONSE ||
+		 req->state == HTTP_REQUEST_STATE_ABORTED);
 
 	req->timeout_time = *time;
 	req->timeout_msecs = 0;
@@ -614,7 +634,8 @@ void http_client_request_set_attempt_timeout_msecs(
 	struct http_client_request *req, unsigned int msecs)
 {
 	i_assert(req->state == HTTP_REQUEST_STATE_NEW ||
-		 req->state == HTTP_REQUEST_STATE_GOT_RESPONSE);
+		 req->state == HTTP_REQUEST_STATE_GOT_RESPONSE ||
+		 req->state == HTTP_REQUEST_STATE_ABORTED);
 
 	req->attempt_timeout_msecs = msecs;
 }
@@ -623,7 +644,8 @@ void http_client_request_set_max_attempts(struct http_client_request *req,
 					  unsigned int max_attempts)
 {
 	i_assert(req->state == HTTP_REQUEST_STATE_NEW ||
-		 req->state == HTTP_REQUEST_STATE_GOT_RESPONSE);
+		 req->state == HTTP_REQUEST_STATE_GOT_RESPONSE ||
+		 req->state == HTTP_REQUEST_STATE_ABORTED);
 
 	req->max_attempts = max_attempts;
 }
@@ -646,7 +668,8 @@ void http_client_request_set_proxy_url(struct http_client_request *req,
 				       const struct http_url *proxy_url)
 {
 	i_assert(req->state == HTTP_REQUEST_STATE_NEW ||
-		 req->state == HTTP_REQUEST_STATE_GOT_RESPONSE);
+		 req->state == HTTP_REQUEST_STATE_GOT_RESPONSE ||
+		 req->state == HTTP_REQUEST_STATE_ABORTED);
 
 	req->host_url = http_url_clone_authority(req->pool, proxy_url);
 	req->host_socket = NULL;
@@ -656,7 +679,8 @@ void http_client_request_set_proxy_socket(struct http_client_request *req,
 					  const char *proxy_socket)
 {
 	i_assert(req->state == HTTP_REQUEST_STATE_NEW ||
-		 req->state == HTTP_REQUEST_STATE_GOT_RESPONSE);
+		 req->state == HTTP_REQUEST_STATE_GOT_RESPONSE ||
+		 req->state == HTTP_REQUEST_STATE_ABORTED);
 
 	req->host_socket = p_strdup(req->pool, proxy_socket);
 	req->host_url = NULL;
@@ -1016,14 +1040,14 @@ static int http_client_request_flush_payload(struct http_client_request *req)
 	struct http_client_connection *conn = req->conn;
 	int ret;
 
-	if (req->payload_output != conn->conn.output &&
-	    (ret = o_stream_finish(req->payload_output)) <= 0) {
-		if (ret < 0)
-			http_client_connection_handle_output_error(conn);
-		return ret;
-	}
+	if (req->payload_output == conn->conn.output)
+		ret = o_stream_flush(req->payload_output);
+	else
+		ret = o_stream_finish(req->payload_output);
 
-	return 1;
+	if (ret < 0)
+		http_client_connection_handle_output_error(conn);
+	return ret;
 }
 
 static int
@@ -1043,10 +1067,17 @@ http_client_request_finish_payload_out(struct http_client_request *req)
 		if (ret == 0) {
 			e_debug(req->event,
 				"Not quite finished sending payload");
+			conn->output_locked = TRUE;
 			return 0;
 		}
 		o_stream_unref(&req->payload_output);
 		req->payload_output = NULL;
+	}
+	if (o_stream_get_buffer_used_size(conn->conn.output) > 0) {
+		e_debug(req->event,
+			"Not quite finished sending request");
+		conn->output_locked = TRUE;
+		return 0;
 	}
 
 	i_assert(req->request_offset < conn->conn.output->offset);
@@ -1094,7 +1125,7 @@ http_client_request_continue_payload(struct http_client_request **_req,
 		req->payload_input = NULL;
 		if (req->state == HTTP_REQUEST_STATE_PAYLOAD_OUT)
 			(void)http_client_request_finish_payload_out(req);
-	} else { 
+	} else {
 		req->payload_input = i_stream_create_from_data(data, size);
 		i_stream_set_name(req->payload_input, "<HTTP request payload>");
 	}
@@ -1500,6 +1531,10 @@ bool http_client_request_callback(struct http_client_request *req,
 	http_client_request_callback_t *callback = req->callback;
 	unsigned int orig_attempts = req->attempts;
 
+	i_assert(req->state >= HTTP_REQUEST_STATE_PAYLOAD_OUT);
+	i_assert(req->conn != NULL);
+	if (req->state == HTTP_REQUEST_STATE_PAYLOAD_OUT)
+		req->conn->output_locked = FALSE;
 	req->state = HTTP_REQUEST_STATE_GOT_RESPONSE;
 	req->last_status = response->status;
 

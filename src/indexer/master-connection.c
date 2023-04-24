@@ -120,7 +120,7 @@ index_mailbox_precache(struct master_connection *conn, struct mailbox *box)
 		if (mail_precache(mail) < 0) {
 			e_error(index_event, "Precache for UID=%u failed: %s%s",
 				mail->uid,
-				mailbox_get_last_internal_error(box, NULL),
+				mail_get_last_internal_error(mail, NULL),
 				get_attempt_error(counter, first_uid, last_uid));
 			ret = -1;
 			break;
@@ -257,13 +257,11 @@ master_connection_cmd_index(struct master_connection *conn,
 			    unsigned int max_recent_msgs, const char *what)
 {
 	struct mail_storage_service_input input;
-	struct mail_storage_service_user *service_user;
 	struct mail_user *user;
 	const char *error;
 	int ret;
 
 	i_zero(&input);
-	input.module = "mail";
 	input.service = "indexer-worker";
 	input.username = username;
 	/* if session-id is given, use it as a prefix to a unique session ID.
@@ -274,7 +272,7 @@ master_connection_cmd_index(struct master_connection *conn,
 		input.session_id_prefix = session_id;
 
 	if (mail_storage_service_lookup_next(conn->storage_service, &input,
-					     &service_user, &user, &error) <= 0) {
+					     &user, &error) <= 0) {
 		e_error(conn->conn.event, "User %s lookup failed: %s",
 			username, error);
 		return -1;
@@ -303,7 +301,6 @@ master_connection_cmd_index(struct master_connection *conn,
 	}
 
 	mail_user_deinit(&user);
-	mail_storage_service_user_unref(&service_user);
 	indexer_worker_refresh_proctitle(NULL, NULL, 0, 0);
 	return ret;
 }

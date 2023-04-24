@@ -99,9 +99,10 @@ struct master_service_haproxy_conn {
 	struct master_service_connection conn;
 
 	pool_t pool;
+	struct event *event;
 
 	struct master_service_haproxy_conn *prev, *next;
-	
+
 	struct master_service *service;
 
 	struct io *io;
@@ -117,6 +118,7 @@ master_service_haproxy_conn_free(struct master_service_haproxy_conn *hpconn)
 
 	io_remove(&hpconn->io);
 	timeout_remove(&hpconn->to);
+	event_unref(&hpconn->event);
 	pool_unref(&hpconn->pool);
 }
 
@@ -143,7 +145,7 @@ master_service_haproxy_conn_success(struct master_service_haproxy_conn *hpconn)
 static void
 master_service_haproxy_timeout(struct master_service_haproxy_conn *hpconn)
 {
-	i_error("haproxy: Client timed out (rip=%s)",
+	e_error(hpconn->event, "Client timed out (rip=%s)",
 		net_ip2addr(&hpconn->conn.remote_ip));
 	master_service_haproxy_conn_failure(hpconn);
 }
@@ -207,7 +209,7 @@ master_service_haproxy_parse_ssl_tlv(struct master_service_haproxy_conn *hpconn,
 				     const struct haproxy_pp2_tlv_ssl *ssl_kv,
 				     const char **error_r)
 {
-	hpconn->conn.proxy.ssl = (ssl_kv->client & (PP2_CLIENT_SSL)) != 0;
+	hpconn->conn.haproxy.ssl = (ssl_kv->client & (PP2_CLIENT_SSL)) != 0;
 
 	/* try parse some more */
 	for(size_t i = 0; i < ssl_kv->len;) {
@@ -225,7 +227,7 @@ master_service_haproxy_parse_ssl_tlv(struct master_service_haproxy_conn *hpconn,
 		case PP2_SUBTYPE_SSL_KEY_ALG:
 			break;
 		case PP2_SUBTYPE_SSL_CN:
-			hpconn->conn.proxy.cert_common_name =
+			hpconn->conn.haproxy.cert_common_name =
 				p_strndup(hpconn->pool, kv.data, kv.len);
 			break;
 		}
@@ -251,13 +253,13 @@ master_service_haproxy_parse_tlv(struct master_service_haproxy_conn *hpconn,
                 /* skip unsupported values */
                 switch(kv.type) {
 		case PP2_TYPE_ALPN:
-			hpconn->conn.proxy.alpn_size = kv.len;
-			hpconn->conn.proxy.alpn =
+			hpconn->conn.haproxy.alpn_size = kv.len;
+			hpconn->conn.haproxy.alpn =
 				p_memdup(hpconn->pool, kv.data, kv.len);
 			break;
                 case PP2_TYPE_AUTHORITY:
                         /* store hostname somewhere */
-                        hpconn->conn.proxy.hostname =
+                        hpconn->conn.haproxy.hostname =
 				p_strndup(hpconn->pool, kv.data, kv.len);
                         break;
                 case PP2_TYPE_SSL:
@@ -275,19 +277,23 @@ master_service_haproxy_parse_tlv(struct master_service_haproxy_conn *hpconn,
 	return 0;
 }
 
+/* reasonable max size for haproxy data */
+#define HAPROXY_READ_SIZE 1500
+
 static int
 master_service_haproxy_read(struct master_service_haproxy_conn *hpconn)
 {
-	/* reasonable max size for haproxy data */
-	unsigned char rbuf[1500];
+	/* Ensure buffer is aligned */
+	unsigned char rbuf_full[HAPROXY_READ_SIZE + sizeof(uint32_t)];
+	unsigned char *rbuf = (unsigned char*)(((uintptr_t)rbuf_full + sizeof(uint32_t)-1) & ~(sizeof(uint32_t)-1));
 	const char *error;
-	static union {
+	static union haproxy_data_union {
 		unsigned char v1_data[HAPROXY_V1_MAX_HEADER_SIZE];
 		struct {
 			const struct haproxy_header_v2 hdr;
 			const struct haproxy_data_v2 data;
 		} v2;
-	} buf;
+	} *buf;
 	struct ip_addr *real_remote_ip = &hpconn->conn.remote_ip;
 	int fd = hpconn->conn.fd;
 	struct ip_addr local_ip, remote_ip;
@@ -300,45 +306,47 @@ master_service_haproxy_read(struct master_service_haproxy_conn *hpconn)
 	   must be sent as one TCP frame, meaning that we will get it in full
 	   with the first recv() call.
 	 */
-	i_zero(&buf);
-	i_zero(&rbuf);
+	i_zero(&rbuf_full);
+	buf = (union haproxy_data_union*)rbuf;
 
 	/* see if there is a HAPROXY protocol command waiting */
-	if ((ret = master_service_haproxy_recv(fd, &buf, sizeof(buf), MSG_PEEK))<=0) {
+	if ((ret = master_service_haproxy_recv(fd, rbuf, sizeof(*buf), MSG_PEEK))<=0) {
 		if (ret < 0)
-			i_info("haproxy: Client disconnected (rip=%s): %m",
+			e_info(hpconn->event, "Client disconnected (rip=%s): %m",
 			       net_ip2addr(real_remote_ip));
 		return ret;
 	/* see if there is a haproxy command, 8 is used later on as well */
-	} else if (ret >= 8 && memcmp(buf.v1_data, "PROXY", 5) == 0) {
+	} else if (ret >= 8 && memcmp(buf->v1_data, "PROXY", 5) == 0) {
 		/* fine */
 		version = HAPROXY_VERSION_1;
-	} else if ((size_t)ret >= sizeof(buf.v2.hdr) &&
-		   memcmp(buf.v2.hdr.sig, haproxy_v2sig, sizeof(haproxy_v2sig)) == 0) {
-		want = ntohs(buf.v2.hdr.len) + sizeof(buf.v2.hdr);
-		if (want > sizeof(rbuf)) {
-			i_error("haproxy: Client disconnected: Too long header (rip=%s)",
+	} else if ((size_t)ret >= sizeof(buf->v2.hdr) &&
+		   memcmp(buf->v2.hdr.sig, haproxy_v2sig, sizeof(haproxy_v2sig)) == 0) {
+		want = ntohs(buf->v2.hdr.len) + sizeof(buf->v2.hdr);
+		if (want > sizeof(rbuf_full)) {
+			e_error(hpconn->event,
+				"Client disconnected: Too long header (rip=%s)",
 				net_ip2addr(real_remote_ip));
 			return -1;
 		}
 
 		if ((ret = master_service_haproxy_recv(fd, rbuf, want, MSG_WAITALL))<=0) {
 			if (ret < 0)
-				i_info("haproxy: Client disconnected (rip=%s): %m",
+				e_info(hpconn->event,
+				       "Client disconnected (rip=%s): %m",
 				       net_ip2addr(real_remote_ip));
 			return ret;
 		}
 
 		if (ret != (ssize_t)want) {
-			i_info("haproxy: Client disconnected: Failed to read full header (rip=%s)",
+			e_info(hpconn->event,
+			       "Client disconnected: Failed to read full header (rip=%s)",
 				net_ip2addr(real_remote_ip));
 			return -1;
 		}
-		memcpy(&buf, rbuf, sizeof(buf));
 		version = HAPROXY_VERSION_2;
 	} else {
 		/* it wasn't haproxy data */
-		i_error("haproxy: Client disconnected: "
+		e_error(hpconn->event, "Client disconnected: "
 			"Failed to read valid HAproxy data (rip=%s)",
 			net_ip2addr(real_remote_ip));
 		return -1;
@@ -352,14 +360,14 @@ master_service_haproxy_read(struct master_service_haproxy_conn *hpconn)
 
 	/* protocol version 2 */
 	if (version == HAPROXY_VERSION_2) {
-		const struct haproxy_header_v2 *hdr = &buf.v2.hdr;
-		const struct haproxy_data_v2 *data = &buf.v2.data;
+		const struct haproxy_header_v2 *hdr = &buf->v2.hdr;
+		const struct haproxy_data_v2 *data = &buf->v2.data;
 		size_t hdr_len;
 
-		i_assert(ret >= (ssize_t)sizeof(buf.v2.hdr));
+		i_assert(ret >= (ssize_t)sizeof(buf->v2.hdr));
 
 		if ((hdr->ver_cmd & 0xf0) != 0x20) {
-			i_error("haproxy: Client disconnected: "
+			e_error(hpconn->event, "Client disconnected: "
 				"Unsupported protocol version (version=%02x, rip=%s)",
 				(hdr->ver_cmd & 0xf0) >> 4,
 				net_ip2addr(real_remote_ip));
@@ -372,8 +380,10 @@ master_service_haproxy_read(struct master_service_haproxy_conn *hpconn)
 		   because TLVs begin after that. */
 		i = 0;
 
+		event_set_append_log_prefix(hpconn->event, "haproxy(v2): ");
+
 		if (ret < (ssize_t)size) {
-			i_error("haproxy(v2): Client disconnected: "
+			e_error(hpconn->event, "Client disconnected: "
 				"Protocol payload length does not match header "
 				"(got=%zu, expect=%zu, rip=%s)",
 				(size_t)ret, size, net_ip2addr(real_remote_ip));
@@ -385,14 +395,14 @@ master_service_haproxy_read(struct master_service_haproxy_conn *hpconn)
 		switch (hdr->ver_cmd & 0x0f) {
 		case HAPROXY_CMD_LOCAL:
 			/* keep local connection address for LOCAL */
-			/*i_debug("haproxy(v2): Local connection (rip=%s)",
+			/*i_debug("Local connection (rip=%s)",
 				net_ip2addr(real_remote_ip));*/
 			i = size; /* we should skip all the remaining data which can be present in PROXY protocol */
 			break;
 		case HAPROXY_CMD_PROXY:
 			if ((hdr->fam & 0x0f) != HAPROXY_SOCK_STREAM) {
 				/* UDP makes no sense currently */
-				i_error("haproxy(v2): Client disconnected: "
+				e_error(hpconn->event, "Client disconnected: "
 					"Not using TCP (type=%02x, rip=%s)",
 					(hdr->fam & 0x0f), net_ip2addr(real_remote_ip));
 				return -1;
@@ -401,7 +411,7 @@ master_service_haproxy_read(struct master_service_haproxy_conn *hpconn)
 			case HAPROXY_AF_INET:
 				/* IPv4 */
 				if (hdr_len < sizeof(data->addr.ip4)) {
-					i_error("haproxy(v2): Client disconnected: "
+					e_error(hpconn->event, "Client disconnected: "
 						"IPv4 data is incomplete (rip=%s)",
 						net_ip2addr(real_remote_ip));
 					return -1;
@@ -417,7 +427,7 @@ master_service_haproxy_read(struct master_service_haproxy_conn *hpconn)
 			case HAPROXY_AF_INET6:
 				/* IPv6 */
 				if (hdr_len < sizeof(data->addr.ip6)) {
-					i_error("haproxy(v2): Client disconnected: "
+					e_error(hpconn->event, "Client disconnected: "
 						"IPv6 data is incomplete (rip=%s)",
 						net_ip2addr(real_remote_ip));
 					return -1;
@@ -433,13 +443,13 @@ master_service_haproxy_read(struct master_service_haproxy_conn *hpconn)
 			case HAPROXY_AF_UNSPEC:
 			case HAPROXY_AF_UNIX:
 				/* unsupported; ignored */
-				i_error("haproxy(v2): Unsupported address family "
+				e_error(hpconn->event, "Unsupported address family "
 					"(family=%02x, rip=%s)", (hdr->fam & 0xf0) >> 4,
 					net_ip2addr(real_remote_ip));
 				break;
 			default:
 				/* unsupported; error */
-				i_error("haproxy(v2): Client disconnected: "
+				e_error(hpconn->event, "Client disconnected: "
 					"Unknown address family "
 					"(family=%02x, rip=%s)", (hdr->fam & 0xf0) >> 4,
 					net_ip2addr(real_remote_ip));
@@ -447,7 +457,7 @@ master_service_haproxy_read(struct master_service_haproxy_conn *hpconn)
 			}
 			break;
 		default:
-			i_error("haproxy(v2): Client disconnected: "
+			e_error(hpconn->event, "Client disconnected: "
 				"Invalid command (cmd=%02x, rip=%s)",
 				(hdr->ver_cmd & 0x0f),
 				net_ip2addr(real_remote_ip));
@@ -455,13 +465,13 @@ master_service_haproxy_read(struct master_service_haproxy_conn *hpconn)
 		}
 
 		if (i > size) {
-			i_error("haproxy(v2): Client disconnected: "
+			e_error(hpconn->event, "Client disconnected: "
 				"Invalid header size (size=%zu, tlv offset=%zu)",
 				size, i);
 			return -1; /* not a supported command */
 		}
-		if (master_service_haproxy_parse_tlv(hpconn, rbuf+i, size-i, &error) < 0) {
-			i_error("haproxy(v2): Client disconnected: "
+		if (master_service_haproxy_parse_tlv(hpconn, PTR_OFFSET(rbuf, i), size-i, &error) < 0) {
+			e_error(hpconn->event, "Client disconnected: "
 				"Invalid TLV: %s (cmd=%02x, rip=%s)",
 				error,
 				(hdr->ver_cmd & 0x0f),
@@ -470,7 +480,7 @@ master_service_haproxy_read(struct master_service_haproxy_conn *hpconn)
 		}
 	/* protocol version 1 (soon obsolete) */
 	} else if (version == HAPROXY_VERSION_1) {
-		unsigned char *data = buf.v1_data, *end;
+		unsigned char *data = buf->v1_data, *end;
 		const char *const *fields;
 		unsigned int family = 0;
 
@@ -488,9 +498,12 @@ master_service_haproxy_read(struct master_service_haproxy_conn *hpconn)
 		i_assert(strcmp(*fields, "PROXY") == 0);
 		fields++;
 
+		event_drop_parent_log_prefixes(hpconn->event, 1);
+		event_set_append_log_prefix(hpconn->event, "haproxy(v1): ");
+
 		/* protocol */
 		if (*fields == NULL) {
-			i_error("haproxy(v1): Client disconnected: "
+			e_error(hpconn->event, "Client disconnected: "
 				"Field for proxied protocol is missing "
 				"(rip=%s)", net_ip2addr(real_remote_ip));
 			return -1;
@@ -502,7 +515,7 @@ master_service_haproxy_read(struct master_service_haproxy_conn *hpconn)
 		} else if (strcmp(*fields, "UNKNOWN") == 0) {
 			family = 0;
 		} else {
-			i_error("haproxy(v1): Client disconnected: "
+			e_error(hpconn->event, "Client disconnected: "
 				"Unknown proxied protocol "
 				"(protocol=`%s', rip=%s)", str_sanitize(*fields, 64),
 				net_ip2addr(real_remote_ip));
@@ -513,14 +526,14 @@ master_service_haproxy_read(struct master_service_haproxy_conn *hpconn)
 		if (family != 0) {
 			/* remote address */
 			if (*fields == NULL) {
-				i_error("haproxy(v1): Client disconnected: "
+				e_error(hpconn->event, "Client disconnected: "
 					"Field for proxied remote address is missing "
 					"(rip=%s)", net_ip2addr(real_remote_ip));
 				return -1;
 			}
 			if (net_addr2ip(*fields, &remote_ip) < 0 ||
 				remote_ip.family != family) {
-				i_error("haproxy(v1): Client disconnected: "
+				e_error(hpconn->event, "Client disconnected: "
 					"Proxied remote address is invalid "
 					"(address=`%s', rip=%s)", str_sanitize(*fields, 64),
 					net_ip2addr(real_remote_ip));
@@ -530,14 +543,14 @@ master_service_haproxy_read(struct master_service_haproxy_conn *hpconn)
 
 			/* local address */
 			if (*fields == NULL) {
-				i_error("haproxy(v1): Client disconnected: "
+				e_error(hpconn->event, "Client disconnected: "
 					"Field for proxied local address is missing "
 					"(rip=%s)", net_ip2addr(real_remote_ip));
 				return -1;
 			}
 			if (net_addr2ip(*fields, &local_ip) < 0 ||
 				local_ip.family != family) {
-				i_error("haproxy(v1): Client disconnected: "
+				e_error(hpconn->event, "Client disconnected: "
 					"Proxied local address is invalid "
 					"(address=`%s', rip=%s)", str_sanitize(*fields, 64),
 					net_ip2addr(real_remote_ip));
@@ -547,13 +560,13 @@ master_service_haproxy_read(struct master_service_haproxy_conn *hpconn)
 
 			/* remote port */
 			if (*fields == NULL) {
-				i_error("haproxy(v1): Client disconnected: "
+				e_error(hpconn->event, "Client disconnected: "
 					"Field for proxied local port is missing "
 					"(rip=%s)", net_ip2addr(real_remote_ip));
 				return -1;
 			}
 			if (net_str2port(*fields, &remote_port) < 0) {
-				i_error("haproxy(v1): Client disconnected: "
+				e_error(hpconn->event, "Client disconnected: "
 					"Proxied remote port is invalid "
 					"(port=`%s', rip=%s)", str_sanitize(*fields, 64),
 					net_ip2addr(real_remote_ip));
@@ -563,13 +576,13 @@ master_service_haproxy_read(struct master_service_haproxy_conn *hpconn)
 
 			/* local port */
 			if (*fields == NULL) {
-				i_error("haproxy(v1): Client disconnected: "
+				e_error(hpconn->event, "Client disconnected: "
 					"Field for proxied local port is missing "
 					"(rip=%s)", net_ip2addr(real_remote_ip));
 				return -1;
 			}
 			if (net_str2port(*fields, &local_port) < 0) {
-				i_error("haproxy(v1): Client disconnected: "
+				e_error(hpconn->event, "Client disconnected: "
 					"Proxied local port is invalid "
 					"(port=`%s', rip=%s)", str_sanitize(*fields, 64),
 					net_ip2addr(real_remote_ip));
@@ -578,22 +591,23 @@ master_service_haproxy_read(struct master_service_haproxy_conn *hpconn)
 			fields++;
 
 			if (*fields != NULL) {
-				i_error("haproxy(v1): Client disconnected: "
+				e_error(hpconn->event, "Client disconnected: "
 					"Header line has spurius extra field "
 					"(field=`%s', rip=%s)", str_sanitize(*fields, 64),
 					net_ip2addr(real_remote_ip));
 				return -1;
 			}
 		}
-		i_assert(size <= sizeof(buf));
+		i_assert(size <= sizeof(*buf));
 
-		if ((ret = master_service_haproxy_recv(fd, &buf, size, 0))<=0) {
+		if ((ret = master_service_haproxy_recv(fd, rbuf, size, 0))<=0) {
 			if (ret < 0)
-				i_info("haproxy: Client disconnected (rip=%s): %m",
+				e_info(hpconn->event,
+				       "Client disconnected (rip=%s): %m",
 				       net_ip2addr(real_remote_ip));
 			return ret;
 		} else if (ret != (ssize_t)size) {
-			i_error("haproxy: Client disconnected: "
+			e_error(hpconn->event, "Client disconnected: "
 				"Failed to read full header (rip=%s)",
 				net_ip2addr(real_remote_ip));
 			return -1;
@@ -608,7 +622,7 @@ master_service_haproxy_read(struct master_service_haproxy_conn *hpconn)
 	hpconn->conn.remote_ip = remote_ip;
 	hpconn->conn.local_port = local_port;
 	hpconn->conn.remote_port = remote_port;
-	hpconn->conn.proxied = TRUE;
+	hpconn->conn.haproxied = TRUE;
 
 	return 1;
 }
@@ -640,8 +654,9 @@ master_service_haproxy_conn_is_trusted(struct master_service *service,
 	net = t_strsplit_spaces(service->set->haproxy_trusted_networks, ", ");
 	for (; *net != NULL; net++) {
 		if (net_parse_range(*net, &net_ip, &bits) < 0) {
-			i_error("haproxy_trusted_networks: "
-				"Invalid network '%s'", *net);
+			e_error(service->event,
+				"haproxy_trusted_networks: Invalid network '%s'",
+				*net);
 			break;
 		}
 
@@ -654,21 +669,24 @@ master_service_haproxy_conn_is_trusted(struct master_service *service,
 void master_service_haproxy_new(struct master_service *service,
 				struct master_service_connection *conn)
 {
-	struct master_service_haproxy_conn *hpconn;
-	pool_t pool;
+	struct event *event = event_create(service->event);
+	event_set_append_log_prefix(event, "haproxy: ");
 
 	if (!master_service_haproxy_conn_is_trusted(service, conn)) {
-		i_warning("haproxy: Client not trusted (rip=%s)",
+		e_warning(event, "Client not trusted (rip=%s)",
 			  net_ip2addr(&conn->real_remote_ip));
 		master_service_client_connection_handled(service, conn);
+		event_unref(&event);
 		return;
 	}
 
-	pool = pool_alloconly_create("haproxy connection", 128);
-	hpconn = p_new(pool, struct master_service_haproxy_conn, 1);
+	pool_t pool = pool_alloconly_create("haproxy connection", 128);
+	struct master_service_haproxy_conn *hpconn =
+		p_new(pool, struct master_service_haproxy_conn, 1);
 	hpconn->pool = pool;
 	hpconn->conn = *conn;
 	hpconn->service = service;
+	hpconn->event = event;
 	DLLIST_PREPEND(&service->haproxy_conns, hpconn);
 
 	hpconn->io = io_add(conn->fd, IO_READ,

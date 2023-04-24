@@ -5,6 +5,7 @@
 #include "mkdir-parents.h"
 #include "eacces-error.h"
 #include "unlink-old-files.h"
+#include "settings-parser.h"
 #include "mailbox-uidvalidity.h"
 #include "mailbox-list-private.h"
 #include "maildir-storage.h"
@@ -56,7 +57,8 @@ maildir_storage_create(struct mail_storage *_storage, struct mail_namespace *ns,
 	struct mailbox_list *list = ns->list;
 	const char *dir;
 
-	storage->set = mail_namespace_get_driver_settings(ns, _storage);
+	storage->set = settings_parser_get_root_set(_storage->user->set_parser,
+		maildir_get_setting_parser_info());
 
 	storage->temp_prefix = p_strdup(_storage->pool,
 					mailbox_list_get_temp_prefix(list));
@@ -96,7 +98,7 @@ static void maildir_storage_get_list_settings(const struct mail_namespace *ns,
 static const char *
 maildir_storage_find_root_dir(const struct mail_namespace *ns)
 {
-	bool debug = ns->mail_set->mail_debug;
+	struct event *event = ns->user->event;
 	const char *home, *path;
 
 	/* we'll need to figure out the maildir location ourself.
@@ -105,18 +107,17 @@ maildir_storage_find_root_dir(const struct mail_namespace *ns)
 	    mail_user_get_home(ns->owner, &home) > 0) {
 		path = t_strconcat(home, "/Maildir", NULL);
 		if (access(path, R_OK|W_OK|X_OK) == 0) {
-			if (debug)
-				i_debug("maildir: root exists (%s)", path);
+			e_debug(event,
+				"maildir autodetect: root exists (%s)", path);
 			return path;
-		} 
-		if (debug)
-			i_debug("maildir: access(%s, rwx): failed: %m", path);
+		}
+		e_debug(event,
+			"maildir autodetect: access(%s, rwx): failed: %m", path);
 	} else {
-		if (debug)
-			i_debug("maildir: Home directory not set");
+		e_debug(event, "maildir autodetect: Home directory not set");
 		if (access("/cur", R_OK|W_OK|X_OK) == 0) {
-			if (debug)
-				i_debug("maildir: /cur exists, assuming chroot");
+			e_debug(event,
+				"maildir autodetect: /cur exists, assuming chroot");
 			return "/";
 		}
 	}
@@ -126,7 +127,7 @@ maildir_storage_find_root_dir(const struct mail_namespace *ns)
 static bool maildir_storage_autodetect(const struct mail_namespace *ns,
 				       struct mailbox_list_settings *set)
 {
-	bool debug = ns->mail_set->mail_debug;
+	struct event *event = ns->user->event;
 	struct stat st;
 	const char *path, *root_dir;
 
@@ -135,22 +136,19 @@ static bool maildir_storage_autodetect(const struct mail_namespace *ns,
 	else {
 		root_dir = maildir_storage_find_root_dir(ns);
 		if (root_dir == NULL) {
-			if (debug)
-				i_debug("maildir: couldn't find root dir");
+			e_debug(event, "maildir autodetect: couldn't find root dir");
 			return FALSE;
 		}
 	}
 
 	path = t_strconcat(root_dir, "/cur", NULL);
 	if (stat(path, &st) < 0) {
-		if (debug)
-			i_debug("maildir autodetect: stat(%s) failed: %m", path);
+		e_debug(event, "maildir autodetect: stat(%s) failed: %m", path);
 		return FALSE;
 	}
 
 	if (!S_ISDIR(st.st_mode)) {
-		if (debug)
-			i_debug("maildir autodetect: %s not a directory", path);
+		e_debug(event, "maildir autodetect: %s not a directory", path);
 		return FALSE;
 	}
 
@@ -346,11 +344,46 @@ maildir_mailbox_exists(struct mailbox *box, bool auto_boxes,
 	return index_storage_mailbox_exists_full(box, "cur", existence_r);
 }
 
+static bool maildir_has_any_subdir(const char *box_path,
+				   const char **error_path)
+{
+	const char *path;
+	unsigned int i;
+	struct stat st;
+
+	for (i = 0; i < N_ELEMENTS(maildir_subdirs); i++) {
+		path = t_strconcat(box_path, "/", maildir_subdirs[i], NULL);
+		if (stat(path, &st) == 0) {
+			/* Return if there is any subdir */
+			return TRUE;
+		} else if (errno == ENOENT || errno == ENAMETOOLONG) {
+			/* Some subdirs may not exist. */
+		} else {
+			*error_path = path;
+			return FALSE;
+		}
+	}
+
+	return FALSE;
+}
+
+static bool maildir_is_selectable(const char *box_path,
+				  const char *root_dir,
+				  const char **error_path_r)
+{
+	struct stat st;
+
+	*error_path_r = box_path;
+	if (strcmp(box_path, root_dir) == 0)
+		return maildir_has_any_subdir(box_path, error_path_r);
+	else
+		return stat(box_path, &st) == 0;
+}
+
 static int maildir_mailbox_open(struct mailbox *box)
 {
 	const char *box_path = mailbox_get_path(box);
 	const char *root_dir;
-	struct stat st;
 	int ret;
 
 	/* begin by checking if tmp/ directory exists and if it should be
@@ -373,10 +406,21 @@ static int maildir_mailbox_open(struct mailbox *box)
 	}
 	root_dir = mailbox_list_get_root_forced(box->list,
 						MAILBOX_LIST_PATH_TYPE_MAILBOX);
-	if (strcmp(box_path, root_dir) == 0 && !box->inbox_any) {
-		/* root directory for some namespace. */
-		errno = ENOENT;
-	} else if (stat(box_path, &st) == 0) {
+
+	/* This code path is executed only for Maildir++ and imapdir layouts,
+	   which don't support \Noselect mailboxes. If the mailbox root
+	   directory exists, automatically create any missing cur/new/tmp
+	   directories. Otherwise the mailbox would show up as selectable
+	   in the mailbox list, but not actually be selectable.
+
+	   As a special case we don't do this when the mailbox root directory
+	   is the same as the namespace root directory. This especially means
+	   that we don't autocreate Maildir INBOX when ~/Maildir directory
+	   exists. Instead, we return that mailbox doesn't exist, so the
+	   caller goes to the INBOX autocreation code path similarly as with
+	   other mailboxes. This is needed e.g. for welcome plugin to work. */
+	const char *error_path;
+	if (maildir_is_selectable(box_path, root_dir, &error_path)) {
 		/* yes, we'll need to create the missing dirs */
 		if (create_maildir_subdirs(box, TRUE) < 0)
 			return -1;
@@ -389,7 +433,7 @@ static int maildir_mailbox_open(struct mailbox *box)
 			T_MAIL_ERR_MAILBOX_NOT_FOUND(box->vname));
 		return -1;
 	} else {
-		mailbox_set_critical(box, "stat(%s) failed: %m", box_path);
+		mailbox_set_critical(box, "stat(%s) failed: %m", error_path);
 		return -1;
 	}
 }
@@ -542,7 +586,7 @@ maildir_mailbox_create(struct mailbox *box, const struct mailbox_update *update,
 		if (maildir_create_shared(box) < 0)
 			ret = -1;
 	}
-	if (update != NULL) {
+	if (ret == 0 && update != NULL) {
 		if (maildir_mailbox_update(box, update) < 0)
 			ret = -1;
 	}
@@ -616,7 +660,8 @@ static void maildir_storage_add_list(struct mail_storage *storage,
 
 	mlist = p_new(list->pool, struct maildir_mailbox_list_context, 1);
 	mlist->module_ctx.super = list->v;
-	mlist->set = mail_namespace_get_driver_settings(list->ns, storage);
+	mlist->set = settings_parser_get_root_set(storage->user->set_parser,
+		maildir_get_setting_parser_info());
 
 	list->v.is_internal_name = maildir_is_internal_name;
 	MODULE_CONTEXT_SET(list, maildir_mailbox_list_module, mlist);

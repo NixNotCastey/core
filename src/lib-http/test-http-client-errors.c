@@ -268,6 +268,7 @@ test_client_invalid_url_response(const struct http_response *resp,
 static bool
 test_client_invalid_url(const struct http_client_settings *client_set)
 {
+	static const unsigned char data[] = "FROP";
 	struct http_client_request *hreq;
 	struct _invalid_url *ctx;
 
@@ -279,11 +280,15 @@ test_client_invalid_url(const struct http_client_settings *client_set)
 	hreq = http_client_request_url_str(
 		http_client, "GET", "imap://example.com/INBOX",
 		test_client_invalid_url_response, ctx);
+	http_client_request_add_header(hreq, "X-Frop", "frop");
+	http_client_request_set_payload_data(hreq, data, sizeof(data) - 1);
 	http_client_request_submit(hreq);
 
 	hreq = http_client_request_url_str(
 		http_client, "GET", "http:/www.example.com",
 		test_client_invalid_url_response, ctx);
+	http_client_request_add_header(hreq, "X-Frop", "frop");
+	http_client_request_set_payload_data(hreq, data, sizeof(data) - 1);
 	http_client_request_submit(hreq);
 
 	return TRUE;
@@ -419,7 +424,8 @@ test_client_connection_refused(const struct http_client_settings *client_set)
 	struct _connection_refused *ctx;
 
 	/* wait for the server side to close the socket */
-	test_subprocess_notify_signal_wait(SIGUSR1, 10000);
+	test_subprocess_notify_signal_wait(
+		SIGUSR1, TEST_SIGNALS_DEFAULT_TIMEOUT_MS);
 
 	ctx = i_new(struct _connection_refused, 1);
 	ctx->count = 2;
@@ -689,7 +695,7 @@ static void test_invalid_redirect_input3(struct server_connection *conn)
 	string_t *resp;
 
 	resp = t_str_new(512);
-	str_printfa(resp, 
+	str_printfa(resp,
 		    "HTTP/1.1 302 Redirect\r\n"
 		    "Location: http://%s:%u/friep.txt\r\n"
 		    "\r\n",
@@ -764,7 +770,7 @@ static void test_invalid_redirect(void)
 	test_end();
 }
 
-/* 
+/*
  * Unseekable redirect
  */
 
@@ -775,7 +781,7 @@ static void test_unseekable_redirect_input(struct server_connection *conn)
 	string_t *resp;
 
 	resp = t_str_new(512);
-	str_printfa(resp, 
+	str_printfa(resp,
 		    "HTTP/1.1 302 Redirect\r\n"
 		    "Location: http://%s:%u/frml.txt\r\n"
 		    "\r\n",
@@ -967,7 +973,7 @@ test_client_broken_payload(const struct http_client_settings *client_set)
 	http_client_request_submit(hreq);
 
 	i_stream_unref(&input);
-	return TRUE;	
+	return TRUE;
 }
 
 /* test */
@@ -1588,7 +1594,7 @@ test_client_early_success(const struct http_client_settings *client_set)
 
 	ctx = i_new(struct _early_success_ctx, 1);
 	ctx->count = 2;
-	
+
 	http_client = http_client_init(client_set);
 
 	hreq = http_client_request(
@@ -1967,7 +1973,7 @@ test_client_request_aborted_early_response(
 		i_debug("RESPONSE: %u %s", resp->status, resp->reason);
 
 	/* abort does not trigger callback */
-	test_assert(FALSE); 
+	test_assert(FALSE);
 }
 
 static void
@@ -1980,7 +1986,7 @@ test_client_request_aborted_early_timeout(
 		/* abort early */
 		http_client_request_abort(&ctx->req1); /* sent */
 		http_client_request_abort(&ctx->req2); /* only queued */
-	
+
 		/* wait a little for server to actually respond to an
 		   already aborted request */
 		ctx->to = timeout_add_short(
@@ -2166,7 +2172,7 @@ test_client_client_deinit_early_response(
 		i_debug("RESPONSE: %u %s", resp->status, resp->reason);
 
 	/* abort does not trigger callback */
-	test_assert(FALSE); 
+	test_assert(FALSE);
 }
 
 static void
@@ -2176,7 +2182,7 @@ test_client_client_deinit_early_timeout(struct _client_deinit_early_ctx *ctx)
 
 	/* deinit early */
 	http_client_deinit(&http_client);
-	
+
 	/* all done */
 	i_free(ctx);
 	io_loop_stop(ioloop);
@@ -2979,7 +2985,7 @@ test_client_reconnect_failure(const struct http_client_settings *client_set)
 	struct _reconnect_failure_ctx *ctx;
 
 	ctx = i_new(struct _reconnect_failure_ctx, 1);
-	
+
 	http_client = http_client_init(client_set);
 
 	hreq = http_client_request(
@@ -3664,7 +3670,7 @@ test_client_run(test_client_init_t client_test,
 static void server_connection_input(struct connection *_conn)
 {
 	struct server_connection *conn = (struct server_connection *)_conn;
-	
+
 	test_server_input(conn);
 }
 
@@ -3803,6 +3809,7 @@ static int test_run_dns(test_dns_init_t dns_test)
 	if (debug)
 		i_debug("PID=%s", my_pid);
 
+	test_subprocess_notify_signal_send_parent(SIGHUP);
 	ioloop = io_loop_create();
 	dns_test();
 	io_loop_destroy(&ioloop);
@@ -3842,7 +3849,6 @@ test_run_client_server(const struct http_client_settings *client_set,
 {
 	unsigned int i;
 
-	test_subprocess_notify_signal_reset(SIGHUP);
 	test_server_init = NULL;
 	test_server_deinit = NULL;
 	test_server_input = NULL;
@@ -3863,10 +3869,11 @@ test_run_client_server(const struct http_client_settings *client_set,
 
 			/* Fork server */
 			fd_listen = fds[i];
-			test_subprocess_fork(test_run_server, &data, FALSE);
-			i_close_fd(&fd_listen);
-			test_subprocess_notify_signal_wait(SIGHUP, 10000);
 			test_subprocess_notify_signal_reset(SIGHUP);
+			test_subprocess_fork(test_run_server, &data, FALSE);
+			test_subprocess_notify_signal_wait(
+				SIGHUP, TEST_SIGNALS_DEFAULT_TIMEOUT_MS);
+			i_close_fd(&fd_listen);
 		}
 	}
 
@@ -3881,7 +3888,10 @@ test_run_client_server(const struct http_client_settings *client_set,
 
 		/* Fork DNS service */
 		fd_listen = fd;
+		test_subprocess_notify_signal_reset(SIGHUP);
 		test_subprocess_fork(test_run_dns, dns_test, FALSE);
+		test_subprocess_notify_signal_wait(
+			SIGHUP, TEST_SIGNALS_DEFAULT_TIMEOUT_MS);
 		i_close_fd(&fd_listen);
 	}
 
@@ -3932,7 +3942,7 @@ int main(int argc, char *argv[])
 	/* listen on localhost */
 	i_zero(&bind_ip);
 	bind_ip.family = AF_INET;
-	bind_ip.u.ip4.s_addr = htonl(INADDR_LOOPBACK);	
+	bind_ip.u.ip4.s_addr = htonl(INADDR_LOOPBACK);
 
 	ret = test_run(test_functions);
 

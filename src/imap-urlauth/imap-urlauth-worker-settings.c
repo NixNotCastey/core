@@ -5,6 +5,7 @@
 #include "settings-parser.h"
 #include "service-settings.h"
 #include "mail-storage-settings.h"
+#include "imap-urlauth-worker-common.h"
 #include "imap-urlauth-worker-settings.h"
 
 #include <stddef.h>
@@ -12,7 +13,12 @@
 
 /* <settings checks> */
 static struct file_listener_settings imap_urlauth_worker_unix_listeners_array[] = {
-	{ "imap-urlauth-worker", 0600, "$default_internal_user", "" }
+	{
+		.path = IMAP_URLAUTH_WORKER_SOCKET,
+		.mode = 0600,
+		.user = "$default_internal_user",
+		.group = "",
+	},
 };
 static struct file_listener_settings *imap_urlauth_worker_unix_listeners[] = {
 	&imap_urlauth_worker_unix_listeners_array[0]

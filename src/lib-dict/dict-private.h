@@ -7,12 +7,17 @@
 
 struct ioloop;
 
+enum dict_driver_flags {
+	DICT_DRIVER_FLAG_SUPPORT_EXPIRE_SECS	= BIT(0),
+};
+
 struct dict_vfuncs {
 	int (*init)(struct dict *dict_driver, const char *uri,
 		    const struct dict_settings *set,
 		    struct dict **dict_r, const char **error_r);
 	void (*deinit)(struct dict *dict);
 	void (*wait)(struct dict *dict);
+	int (*expire_scan)(struct dict *dict, const char **error_r);
 
 	int (*lookup)(struct dict *dict, const struct dict_op_settings *set,
 		      pool_t pool, const char *key, const char *const **values_r,
@@ -49,6 +54,8 @@ struct dict_vfuncs {
 	bool (*switch_ioloop)(struct dict *dict);
 	void (*set_timestamp)(struct dict_transaction_context *ctx,
 			      const struct timespec *ts);
+	void (*set_hide_log_values)(struct dict_transaction_context *ctx,
+			            bool hide_log_values);
 };
 
 struct dict_commit_callback_ctx;
@@ -56,11 +63,14 @@ struct dict_commit_callback_ctx;
 struct dict_op_settings_private {
 	char *username;
 	char *home_dir;
+	unsigned int expire_secs;
 	bool no_slowness_warning;
+	bool hide_log_values;
 };
 
 struct dict {
 	const char *name;
+	enum dict_driver_flags flags;
 
 	struct dict_vfuncs v;
 	unsigned int iter_count;
@@ -70,6 +80,7 @@ struct dict {
 	struct event *event;
 	struct ioloop *ioloop, *prev_ioloop;
 	struct dict_commit_callback_ctx *commits;
+	struct dict_transaction_context *rollbacks;
 };
 
 struct dict_iterate_context {
@@ -93,6 +104,9 @@ struct dict_transaction_context {
 
 	struct event *event;
 	struct timespec timestamp;
+
+	struct timeout *to_rollback;
+	const char *error;
 
 	bool changed:1;
 };

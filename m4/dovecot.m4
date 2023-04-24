@@ -6,7 +6,7 @@ dnl This file is free software; the authors give
 dnl unlimited permission to copy and/or distribute it, with or without
 dnl modifications, as long as this notice is preserved.
 
-# serial 35
+# serial 38
 
 dnl
 dnl Check for support for D_FORTIFY_SOURCE=2
@@ -23,51 +23,63 @@ AC_DEFUN([AC_CC_D_FORTIFY_SOURCE],[
             [],
             [AC_LANG_PROGRAM()]
           )
+        ;;
       esac
     ])
 ])
 
 dnl * gcc specific options
 AC_DEFUN([DC_DOVECOT_CFLAGS],[
+  m4_version_prereq(2.70, [AC_PROG_CC], [AC_PROG_CC_C99])
+
+  AS_IF([test "$ac_prog_cc_stdc" = "c89" || test "$ac_prog_cc_std" = "no" || test "$ac_cv_prog_cc_c99" = "no"], [
+    AC_MSG_ERROR(C99 capable compiler required)
+  ])
+
+  AC_MSG_CHECKING([Which $CC -std flag to use])
+  old_cflags=$CFLAGS
+  std=
+  for mystd in gnu11 gnu99 c11 c99; do
+    CFLAGS="-std=$mystd"
+    AC_COMPILE_IFELSE([AC_LANG_PROGRAM()
+    ], [
+      CFLAGS="$CFLAGS $old_cflags"
+      std=$mystd
+      break
+    ], [
+      CFLAGS="$old_cflags"
+    ])
+  done
+  AC_MSG_RESULT($std)
+
   AS_IF([test "x$ac_cv_c_compiler_gnu" = "xyes"], [
-        dnl -Wcast-qual -Wcast-align -Wconversion -Wunreachable-code # too many warnings
-        dnl -Wstrict-prototypes -Wredundant-decls # may give warnings in some systems
-        dnl -Wmissing-format-attribute -Wmissing-noreturn -Wwrite-strings # a couple of warnings
-        CFLAGS="$CFLAGS -Wall -W -Wmissing-prototypes -Wmissing-declarations -Wpointer-arith -Wchar-subscripts -Wformat=2 -Wbad-function-cast"
+    dnl -Wcast-qual -Wcast-align -Wconversion -Wunreachable-code # too many warnings
+    dnl -Wstrict-prototypes -Wredundant-decls # may give warnings in some systems
+    dnl -Wmissing-format-attribute -Wmissing-noreturn -Wwrite-strings # a couple of warnings
+    CFLAGS="$CFLAGS -Wall -W -Wmissing-prototypes -Wmissing-declarations -Wpointer-arith -Wchar-subscripts -Wformat=2 -Wbad-function-cast"
 
-        AS_IF([test "$have_clang" = "yes"], [
-          AC_TRY_COMPILE([
-          #if __clang_major__ > 3 || (__clang_major__ == 3 && __clang_minor__ >= 3)
-          #  error new clang
-          #endif
-          ],,,[
-            dnl clang 3.3+ unfortunately this gives warnings with hash.h
-            CFLAGS="$CFLAGS -Wno-duplicate-decl-specifier"
-          ])
-        ], [
-          dnl This is simply to avoid warning when building strftime() wrappers..
-          CFLAGS="$CFLAGS -fno-builtin-strftime"
-        ])
+    AS_IF([test "$have_clang" = "yes"], [
+      AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
+      #if __clang_major__ > 3 || (__clang_major__ == 3 && __clang_minor__ >= 3)
+      #  error new clang
+      #endif
+      ]], [[]])],[],[
+        dnl clang 3.3+ unfortunately this gives warnings with hash.h
+        CFLAGS="$CFLAGS -Wno-duplicate-decl-specifier"
+      ])
+    ], [
+      dnl This is simply to avoid warning when building strftime() wrappers..
+      CFLAGS="$CFLAGS -fno-builtin-strftime"
+    ])
 
-        AC_TRY_COMPILE([
-        #if __GNUC__ < 4
-        #  error old gcc
-        #endif
-        ],,[
-          dnl gcc4
-          CFLAGS="$CFLAGS -Wstrict-aliasing=2"
-        ])
-
-        dnl Use std=gnu99 if we have new enough gcc
-        old_cflags=$CFLAGS
-        CFLAGS="-std=gnu99"
-        AC_TRY_COMPILE([
-        ],, [
-          CFLAGS="$CFLAGS $old_cflags"
-        ], [
-          CFLAGS="$old_cflags"
-        ])
-
+    AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
+      #if __GNUC__ < 4
+      #  error old gcc
+      #endif
+      ]], [[]])],[
+        dnl gcc4
+        CFLAGS="$CFLAGS -Wstrict-aliasing=2"
+      ],[])
   ])
 ])
 
@@ -324,7 +336,7 @@ AC_DEFUN([DC_DOVECOT],[
 	)
 
 	AC_ARG_WITH(dovecot-install-dirs,
-		[AC_HELP_STRING([--with-dovecot-install-dirs],
+		[AS_HELP_STRING([--with-dovecot-install-dirs],
 		[Use install directories configured for Dovecot (default)])],
 	AS_IF([test x$withval = xno], [
 		use_install_dirs=no
@@ -407,7 +419,7 @@ AC_DEFUN([DC_CC_WRAPPER],[
 	cat > cc-wrapper.sh <<_DC_EOF
 #!/bin/sh
 
-if echo "\$[*]" | grep -- -ldl > /dev/null; then
+if echo "\$[*]" | grep -- -export-dynamic > /dev/null; then
   # the binary uses plugins. make sure we include everything from .a libs
   exec $CC -Wl,--whole-archive \$[*] -Wl,--no-whole-archive
 else
@@ -421,18 +433,6 @@ _DC_EOF
   ])
 ])
 
-AC_DEFUN([DC_PANDOC], [
-  AC_ARG_VAR(PANDOC, [Path to pandoc program])
-
-  dnl Optional tool for making documentation
-  AC_CHECK_PROGS(PANDOC, [pandoc], [true])
-
-  AS_IF([test "$PANDOC" = "true"], [
-   AS_IF([test ! -e README], [
-     AC_MSG_ERROR([Cannot produce documentation without pandoc - disable with PANDOC=false ./configure])
-   ])
-  ])
-])
 # warnings.m4 serial 11
 dnl Copyright (C) 2008-2015 Free Software Foundation, Inc.
 dnl This file is free software; the Free Software Foundation

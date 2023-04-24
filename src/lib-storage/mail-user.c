@@ -12,6 +12,7 @@
 #include "safe-mkstemp.h"
 #include "str.h"
 #include "strescape.h"
+#include "strfuncs.h"
 #include "var-expand.h"
 #include "settings-parser.h"
 #include "iostream-ssl.h"
@@ -40,44 +41,58 @@ static void mail_user_deinit_base(struct mail_user *user)
 		dict_deinit(&user->_attr_dict);
 	}
 	mail_namespaces_deinit(&user->namespaces);
-	if (user->_service_user != NULL)
-		mail_storage_service_user_unref(&user->_service_user);
+	mail_storage_service_user_unref(&user->service_user);
 }
 
 static void mail_user_deinit_pre_base(struct mail_user *user ATTR_UNUSED)
 {
 }
 
+void mail_user_add_event_fields(struct mail_user *user)
+{
+	if (user->userdb_fields == NULL)
+		return;
+	for (unsigned int i = 0; user->userdb_fields[i] != NULL; i++) {
+		const char *field = user->userdb_fields[i];
+		const char *key, *value;
+		t_split_key_value_eq(field, &key, &value);
+		if (str_begins(key, "event_", &key))
+			event_add_str(user->event, key, value);
+	}
+}
+
 static struct mail_user *
-mail_user_alloc_int(struct event *parent_event,
-		    const char *username,
-		    const struct setting_parser_info *set_info,
-		    const struct mail_user_settings *set, pool_t pool)
+mail_user_alloc_int(struct mail_storage_service_user *service_user,
+		    struct setting_parser_context *unexpanded_set_parser,
+		    pool_t pool)
 {
 	struct mail_user *user;
-	const char *error;
-
-	i_assert(username != NULL);
+	struct event *parent_event =
+		mail_storage_service_user_get_event(service_user);
+	const char *username =
+		mail_storage_service_user_get_username(service_user);
 	i_assert(*username != '\0');
 
 	user = p_new(pool, struct mail_user, 1);
 	user->pool = pool;
 	user->refcount = 1;
+	user->service_user = service_user;
+	mail_storage_service_user_ref(service_user);
 	user->username = p_strdup(pool, username);
-	user->set_info = set_info;
-	user->unexpanded_set = set;
-	user->set = settings_dup_with_pointers(set_info, user->unexpanded_set, pool);
+	user->unexpanded_set_parser = unexpanded_set_parser;
+	settings_parser_ref(user->unexpanded_set_parser);
+	user->set_parser = settings_parser_dup(unexpanded_set_parser, pool);
+	user->unexpanded_set =
+		settings_parser_get_root_set(unexpanded_set_parser,
+					     &mail_user_setting_parser_info);
+	user->set = settings_parser_get_root_set(user->set_parser,
+						 &mail_user_setting_parser_info);
 	user->service = master_service_get_name(master_service);
 	user->default_normalizer = uni_utf8_to_decomposed_titlecase;
 	user->session_create_time = ioloop_time;
 	user->event = event_create(parent_event);
 	event_add_category(user->event, &event_category_storage);
 	event_add_str(user->event, "user", username);
-
-	/* check settings so that the duplicated structure will again
-	   contain the parsed fields */
-	if (!settings_check(set_info, pool, user->set, &error))
-		i_panic("Settings check unexpectedly failed: %s", error);
 
 	user->v.deinit = mail_user_deinit_base;
 	user->v.deinit_pre = mail_user_deinit_pre_base;
@@ -86,27 +101,27 @@ mail_user_alloc_int(struct event *parent_event,
 }
 
 struct mail_user *
-mail_user_alloc_nodup_set(struct event *parent_event,
-			  const char *username,
-			  const struct setting_parser_info *set_info,
-			  const struct mail_user_settings *set)
+mail_user_alloc_nodup_set(struct mail_storage_service_user *service_user,
+			  struct setting_parser_context *unexpanded_set_parser)
 {
 	pool_t pool;
 
 	pool = pool_alloconly_create(MEMPOOL_GROWING"mail user", 16*1024);
-	return mail_user_alloc_int(parent_event, username, set_info, set, pool);
+	return mail_user_alloc_int(service_user, unexpanded_set_parser, pool);
 }
 
-struct mail_user *mail_user_alloc(struct event *parent_event,
-				  const char *username,
-				  const struct setting_parser_info *set_info,
-				  const struct mail_user_settings *set)
+struct mail_user *mail_user_alloc(struct mail_storage_service_user *service_user,
+				  struct setting_parser_context *unexpanded_set_parser)
 {
 	pool_t pool;
 
 	pool = pool_alloconly_create(MEMPOOL_GROWING"mail user", 16*1024);
-	return mail_user_alloc_int(parent_event, username, set_info,
-				   settings_dup(set_info, set, pool), pool);
+	struct setting_parser_context *set_parser =
+		settings_parser_dup(unexpanded_set_parser, pool);
+	struct mail_user *user =
+		mail_user_alloc_int(service_user, set_parser, pool);
+	settings_parser_unref(&set_parser);
+	return user;
 }
 
 static void
@@ -146,29 +161,45 @@ mail_user_expand_plugins_envs(struct mail_user *user)
 	}
 }
 
+int mail_user_var_expand(struct mail_user *user,
+			 const struct setting_parser_info *info, void *set,
+			 const char **error_r)
+{
+	return settings_var_expand_with_funcs(info, set,
+			user->pool, mail_user_var_expand_table(user),
+			mail_user_var_expand_func_table, user, error_r);
+}
+
 int mail_user_init(struct mail_user *user, const char **error_r)
 {
 	const struct mail_storage_settings *mail_set;
-	const char *home, *key, *value, *error;
-	bool need_home_dir;
+	const char *error;
 
-	need_home_dir = user->_home == NULL &&
-		settings_vars_have_key(user->set_info, user->set,
-				       'h', "home", &key, &value);
-	if (need_home_dir && mail_user_get_home(user, &home) <= 0) {
-		user->error = p_strdup_printf(user->pool,
-			"userdb didn't return a home directory, "
-			"but %s used it (%%h): %s", key, value);
+	i_assert(!user->initialized);
+
+	struct mail_storage_service_ctx *service_ctx =
+		mail_storage_service_user_get_service_ctx(user->service_user);
+	const struct setting_parser_info *const *set_roots =
+		mail_storage_service_get_set_roots(service_ctx);
+	for (unsigned int i = 0; set_roots[i] != NULL; i++) {
+		if (user->error != NULL)
+			break;
+
+		void *set = settings_parser_get_root_set(user->set_parser, set_roots[i]);
+		/* check settings so that the duplicated structure will again
+		   contain the parsed fields */
+		if (!settings_check(set_roots[i], user->pool, set, &error)) {
+			user->error = p_strdup_printf(user->pool,
+				"Settings check unexpectedly failed: %s", error);
+			break;
+		}
+		if (mail_user_var_expand(user, set_roots[i], set, &error) <= 0) {
+			user->error = p_strdup_printf(user->pool,
+				"Failed to expand settings: %s", error);
+			break;
+		}
 	}
 
-	/* expand settings after we can expand %h */
-	if (settings_var_expand_with_funcs(user->set_info, user->set,
-					   user->pool, mail_user_var_expand_table(user),
-					   mail_user_var_expand_func_table, user,
-					   &error) <= 0) {
-		user->error = p_strdup_printf(user->pool,
-			"Failed to expand settings: %s", error);
-	}
 	user->settings_expanded = TRUE;
 	mail_user_expand_plugins_envs(user);
 
@@ -217,6 +248,8 @@ void mail_user_unref(struct mail_user **_user)
 		user->v.deinit_pre(user);
 		user->v.deinit(user);
 	} T_END;
+	settings_parser_unref(&user->set_parser);
+	settings_parser_unref(&user->unexpanded_set_parser);
 	event_unref(&user->event);
 	i_assert(user->refcount == 1);
 	pool_unref(&user->pool);
@@ -292,11 +325,6 @@ void mail_user_set_vars(struct mail_user *user, const char *service,
 const struct var_expand_table *
 mail_user_var_expand_table(struct mail_user *user)
 {
-	/* use a cached table, unless home directory has been set afterwards */
-	if (user->var_expand_table != NULL &&
-	    user->var_expand_table[4].value == user->_home)
-		return user->var_expand_table;
-
 	const char *username =
 		p_strdup(user->pool, t_strcut(user->username, '@'));
 	const char *domain = i_strchr_to_next(user->username, '@');
@@ -322,7 +350,6 @@ mail_user_var_expand_table(struct mail_user *user)
 		{ 'n', username, "username" },
 		{ 'd', domain, "domain" },
 		{ 's', user->service, "service" },
-		{ 'h', user->_home /* don't look it up unless we need it */, "home" },
 		{ 'l', local_ip, "lip" },
 		{ 'r', remote_ip, "rip" },
 		{ 'p', my_pid, "pid" },
@@ -347,6 +374,20 @@ mail_user_var_expand_table(struct mail_user *user)
 
 	user->var_expand_table = tab;
 	return user->var_expand_table;
+}
+
+static int
+mail_user_var_expand_func_home(const char *data ATTR_UNUSED, void *context,
+			       const char **value_r, const char **error_r)
+{
+	struct mail_user *user = context;
+
+	if (mail_user_get_home(user, value_r) <= 0) {
+		*error_r = "Setting used home directory (%h) but there is no "
+			"mail_home and userdb didn't return it";
+		return -1;
+	}
+	return 1;
 }
 
 static int
@@ -433,8 +474,14 @@ static int mail_user_userdb_lookup_home(struct mail_user *user)
 				      user->username, &info, userdb_pool,
 				      &username, &fields);
 	if (ret > 0) {
-		auth_user_fields_parse(fields, userdb_pool, &reply);
-		user->_home = p_strdup(user->pool, reply.home);
+		const char *error;
+		if (auth_user_fields_parse(fields, userdb_pool,
+					   &reply, &error) < 0) {
+			e_error(user->event,
+				"Failed to parse credentials due to %s", error);
+			ret = -1;
+		} else
+			user->_home = p_strdup(user->pool, reply.home);
 	}
 	pool_unref(&userdb_pool);
 	return ret;
@@ -449,6 +496,7 @@ static bool mail_user_get_mail_home(struct mail_user *user)
 		user->_home = home[0] != '\0' ? home : NULL;
 		return TRUE;
 	}
+	home = user->unexpanded_set->mail_home;
 	/* we're still initializing user. need to do the expansion ourself. */
 	i_assert(home[0] == SETTING_STRVAR_UNEXPANDED[0]);
 	home++;
@@ -657,14 +705,9 @@ const char *const *mail_user_get_alt_usernames(struct mail_user *user)
 	ARRAY_TYPE(const_string) alt_usernames;
 	t_array_init(&alt_usernames, 4);
 	for (unsigned int i = 0; user->userdb_fields[i] != NULL; i++) {
-		const char *field = user->userdb_fields[i];
-		if (strncmp(field, "user_", 5) != 0)
-			continue;
-
-		const char *value = strchr(field, '=');
-		if (value != NULL) {
-			const char *key =
-				p_strdup_until(user->pool, field, value++);
+		const char *key, *value;
+		if (t_split_key_value_eq(user->userdb_fields[i], &key, &value) &&
+		    *value != '\0' && str_begins_with(key, "user_")) {
 			array_append(&alt_usernames, &key, 1);
 			array_append(&alt_usernames, &value, 1);
 		}
@@ -733,12 +776,8 @@ struct mail_user *mail_user_dup(struct mail_user *user)
 {
 	struct mail_user *user2;
 
-	user2 = mail_user_alloc(event_get_parent(user->event), user->username,
-				user->set_info, user->unexpanded_set);
-	if (user2->_service_user != NULL) {
-		user2->_service_user = user->_service_user;
-		mail_storage_service_user_ref(user2->_service_user);
-	}
+	user2 = mail_user_alloc(user->service_user,
+				user->unexpanded_set_parser);
 	if (user->_home != NULL)
 		mail_user_set_home(user2, user->_home);
 	mail_user_set_vars(user2, user->service, &user->conn);
@@ -759,15 +798,8 @@ struct mail_user *mail_user_dup(struct mail_user *user)
 void mail_user_init_ssl_client_settings(struct mail_user *user,
 	struct ssl_iostream_settings *ssl_set_r)
 {
-	if (user->_service_user == NULL) {
-		/* Internal test user that should never actually need any
-		   SSL settings. */
-		i_zero(ssl_set_r);
-		return;
-	}
-
 	const struct master_service_ssl_settings *ssl_set =
-		mail_storage_service_user_get_ssl_settings(user->_service_user);
+		mail_storage_service_user_get_ssl_settings(user->service_user);
 
 	master_service_ssl_client_settings_to_iostream_set(ssl_set,
 		pool_datastack_create(), ssl_set_r);
@@ -864,6 +896,8 @@ mail_user_get_dict_op_settings(struct mail_user *user)
 }
 
 static const struct var_expand_func_table mail_user_var_expand_func_table_arr[] = {
+	{ "h", mail_user_var_expand_func_home },
+	{ "home", mail_user_var_expand_func_home },
 	{ "userdb", mail_user_var_expand_func_userdb },
 	{ NULL, NULL }
 };

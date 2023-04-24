@@ -19,7 +19,8 @@ cmd_deduplicate_box(struct doveadm_mail_cmd_context *_ctx,
 		    struct mail_search_args *search_args)
 {
 	struct deduplicate_cmd_context *ctx =
-		(struct deduplicate_cmd_context *)_ctx;
+		container_of(_ctx, struct deduplicate_cmd_context, ctx);
+
 	struct doveadm_mail_iter *iter;
 	struct mail *mail;
 	enum mail_error error;
@@ -38,10 +39,11 @@ cmd_deduplicate_box(struct doveadm_mail_cmd_context *_ctx,
 	while (doveadm_mail_iter_next(iter, &mail)) {
 		if (ctx->by_msgid) {
 			if (mail_get_first_header(mail, "Message-ID", &key) < 0) {
-				errstr = mailbox_get_last_internal_error(mail->box, &error);
+				errstr = mail_get_last_internal_error(mail, &error);
 				if (error == MAIL_ERROR_NOTFOUND)
 					continue;
-				i_error("Couldn't lookup Message-ID: for UID=%u: %s",
+				e_error(ctx->ctx.cctx->event,
+					"Couldn't lookup Message-ID: for UID=%u: %s",
 					mail->uid, errstr);
 				doveadm_mail_failed_error(_ctx, error);
 				ret = -1;
@@ -49,10 +51,11 @@ cmd_deduplicate_box(struct doveadm_mail_cmd_context *_ctx,
 			}
 		} else {
 			if (mail_get_special(mail, MAIL_FETCH_GUID, &key) < 0) {
-				errstr = mailbox_get_last_internal_error(mail->box, &error);
+				errstr = mail_get_last_internal_error(mail, &error);
 				if (error == MAIL_ERROR_NOTFOUND)
 					continue;
-				i_error("Couldn't lookup GUID: for UID=%u: %s",
+				e_error(ctx->ctx.cctx->event,
+					"Couldn't lookup GUID: for UID=%u: %s",
 					mail->uid, errstr);
 				doveadm_mail_failed_error(_ctx, error);
 				ret = -1;
@@ -62,8 +65,10 @@ cmd_deduplicate_box(struct doveadm_mail_cmd_context *_ctx,
 		if (key != NULL && *key != '\0') {
 			if (hash_table_lookup(hash, key) != NULL)
 				mail_expunge(mail);
-			else
+			else {
+				key = p_strdup(pool, key);
 				hash_table_insert(hash, key, POINTER_CAST(1));
+			}
 		}
 	}
 
@@ -96,29 +101,18 @@ cmd_deduplicate_run(struct doveadm_mail_cmd_context *ctx, struct mail_user *user
 	return ret;
 }
 
-static void cmd_deduplicate_init(struct doveadm_mail_cmd_context *ctx,
-				 const char *const args[])
+static void cmd_deduplicate_init(struct doveadm_mail_cmd_context *_ctx)
 {
-	if (args[0] == NULL)
+	struct doveadm_cmd_context *cctx = _ctx->cctx;
+	struct deduplicate_cmd_context *ctx =
+		container_of(_ctx, struct deduplicate_cmd_context, ctx);
+
+	const char *const *query;
+	ctx->by_msgid = doveadm_cmd_param_flag(cctx, "by-msgid");
+	if (!doveadm_cmd_param_array(cctx, "query", &query))
 		doveadm_mail_help_name("deduplicate");
 
-	ctx->search_args = doveadm_mail_build_search_args(args);
-}
-
-static bool
-cmd_deduplicate_parse_arg(struct doveadm_mail_cmd_context *_ctx, int c)
-{
-	struct deduplicate_cmd_context *ctx =
-		(struct deduplicate_cmd_context *)_ctx;
-
-	switch (c) {
-	case 'm':
-		ctx->by_msgid = TRUE;
-		break;
-	default:
-		return FALSE;
-	}
-	return TRUE;
+	_ctx->search_args = doveadm_mail_build_search_args(query);
 }
 
 static struct doveadm_mail_cmd_context *cmd_deduplicate_alloc(void)
@@ -126,8 +120,6 @@ static struct doveadm_mail_cmd_context *cmd_deduplicate_alloc(void)
 	struct deduplicate_cmd_context *ctx;
 
 	ctx = doveadm_mail_cmd_alloc(struct deduplicate_cmd_context);
-	ctx->ctx.getopt_args = "m";
-	ctx->ctx.v.parse_arg = cmd_deduplicate_parse_arg;
 	ctx->ctx.v.init = cmd_deduplicate_init;
 	ctx->ctx.v.run = cmd_deduplicate_run;
 	return &ctx->ctx;

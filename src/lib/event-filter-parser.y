@@ -9,7 +9,10 @@
 %defines
 
 %{
+#include <ctype.h>
+
 #include "lib.h"
+#include "str-parse.h"
 #include "wildcard-match.h"
 #include "lib-event-private.h"
 #include "event-filter-private.h"
@@ -93,20 +96,67 @@ static struct event_filter_node *key_value(struct event_filter_parser_state *sta
 	case EVENT_FILTER_NODE_TYPE_EVENT_FIELD_WILDCARD:
 		node->field.key = p_strdup(state->pool, a);
 		node->field.value.str = p_strdup(state->pool, b);
+		node->field.value_type = EVENT_FIELD_VALUE_TYPE_STR;
 
 		/* Filter currently supports only comparing strings
 		   and numbers. */
-		if (str_to_intmax(b, &node->field.value.intmax) < 0) {
-			/* not a number - no problem
-			   Either we have a string, or a number with wildcards */
+		if (str_to_intmax(b, &node->field.value.intmax) == 0) {
+			/* Leave a hint that this is in fact a valid number. */
+			node->field.value_type = EVENT_FIELD_VALUE_TYPE_INTMAX;
+			node->type = EVENT_FILTER_NODE_TYPE_EVENT_FIELD_EXACT;
+		} else if (net_parse_range(b, &node->field.value.ip,
+					   &node->field.value.ip_bits) == 0) {
+			/* Leave a hint that this is in fact a valid IP. */
+			node->field.value_type = EVENT_FIELD_VALUE_TYPE_IP;
+			node->type = EVENT_FILTER_NODE_TYPE_EVENT_FIELD_EXACT;
+		} else {
+			/* This field contains no valid number.
+			   Either this is a string that contains a size unit, a
+			   number with wildcard or another arbitrary string. */
 			node->field.value.intmax = INT_MIN;
+
+			/* If the field contains a size unit, take that. */
+			uoff_t bytes;
+			const char *error;
+			int ret = str_parse_get_size(b, &bytes, &error);
+			if (ret == 0 && i_toupper(b[strlen(b)-1]) == 'M') {
+				/* Don't accept <num>M, since it's ambiguous
+				   whether it's MB or minutes. A warning will
+				   be logged later on about this. */
+				node->field.value_type = EVENT_FIELD_VALUE_TYPE_STR;
+				node->ambiguous_unit = TRUE;
+				break;
+			}
+			if (ret == 0 && bytes <= INTMAX_MAX) {
+				node->field.value.intmax = (intmax_t) bytes;
+				node->field.value_type = EVENT_FIELD_VALUE_TYPE_INTMAX;
+				node->type = EVENT_FILTER_NODE_TYPE_EVENT_FIELD_EXACT;
+				break;
+			}
+
+			/* As a second step try to parse the value as an
+			   interval. The string-parser returns values as
+			   milliseconds, but the events usually report values
+			   as microseconds, which needs to be accounted for. */
+			unsigned int intval;
+			ret = str_parse_get_interval_msecs(b, &intval, &error);
+			if (ret == 0) {
+				node->field.value.intmax = (intmax_t) intval * 1000;
+				node->field.value_type = EVENT_FIELD_VALUE_TYPE_INTMAX;
+				node->type = EVENT_FILTER_NODE_TYPE_EVENT_FIELD_EXACT;
+				break;
+			}
+
+			if (wildcard_is_literal(node->field.value.str))
+				node->type = EVENT_FILTER_NODE_TYPE_EVENT_FIELD_EXACT;
+			else if (strspn(b, "0123456789*?") == strlen(b))
+				node->type = EVENT_FILTER_NODE_TYPE_EVENT_FIELD_NUMERIC_WILDCARD;
 		}
 
-		if (wildcard_is_literal(node->field.value.str))
-			node->type = EVENT_FILTER_NODE_TYPE_EVENT_FIELD_EXACT;
 		break;
 	case EVENT_FILTER_NODE_TYPE_EVENT_NAME_EXACT:
 	case EVENT_FILTER_NODE_TYPE_EVENT_FIELD_EXACT:
+	case EVENT_FILTER_NODE_TYPE_EVENT_FIELD_NUMERIC_WILDCARD:
 		i_unreached();
 	}
 
@@ -168,6 +218,8 @@ key_value : key op value	{
 					$$ = key_value(state, $1, $3, $2);
 					if ($$ == NULL) {
 						yyerror(state, state->error);
+						/* avoid compiler warning about yynerrs being set, but not used */
+						(void)yynerrs;
 						YYERROR;
 					}
 				}

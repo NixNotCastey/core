@@ -299,13 +299,13 @@ static void imap_parser_save_arg(struct imap_parser *parser,
 	parser->cur_type = ARG_PARSE_NONE;
 }
 
-static bool is_valid_atom_char(struct imap_parser *parser, char chr)
+static bool is_valid_atom_char(struct imap_parser *parser, unsigned char chr)
 {
 	const char *error_msg;
 
-	if (IS_ATOM_PARSER_INPUT((unsigned char)chr))
+	if (IS_ATOM_PARSER_INPUT(chr))
 		error_msg = "Invalid characters in atom";
-	else if ((((unsigned char)chr) & 0x80) != 0)
+	else if ((chr & 0x80) != 0)
 		error_msg = "8bit data in atom";
 	else
 		return TRUE;
@@ -989,16 +989,19 @@ imap_parser_read_next_atom(struct imap_parser *parser, bool parsing_tag,
 		/* quoted-specials: */
 		case '"':
 		case '\\':
+			return -1;
 		/* resp-specials: */
 		case ']':
-			return -1;
+			if (!parsing_tag)
+				return -1;
+			break;
 		case '+':
 			if (parsing_tag)
 				return -1;
 			break;
 		default:
 			if ((unsigned char)data[i] < ' ' ||
-			    (unsigned char)data[i] >= 0x80)
+			    (unsigned char)data[i] >= 0x7F)
 				return -1;
 		}
 	}

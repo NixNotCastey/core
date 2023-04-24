@@ -17,9 +17,27 @@ static bool imap_settings_verify(void *_set, pool_t pool,
 
 /* <settings checks> */
 static struct file_listener_settings imap_unix_listeners_array[] = {
-	{ "login/imap", 0666, "", "" },
-	{ "imap-master", 0600, "", "" },
-	{ "srv.imap/%{pid}", 0600, "", "" },
+	{
+		.path = "login/imap",
+		.type = "login",
+		.mode = 0666,
+		.user = "",
+		.group = "",
+	},
+	{
+		.path = "imap-master",
+		.type = "master",
+		.mode = 0600,
+		.user = "",
+		.group = "",
+	},
+	{
+		.path = "srv.imap/%{pid}",
+		.type = "admin",
+		.mode = 0600,
+		.user = "",
+		.group = "",
+	},
 };
 static struct file_listener_settings *imap_unix_listeners[] = {
 	&imap_unix_listeners_array[0],
@@ -76,7 +94,6 @@ static const struct setting_define imap_setting_defines[] = {
 	DEF(STR, imap_client_workarounds),
 	DEF(STR, imap_logout_format),
 	DEF(STR, imap_id_send),
-	DEF(STR, imap_id_log),
 	DEF(ENUM, imap_fetch_failure),
 	DEF(BOOL, imap_metadata),
 	DEF(BOOL, imap_literal_minus),
@@ -104,7 +121,6 @@ static const struct imap_settings imap_default_settings = {
 		"hdr_count=%{fetch_hdr_count} hdr_bytes=%{fetch_hdr_bytes} "
 		"body_count=%{fetch_body_count} body_bytes=%{fetch_body_bytes}",
 	.imap_id_send = "name *",
-	.imap_id_log = "",
 	.imap_fetch_failure = "disconnect-immediately:disconnect-after:no-after",
 	.imap_metadata = FALSE,
 	.imap_literal_minus = FALSE,

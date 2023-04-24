@@ -8,6 +8,7 @@ struct ssl_iostream_settings;
 /* <settings checks> */
 enum dsync_features {
 	DSYNC_FEATURE_EMPTY_HDR_WORKAROUND = 0x1,
+	DSYNC_FEATURE_NO_HEADER_HASHES = 0x2,
 };
 /* </settings checks> */
 
@@ -28,7 +29,6 @@ struct doveadm_settings {
 	const char *doveadm_allowed_commands;
 	const char *dsync_alt_char;
 	const char *dsync_remote_cmd;
-	const char *director_username_hash;
 	const char *doveadm_api_key;
 	const char *dsync_features;
 	const char *dsync_hashed_headers;
@@ -58,6 +58,7 @@ void doveadm_setting_roots_add(const struct setting_parser_info *info);
 void *doveadm_setting_roots_get_settings(const struct setting_parser_info *info);
 
 void doveadm_read_settings(void);
+int doveadm_settings_get_config_fd(void);
 
 void doveadm_settings_init(void);
 void doveadm_settings_deinit(void);

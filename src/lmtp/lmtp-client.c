@@ -97,49 +97,40 @@ static void client_load_modules(struct client *client)
 	module_dir_init(mail_storage_service_modules);
 }
 
-static void client_raw_user_create(struct client *client)
-{
-	void **sets;
-
-	sets = master_service_settings_get_others(master_service);
-	client->raw_mail_user =
-		raw_storage_create_from_set(client->user_set_info, sets[0]);
-}
-
 static void client_read_settings(struct client *client, bool ssl)
 {
 	struct mail_storage_service_input input;
-	const struct setting_parser_context *set_parser;
-	struct mail_user_settings *user_set;
+	struct setting_parser_context *set_parser;
 	struct lmtp_settings *lmtp_set;
 	struct lda_settings *lda_set;
 	const char *error;
 
 	i_zero(&input);
-	input.module = input.service = "lmtp";
+	input.service = "lmtp";
 	input.local_ip = client->local_ip;
 	input.remote_ip = client->remote_ip;
 	input.local_port = client->local_port;
 	input.remote_port = client->remote_port;
-	input.conn_secured = ssl;
-	input.conn_ssl_secured = ssl;
+	input.end_client_tls_secured = ssl;
 	input.username = "";
 
 	if (mail_storage_service_read_settings(storage_service, &input,
-					       client->pool,
-					       &client->user_set_info,
 					       &set_parser, &error) < 0)
 		i_fatal("%s", error);
 
-	lmtp_settings_dup(set_parser, client->pool,
-			  &user_set, &lmtp_set, &lda_set);
+	/* create raw user before duplicating the settings parser */
+	client->raw_mail_user =
+		raw_storage_create_from_set(storage_service, set_parser);
+
+	set_parser = settings_parser_dup(set_parser, client->pool);
+	lmtp_settings_get(set_parser, client->pool, &lmtp_set, &lda_set);
+	settings_parser_unref(&set_parser);
 	const struct var_expand_table *tab =
 		mail_storage_service_get_var_expand_table(storage_service, &input);
 	if (settings_var_expand(&lmtp_setting_parser_info, lmtp_set,
 				client->pool, tab, &error) <= 0)
 		i_fatal("Failed to expand settings: %s", error);
 	client->service_set = master_service_settings_get(master_service);
-	client->user_set = user_set;
 	client->lmtp_set = lmtp_set;
 	client->unexpanded_lda_set = lda_set;
 }
@@ -155,6 +146,7 @@ struct client *client_create(int fd_in, int fd_out,
 	struct smtp_server_settings lmtp_set;
 	struct client *client;
 	pool_t pool;
+	bool conn_tls = conn->ssl || (conn->haproxied && conn->haproxy.ssl);
 
 	pool = pool_alloconly_create("lmtp client", 2048);
 	client = p_new(pool, struct client, 1);
@@ -173,8 +165,7 @@ struct client *client_create(int fd_in, int fd_out,
 	client->event = event_create(NULL);
 	event_add_category(client->event, &event_category_lmtp);
 
-	client_read_settings(client, conn->ssl);
-	client_raw_user_create(client);
+	client_read_settings(client, conn_tls);
 	client_load_modules(client);
 	client->my_domain = client->unexpanded_lda_set->hostname;
 
@@ -191,7 +182,7 @@ struct client *client_create(int fd_in, int fd_out,
 		SMTP_CAPABILITY_CHUNKING |
 		SMTP_CAPABILITY_XCLIENT |
 		SMTP_CAPABILITY__ORCPT;
-	if (!conn->ssl && master_service_ssl_is_enabled(master_service))
+	if (!conn_tls && master_service_ssl_is_enabled(master_service))
 		lmtp_set.capabilities |= SMTP_CAPABILITY_STARTTLS;
 	lmtp_set.hostname = client->unexpanded_lda_set->hostname;
 	lmtp_set.login_greeting = client->lmtp_set->login_greeting;
@@ -302,7 +293,7 @@ static void
 client_connection_trans_free(void *context,
 			     struct smtp_server_transaction *trans)
 {
-	struct client *client = (struct client *)context;
+	struct client *client = context;
 
 	client->v.trans_free(client, trans);
 }
@@ -319,7 +310,7 @@ client_connection_state_changed(void *context,
 				enum smtp_server_state new_state,
 				const char *new_args)
 {
-	struct client *client = (struct client *)context;
+	struct client *client = context;
 
 	i_free(client->state.args);
 
@@ -344,10 +335,16 @@ static void
 client_connection_proxy_data_updated(void *context,
 				     const struct smtp_proxy_data *data)
 {
-	struct client *client = (struct client *)context;
+	struct client *client = context;
 
 	client->remote_ip = data->source_ip;
 	client->remote_port = data->source_port;
+	if (data->client_transport != NULL) {
+		client->end_client_tls_secured = TRUE;
+		client->end_client_tls_secured =
+			str_begins_with(data->client_transport,
+					CLIENT_TRANSPORT_TLS);
+	}
 
 	if (clients_count == 1)
 		refresh_proctitle();
@@ -355,7 +352,7 @@ client_connection_proxy_data_updated(void *context,
 
 static void client_connection_disconnect(void *context, const char *reason)
 {
-	struct client *client = (struct client *)context;
+	struct client *client = context;
 
 	if (client->disconnected)
 		return;
@@ -369,14 +366,14 @@ static void client_connection_disconnect(void *context, const char *reason)
 
 static void client_connection_free(void *context)
 {
-	struct client *client = (struct client *)context;
+	struct client *client = context;
 
 	client->v.destroy(client);
 }
 
 static bool client_connection_is_trusted(void *context)
 {
-	struct client *client = (struct client *)context;
+	struct client *client = context;
 	const char *const *net;
 	struct ip_addr net_ip;
 	unsigned int bits;

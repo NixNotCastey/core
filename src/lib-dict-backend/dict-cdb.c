@@ -28,7 +28,7 @@ struct cdb_dict_iterate_context {
 	buffer_t *buffer;
 	const char *values[2];
 	char *path;
-	unsigned cptr;
+	unsigned int cptr;
 	char *error;
 };
 
@@ -91,20 +91,20 @@ cdb_dict_lookup(struct dict *_dict,
 	        const char **error_r)
 {
 	struct cdb_dict *dict = (struct cdb_dict *)_dict;
-	unsigned datalen;
+	unsigned int datalen;
 	int ret = 0;
 	char *data;
 
 	/* keys and values may be null terminated... */
 	if ((dict->flag & CDB_WITH_NULL) != 0) {
-		ret = cdb_find(&dict->cdb, key, (unsigned)strlen(key)+1);
+		ret = cdb_find(&dict->cdb, key, (unsigned int)strlen(key)+1);
 		if (ret > 0)
 			dict->flag &= ENUM_NEGATE(CDB_WITHOUT_NULL);
 	}
 
 	/* ...or not */
 	if (ret == 0 && (dict->flag & CDB_WITHOUT_NULL) != 0) {
-		ret = cdb_find(&dict->cdb, key, (unsigned)strlen(key));
+		ret = cdb_find(&dict->cdb, key, (unsigned int)strlen(key));
 		if (ret > 0)
 			dict->flag &= ENUM_NEGATE(CDB_WITH_NULL);
 	}
@@ -155,7 +155,7 @@ cdb_dict_next(struct cdb_dict_iterate_context *ctx, const char **key_r)
 {
 	struct cdb_dict *dict = (struct cdb_dict *)ctx->ctx.dict;
 	char *data;
-	unsigned datalen;
+	unsigned int datalen;
 	int ret;
 
 	if ((ret = cdb_seqnext(&ctx->cptr, &dict->cdb)) < 1) {
@@ -191,7 +191,7 @@ static bool cdb_dict_iterate(struct dict_iterate_context *_ctx,
 	const char *key;
 	bool match = FALSE;
 	char *data;
-	unsigned datalen;
+	unsigned int datalen;
 
 	if (ctx->error != NULL)
 		return FALSE;
@@ -255,7 +255,7 @@ static int cdb_dict_iterate_deinit(struct dict_iterate_context *_ctx,
 
 struct dict dict_driver_cdb = {
 	.name = "cdb",
-	{
+	.v = {
 		.init = cdb_dict_init,
 		.deinit = cdb_dict_deinit,
 		.lookup = cdb_dict_lookup,

@@ -988,7 +988,7 @@ static void ldap_input(struct ldap_connection *conn)
 
 #ifdef HAVE_LDAP_SASL
 static int
-sasl_interact(LDAP *ld ATTR_UNUSED, unsigned flags ATTR_UNUSED,
+sasl_interact(LDAP *ld ATTR_UNUSED, unsigned int flags ATTR_UNUSED,
 	      void *defaults, void *interact)
 {
 	struct db_ldap_sasl_bind_context *context = defaults;
@@ -1017,7 +1017,6 @@ sasl_interact(LDAP *ld ATTR_UNUSED, unsigned flags ATTR_UNUSED,
 			in->len = strlen(str);
 			in->result = str;
 		}
-		
 	}
 	return LDAP_SUCCESS;
 }
@@ -1051,7 +1050,7 @@ static int db_ldap_bind_sasl(struct ldap_connection *conn)
 					   sasl_interact, &context);
 	if (db_ldap_connect_finish(conn, ret) < 0)
 		return -1;
-	
+
 	conn->conn_state = LDAP_CONN_STATE_BOUND_DEFAULT;
 
 	return 0;

@@ -94,6 +94,11 @@ int fts_backend_init(const char *backend_name, struct mail_namespace *ns,
 		return -1;
 	}
 
+	backend->event = event_create(ns->user->event);
+	event_add_category(backend->event, &event_category_fts);
+	event_set_append_log_prefix(backend->event, t_strdup_printf(
+		"fts-%s: ", backend->name));
+
 	fts_header_filters_init(backend);
 	*backend_r = backend;
 	return 0;
@@ -102,9 +107,10 @@ int fts_backend_init(const char *backend_name, struct mail_namespace *ns,
 void fts_backend_deinit(struct fts_backend **_backend)
 {
 	struct fts_backend *backend = *_backend;
+	*_backend = NULL;
 
 	fts_header_filters_deinit(backend);
-	*_backend = NULL;
+	event_unref(&backend->event);
 	backend->v.deinit(backend);
 }
 
@@ -165,10 +171,10 @@ fts_backend_update_init(struct fts_backend *backend)
 static void fts_backend_set_cur_mailbox(struct fts_backend_update_context *ctx)
 {
 	fts_backend_update_unset_build_key(ctx);
-	if (ctx->backend_box != ctx->cur_box) {
+	if (ctx->backend_box != ctx->cur_box) T_BEGIN {
 		ctx->backend->v.update_set_mailbox(ctx, ctx->cur_box);
 		ctx->backend_box = ctx->cur_box;
-	}
+	} T_END;
 }
 
 int fts_backend_update_deinit(struct fts_backend_update_context **_ctx)
@@ -190,11 +196,11 @@ int fts_backend_update_deinit(struct fts_backend_update_context **_ctx)
 void fts_backend_update_set_mailbox(struct fts_backend_update_context *ctx,
 				    struct mailbox *box)
 {
-	if (ctx->backend_box != NULL && box != ctx->backend_box) {
+	if (ctx->backend_box != NULL && box != ctx->backend_box) T_BEGIN {
 		/* make sure we don't reference the backend box anymore */
 		ctx->backend->v.update_set_mailbox(ctx, NULL);
 		ctx->backend_box = NULL;
-	}
+	} T_END;
 	ctx->cur_box = box;
 }
 
@@ -202,17 +208,24 @@ void fts_backend_update_expunge(struct fts_backend_update_context *ctx,
 				uint32_t uid)
 {
 	fts_backend_set_cur_mailbox(ctx);
-	ctx->backend->v.update_expunge(ctx, uid);
+	T_BEGIN {
+		ctx->backend->v.update_expunge(ctx, uid);
+	} T_END;
 }
 
 bool fts_backend_update_set_build_key(struct fts_backend_update_context *ctx,
 				      const struct fts_backend_build_key *key)
 {
+	bool ret;
+
 	fts_backend_set_cur_mailbox(ctx);
 
 	i_assert(ctx->cur_box != NULL);
 
-	if (!ctx->backend->v.update_set_build_key(ctx, key))
+	T_BEGIN {
+		ret = ctx->backend->v.update_set_build_key(ctx, key);
+	} T_END;
+	if (!ret)
 		return FALSE;
 	ctx->build_key_open = TRUE;
 	return TRUE;
@@ -220,18 +233,23 @@ bool fts_backend_update_set_build_key(struct fts_backend_update_context *ctx,
 
 void fts_backend_update_unset_build_key(struct fts_backend_update_context *ctx)
 {
-	if (ctx->build_key_open) {
+	if (ctx->build_key_open) T_BEGIN {
 		ctx->backend->v.update_unset_build_key(ctx);
 		ctx->build_key_open = FALSE;
-	}
+	} T_END;
 }
 
 int fts_backend_update_build_more(struct fts_backend_update_context *ctx,
 				  const unsigned char *data, size_t size)
 {
+	int ret;
+
 	i_assert(ctx->build_key_open);
 
-	return ctx->backend->v.update_build_more(ctx, data, size);
+	T_BEGIN {
+		ret = ctx->backend->v.update_build_more(ctx, data, size);
+	} T_END;
+	return ret;
 }
 
 int fts_backend_refresh(struct fts_backend *backend)
@@ -514,7 +532,8 @@ int fts_index_have_compatible_settings(struct mailbox_list *list,
 
 	box = mailbox_alloc(list, vname, 0);
 	if (mailbox_sync(box, (enum mailbox_sync_flags)0) < 0) {
-		i_error("fts: Failed to sync mailbox %s: %s", vname,
+		e_error(ns->user->event,
+			"fts: Failed to sync mailbox %s: %s", vname,
 			mailbox_get_last_internal_error(box, NULL));
 		ret = -1;
 	} else {

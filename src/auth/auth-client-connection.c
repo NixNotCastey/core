@@ -277,7 +277,7 @@ static void auth_client_input(struct auth_client_connection *conn)
 				return;
 			}
 			/* make sure the major version matches */
-			if (vmajor != AUTH_MASTER_PROTOCOL_MAJOR_VERSION) {
+			if (vmajor != AUTH_CLIENT_PROTOCOL_MAJOR_VERSION) {
 				e_error(conn->event, "Authentication client "
 					"not compatible with this server "
 					"(mixed old and new binaries?)");
@@ -348,7 +348,7 @@ void auth_client_connection_create(struct auth *auth, int fd,
 
 	if (token_auth) {
 		mechanisms = t_strconcat("MECH\t",
-			mech_dovecot_token.mech_name, "\n", NULL);
+			mech_dovecot_token.mech_name, "\tprivate\n", NULL);
 	} else {
 		mechanisms = str_c(auth->reg->handshake);
 	}

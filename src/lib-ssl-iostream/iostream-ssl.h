@@ -57,11 +57,13 @@ int io_stream_ssl_global_init(const struct ssl_iostream_settings *set,
 
 int io_stream_create_ssl_client(struct ssl_iostream_context *ctx, const char *host,
 				const struct ssl_iostream_settings *set,
+				struct event *event_parent,
 				struct istream **input, struct ostream **output,
 				struct ssl_iostream **iostream_r,
 				const char **error_r);
 int io_stream_create_ssl_server(struct ssl_iostream_context *ctx,
 				const struct ssl_iostream_settings *set,
+				struct event *event_parent,
 				struct istream **input, struct ostream **output,
 				struct ssl_iostream **iostream_r,
 				const char **error_r);
@@ -120,10 +122,24 @@ int ssl_iostream_check_cert_validity(struct ssl_iostream *ssl_io,
    will always return FALSE before even checking the hostname. */
 bool ssl_iostream_cert_match_name(struct ssl_iostream *ssl_io, const char *name,
 				  const char **reason_r);
+/* Returns name of the peer if available, NULL if not. Usually used to retrieve
+   username from certificate. */
 const char *ssl_iostream_get_peer_name(struct ssl_iostream *ssl_io);
+/* Returns used compression, if any. Returns NULL if not available. */
 const char *ssl_iostream_get_compression(struct ssl_iostream *ssl_io);
+/* Returns TLS extension server_name(0) requested by client, or NULL if not
+   provided.
+ */
 const char *ssl_iostream_get_server_name(struct ssl_iostream *ssl_io);
+/* Returns textual representation of the security parameters for the connection,
+   or NULL if handshake has not been done. */
 const char *ssl_iostream_get_security_string(struct ssl_iostream *ssl_io);
+
+/* Returns ClientHello based JA3 string. Will return NULL
+   if it is not available due to no handshake performed, or
+   OpenSSL version is earlier than 1.1. */
+const char *ssl_iostream_get_ja3(struct ssl_iostream *ssl_io);
+
 /* Returns SSL context's current used cipher algorithm. Returns NULL
    if SSL handshake has not been performed.
 

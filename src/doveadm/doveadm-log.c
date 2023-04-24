@@ -9,6 +9,7 @@
 #include "time-util.h"
 #include "master-service-private.h"
 #include "master-service-settings.h"
+#include "log-error-buffer.h"
 #include "doveadm.h"
 #include "doveadm-print.h"
 
@@ -47,9 +48,9 @@ cmd_log_test(struct doveadm_cmd_context *cctx ATTR_UNUSED)
 	}
 }
 
-static void cmd_log_reopen(struct doveadm_cmd_context *cctx ATTR_UNUSED)
+static void cmd_log_reopen(struct doveadm_cmd_context *cctx)
 {
-	doveadm_master_send_signal(SIGUSR1);
+	doveadm_master_send_signal(SIGUSR1, cctx->event);
 }
 
 struct log_find_file {
@@ -82,7 +83,8 @@ static void cmd_log_find_add(struct log_find_context *ctx,
 }
 
 static void
-cmd_log_find_syslog_files(struct log_find_context *ctx, const char *path)
+cmd_log_find_syslog_files(struct log_find_context *ctx, const char *path,
+			  struct event *event)
 {
 	struct log_find_file *file;
 	DIR *dir;
@@ -94,7 +96,7 @@ cmd_log_find_syslog_files(struct log_find_context *ctx, const char *path)
 
 	dir = opendir(path);
 	if (dir == NULL) {
-		i_error("opendir(%s) failed: %m", path);
+		e_error(event, "opendir(%s) failed: %m", path);
 		return;
 	}
 
@@ -114,7 +116,7 @@ cmd_log_find_syslog_files(struct log_find_context *ctx, const char *path)
 
 		if (S_ISDIR(st.st_mode)) {
 			/* recursively go through all subdirectories */
-			cmd_log_find_syslog_files(ctx, str_c(full_path));
+			cmd_log_find_syslog_files(ctx, str_c(full_path), event);
 		} else if (hash_table_lookup(ctx->files,
 					     str_c(full_path)) == NULL) {
 			file = p_new(ctx->pool, struct log_find_file, 1);
@@ -153,7 +155,7 @@ static void cmd_log_find_syslog_file_messages(struct log_find_file *file)
 	fd = open(file->path, O_RDONLY);
 	if (fd == -1)
 		return;
-	
+
 	input = i_stream_create_fd_autoclose(&fd, 1024);
 	i_stream_seek(input, file->size);
 	while ((line = i_stream_read_next_line(input)) != NULL) {
@@ -206,7 +208,7 @@ cmd_log_find_syslog(struct log_find_context *ctx,
 		return;
 
 	printf("Looking for log files from %s\n", log_dir);
-	cmd_log_find_syslog_files(ctx, log_dir);
+	cmd_log_find_syslog_files(ctx, log_dir, cctx->event);
 	cmd_log_test(cctx);
 
 	/* give syslog some time to write the messages to files */
@@ -289,7 +291,7 @@ static const char *t_cmd_log_error_trim(const char *orig)
 	/* Trim whitespace from suffix and remove ':' if it exists */
 	for (pos = strlen(orig); pos > 0; pos--) {
 		if (orig[pos-1] != ' ') {
-			if (orig[pos-1] == ':') 
+			if (orig[pos-1] == ':')
 				pos--;
 			break;
 		}
@@ -297,37 +299,86 @@ static const char *t_cmd_log_error_trim(const char *orig)
 	return orig[pos] == '\0' ? orig : t_strndup(orig, pos);
 }
 
-static void cmd_log_error_write(const char *const *args, time_t min_timestamp)
+static bool
+cmd_log_error_next(struct event *event, struct istream *input,
+		   struct log_error *error_r)
 {
+	if (error_r->text != NULL) {
+		/* already set */
+		return TRUE;
+	}
+
+	i_zero(error_r);
+	if (input == NULL || input->closed) {
+		/* already logged failure */
+		return FALSE;
+	}
+
+	const char *line = i_stream_read_next_line(input);
+	if (line == NULL) {
+		if (input->stream_errno != 0) {
+			e_error(event, "read() failed: %s",
+				i_stream_get_error(input));
+		}
+		return FALSE;
+	}
+
+	if (line[0] == '\0') {
+		/* end of lines reply from master */
+		return FALSE;
+	}
+
 	/* <type> <timestamp> <prefix> <text> */
-	const char *type_prefix = "?";
-	unsigned int type;
-	time_t t;
+	const char *const *args = t_strsplit_tabescaped(line);
+
+	if (str_array_length(args) != 4) {
+		e_error(event, "Invalid input from log: %s", line);
+		doveadm_exit_code = EX_PROTOCOL;
+		i_stream_close(input);
+		return FALSE;
+	}
 
 	/* find type's prefix */
+	enum log_type type;
 	for (type = 0; type < LOG_TYPE_COUNT; type++) {
 		if (strcmp(args[0], failure_log_type_names[type]) == 0) {
-			type_prefix = failure_log_type_prefixes[type];
+			error_r->type = type;
 			break;
 		}
 	}
+	if (type == LOG_TYPE_COUNT) {
+		e_error(event, "Invalid log type: %s", args[0]);
+		error_r->type = LOG_TYPE_ERROR;
+	}
 
-	if (str_to_time(args[1], &t) < 0) {
-		i_error("Invalid timestamp: %s", args[1]);
-		t = 0;
+	if (str_to_timeval(args[1], &error_r->timestamp) < 0)
+		e_error(event, "Invalid timestamp: %s", args[1]);
+	error_r->prefix = args[2];
+	error_r->text = args[3];
+	return TRUE;
+}
+
+static void cmd_log_error_write(const struct log_error *error)
+{
+	const char *ts_secs =
+		t_strflocaltime(LOG_TIMESTAMP_FORMAT, error->timestamp.tv_sec);
+	doveadm_print(t_strdup_printf("%s.%06u", ts_secs,
+				      (unsigned int)error->timestamp.tv_usec));
+	if (error->prefix[0] == '\0')
+		doveadm_print("");
+	else {
+		const char *prefix = t_strconcat(
+			t_cmd_log_error_trim(error->prefix), ": ", NULL);
+		doveadm_print(prefix);
 	}
-	if (t >= min_timestamp) {
-		doveadm_print(t_strflocaltime(LOG_TIMESTAMP_FORMAT, t));
-		doveadm_print(t_cmd_log_error_trim(args[2]));
-		doveadm_print(t_cmd_log_error_trim(type_prefix));
-		doveadm_print(args[3]);
-	}
+	doveadm_print(t_cmd_log_error_trim(failure_log_type_prefixes[error->type]));
+	doveadm_print(error->text);
 }
 
 static void cmd_log_errors(struct doveadm_cmd_context *cctx)
 {
-	struct istream *input;
-	const char *path, *line, *const *args;
+	struct istream *input1 = NULL, *input2 = NULL;
+	const char *error, *path1;
 	time_t min_timestamp = 0;
 	int64_t since_int64;
 	int fd;
@@ -335,33 +386,51 @@ static void cmd_log_errors(struct doveadm_cmd_context *cctx)
 	if (doveadm_cmd_param_int64(cctx, "since", &since_int64))
 		min_timestamp = since_int64;
 
-	path = t_strconcat(doveadm_settings->base_dir,
-			   "/"LOG_ERRORS_FNAME, NULL);
-	fd = net_connect_unix(path);
+	path1 = t_strconcat(doveadm_settings->base_dir,
+			    "/"LOG_ERRORS_FNAME, NULL);
+	fd = net_connect_unix(path1);
 	if (fd == -1)
-		i_fatal("net_connect_unix(%s) failed: %m", path);
-	net_set_nonblock(fd, FALSE);
+		e_error(cctx->event, "net_connect_unix(%s) failed: %m", path1);
+	else {
+		net_set_nonblock(fd, FALSE);
+		input1 = i_stream_create_fd_autoclose(&fd, SIZE_MAX);
+	}
 
-	input = i_stream_create_fd_autoclose(&fd, SIZE_MAX);
+	if (master_service_send_cmd("ERROR-LOG", &input2, &error) < 0) {
+		e_error(cctx->event, "%s", error);
+		input2 = NULL;
+	}
 
 	doveadm_print_init(DOVEADM_PRINT_TYPE_FORMATTED);
-	doveadm_print_formatted_set_format("%{timestamp} %{type}: %{prefix}: %{text}\n");
+	doveadm_print_formatted_set_format("%{timestamp} %{type}: %{prefix}%{text}\n");
 
 	doveadm_print_header_simple("timestamp");
 	doveadm_print_header_simple("prefix");
 	doveadm_print_header_simple("type");
 	doveadm_print_header_simple("text");
 
-	while ((line = i_stream_read_next_line(input)) != NULL) T_BEGIN {
-		args = t_strsplit_tabescaped(line);
-		if (str_array_length(args) == 4)
-			cmd_log_error_write(args, min_timestamp);
-		else {
-			i_error("Invalid input from log: %s", line);
-			doveadm_exit_code = EX_PROTOCOL;
+	struct log_error error1, error2;
+	i_zero(&error1);
+	i_zero(&error2);
+	while (cmd_log_error_next(cctx->event, input1, &error1) ||
+	       cmd_log_error_next(cctx->event, input2, &error2)) T_BEGIN {
+		struct log_error *error;
+		if (error2.text == NULL ||
+		    (error1.text != NULL &&
+		     timeval_cmp(&error1.timestamp, &error2.timestamp) < 0)) {
+			i_assert(error1.text != NULL);
+			error = &error1;
+		} else {
+			if (error2.prefix[0] == '\0')
+				error2.prefix = "master: ";
+			error = &error2;
 		}
+		if (error->timestamp.tv_sec >= min_timestamp)
+			cmd_log_error_write(error);
+		i_zero(error);
 	} T_END;
-	i_stream_destroy(&input);
+	i_stream_destroy(&input1);
+	i_stream_destroy(&input2);
 }
 
 struct doveadm_cmd_ver2 doveadm_cmd_log[] = {
@@ -392,7 +461,7 @@ DOVEADM_CMD_PARAMS_END
 	.usage = "[-s <min_timestamp>]",
 	.cmd = cmd_log_errors,
 DOVEADM_CMD_PARAMS_START
-DOVEADM_CMD_PARAM('s', "since", CMD_PARAM_INT64, 0)
+DOVEADM_CMD_PARAM('s', "since", CMD_PARAM_INT64, CMD_PARAM_FLAG_UNSIGNED)
 DOVEADM_CMD_PARAMS_END
 }
 };

@@ -222,7 +222,7 @@ dbox_file_find_next_magic(struct dbox_file *file, uoff_t *offset_r, bool *pre_r)
 		else {
 			ret = 0;
 			*offset_r = input->v_offset;
-		} 
+		}
 	}
 	i_stream_seek(input, orig_offset);
 	return ret <= 0 ? ret : 1;
@@ -446,6 +446,7 @@ dbox_file_fix_write_stream(struct dbox_file *file, uoff_t start_offset,
 
 int dbox_file_fix(struct dbox_file *file, uoff_t start_offset)
 {
+	struct event *event = file->storage->storage.event;
 	struct ostream *output;
 	const char *dir, *p, *temp_path, *broken_path;
 	bool deleted, have_messages;
@@ -490,7 +491,7 @@ int dbox_file_fix(struct dbox_file *file, uoff_t start_offset)
 					  "link(%s, %s) failed: %m",
 					  file->cur_path, broken_path);
 	} else {
-		i_warning("dbox: Copy of the broken file saved to %s",
+		e_warning(event, "Copy of the broken file saved to %s",
 			  broken_path);
 	}
 	if (!have_messages) {

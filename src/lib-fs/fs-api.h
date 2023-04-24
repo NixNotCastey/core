@@ -22,6 +22,8 @@ struct hash_method;
    backend may be something different, e.g. object ID. This allows the backend
    to still access the original path. */
 #define FS_METADATA_ORIG_PATH FS_METADATA_INTERNAL_PREFIX"OrigPath"
+/* Size of the file, this will allow to replace missing file with spaces */
+#define FS_METADATA_FILE_SIZE FS_METADATA_INTERNAL_PREFIX"Size"
 
 enum fs_properties {
 	FS_PROPERTY_METADATA	= 0x01,
@@ -224,6 +226,8 @@ struct fs *fs_get_parent(struct fs *fs);
 const char *fs_get_driver(struct fs *fs);
 /* Returns the root fs's driver name (bypassing all wrapper fses) */
 const char *fs_get_root_driver(struct fs *fs);
+/* Returns the fs's event. */
+struct event *fs_get_event(struct fs *fs);
 
 struct fs_file *fs_file_init(struct fs *fs, const char *path, int mode_flags);
 struct fs_file *fs_file_init_with_event(struct fs *fs, struct event *event,

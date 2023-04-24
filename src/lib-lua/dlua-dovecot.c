@@ -2,10 +2,12 @@
 
 #include "lib.h"
 #include "ioloop.h"
+#include "net.h"
 #include "str.h"
+#include "time-util.h"
 #include "dlua-script-private.h"
-
-#include <libgen.h>
+#include "dict-lua.h"
+#include "doveadm-client-lua.h"
 
 #define LUA_SCRIPT_DOVECOT "dovecot"
 #define DLUA_EVENT_PASSTHROUGH "struct event_passthrough"
@@ -619,6 +621,47 @@ static int dlua_restrict_global_variables(lua_State *L)
 	return 0;
 }
 
+static int dlua_gettimeofday(lua_State *L)
+{
+	struct timeval tv;
+
+	i_gettimeofday(&tv);
+	lua_newtable(L);
+	lua_pushinteger(L, tv.tv_sec);
+	lua_setfield(L, -2, "tv_sec");
+	lua_pushinteger(L, tv.tv_usec);
+	lua_setfield(L, -2, "tv_usec");
+	return 1;
+}
+
+static int dlua_nanoseconds(lua_State *L)
+{
+	lua_pushinteger(L, i_nanoseconds());
+	return 1;
+}
+
+static int dlua_microseconds(lua_State *L)
+{
+	lua_pushinteger(L, i_microseconds());
+	return 1;
+}
+
+static int net_ip_family(lua_State *L)
+{
+	DLUA_REQUIRE_ARGS(L, 1);
+
+	struct ip_addr ip;
+	if (net_addr2ip(luaL_checkstring(L, 1), &ip) < 0)
+		lua_pushinteger(L, 0);
+	else if (IPADDR_IS_V4(&ip))
+		lua_pushinteger(L, 4);
+	else {
+		i_assert(IPADDR_IS_V6(&ip));
+		lua_pushinteger(L, 6);
+	}
+	return 1;
+}
+
 static luaL_Reg lua_dovecot_methods[] = {
 	{ "i_debug", dlua_i_debug },
 	{ "i_info", dlua_i_info },
@@ -629,6 +672,10 @@ static luaL_Reg lua_dovecot_methods[] = {
 	{ "set_flag", dlua_set_flag },
 	{ "clear_flag", dlua_clear_flag },
 	{ "restrict_global_variables", dlua_restrict_global_variables },
+	{ "gettimeofday", dlua_gettimeofday },
+	{ "nanoseconds", dlua_nanoseconds },
+	{ "microseconds", dlua_microseconds },
+	{ "net_ip_family", net_ip_family },
 	{ NULL, NULL }
 };
 
@@ -659,8 +706,12 @@ void dlua_dovecot_register(struct dlua_script *script)
 	/* register table as global */
 	lua_setglobal(script->L, LUA_SCRIPT_DOVECOT);
 
-	/* register http methods */
+	/* register other libraries */
 	dlua_dovecot_http_register(script);
+#ifdef DLUA_WITH_YIELDS
+	dlua_dovecot_dict_register(script);
+	dlua_dovecot_doveadm_client_register(script);
+#endif
 }
 
 #undef event_want_level

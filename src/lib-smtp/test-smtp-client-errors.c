@@ -11,9 +11,7 @@
 #include "ostream.h"
 #include "iostream-ssl.h"
 #include "iostream-ssl-test.h"
-#ifdef HAVE_OPENSSL
-#  include "iostream-openssl.h"
-#endif
+#include "iostream-openssl.h"
 #include "time-util.h"
 #include "sleep.h"
 #include "connection.h"
@@ -23,6 +21,7 @@
 #include "smtp-client-connection.h"
 #include "smtp-client-transaction.h"
 
+#include <sys/signal.h>
 #include <unistd.h>
 
 #define CLIENT_PROGRESS_TIMEOUT     10
@@ -3693,9 +3692,6 @@ static void test_transaction_timeout(void)
 /*
  * Invalid SSL certificate
  */
-
-#ifdef HAVE_OPENSSL
-
 /* dns */
 
 static void
@@ -3839,8 +3835,6 @@ static void test_invalid_ssl_certificate(void)
 	test_end();
 }
 
-#endif
-
 /*
  * All tests
  */
@@ -3868,9 +3862,7 @@ static void (*const test_functions[])(void) = {
 	test_dns_lookup_failure,
 	test_authentication,
 	test_transaction_timeout,
-#ifdef HAVE_OPENSSL
 	test_invalid_ssl_certificate,
-#endif
 	NULL
 };
 
@@ -3952,7 +3944,7 @@ server_connection_init_ssl(struct server_connection *conn)
 		return -1;
 	}
 
-	if (io_stream_create_ssl_server(server_ssl_ctx, &ssl_set,
+	if (io_stream_create_ssl_server(server_ssl_ctx, &ssl_set, conn->conn.event,
 					&conn->conn.input, &conn->conn.output,
 					&conn->ssl_iostream, &error) < 0) {
 		i_error("SSL init failed: %s", error);
@@ -4213,6 +4205,7 @@ static int test_run_server(struct test_server_data *data)
 
 	server_ssl_ctx = NULL;
 
+	test_subprocess_notify_signal_send_parent(SIGUSR1);
 	ioloop = io_loop_create();
 	data->server_test(data->index);
 	io_loop_destroy(&ioloop);
@@ -4233,6 +4226,7 @@ static int test_run_dns(test_dns_init_t dns_test)
 	if (debug)
 		i_debug("PID=%s", my_pid);
 
+	test_subprocess_notify_signal_send_parent(SIGUSR1);
 	ioloop = io_loop_create();
 	dns_test();
 	io_loop_destroy(&ioloop);
@@ -4290,7 +4284,10 @@ test_run_client_server(const struct smtp_client_settings *client_set,
 
 			/* Fork server */
 			fd_listen = fds[i];
+			test_subprocess_notify_signal_reset(SIGUSR1);
 			test_subprocess_fork(test_run_server, &data, FALSE);
+			test_subprocess_notify_signal_wait(
+				SIGUSR1, TEST_SIGNALS_DEFAULT_TIMEOUT_MS);
 			i_close_fd(&fd_listen);
 		}
 	}
@@ -4306,7 +4303,10 @@ test_run_client_server(const struct smtp_client_settings *client_set,
 
 		/* Fork DNS service */
 		fd_listen = fd;
+		test_subprocess_notify_signal_reset(SIGUSR1);
 		test_subprocess_fork(test_run_dns, dns_test, FALSE);
+		test_subprocess_notify_signal_wait(SIGUSR1,
+			TEST_SIGNALS_DEFAULT_TIMEOUT_MS);
 		i_close_fd(&fd_listen);
 	}
 
@@ -4326,17 +4326,13 @@ test_run_client_server(const struct smtp_client_settings *client_set,
 
 static void main_init(void)
 {
-#ifdef HAVE_OPENSSL
 	ssl_iostream_openssl_init();
-#endif
 }
 
 static void main_deinit(void)
 {
 	ssl_iostream_context_cache_free();
-#ifdef HAVE_OPENSSL
 	ssl_iostream_openssl_deinit();
-#endif
 }
 
 int main(int argc, char *argv[])

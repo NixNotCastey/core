@@ -1,6 +1,16 @@
 #ifndef LIB_H
 #define LIB_H
 
+#if defined(__FreeBSD__) || defined(__NetBSD__) || defined(__OpenBSD__)
+#  define __BSD_VISIBLE 1
+#elif defined(__APPLE__)
+#  define _DARWIN_C_SOURCE 1
+#endif
+#define _BSD_SOURCE 1
+#define _DEFAULT_SOURCE 1
+#define _POSIX_C_SOURCE 200809L
+#define _XOPEN_SOURCE 700
+
 /* default lib includes */
 #ifdef HAVE_CONFIG_H
 #  include "config.h"
@@ -17,10 +27,10 @@
 #include <limits.h> /* INT_MAX, etc. */
 #include <errno.h> /* error checking is good */
 #include <sys/types.h> /* many other includes want this */
+#include <stdint.h> /* C99 int types, we mostly need uintmax_t */
 #include <inttypes.h> /* PRI* macros */
-
-#ifdef HAVE_STDINT_H
-#  include <stdint.h> /* C99 int types, we mostly need uintmax_t */
+#ifndef __cplusplus
+#  include <stdbool.h>
 #endif
 
 #include "compat.h"
@@ -52,6 +62,19 @@ typedef void lib_atexit_callback_t(void);
 #define LIB_ATEXIT_PRIORITY_HIGH -10
 #define LIB_ATEXIT_PRIORITY_DEFAULT 0
 #define LIB_ATEXIT_PRIORITY_LOW 10
+
+#define static_assert_array_size(arr, count) \
+	static_assert(N_ELEMENTS(arr) == (count), "array/enum size mismatch")
+
+/* Using memcpy() with NULL pointers is undefined behavior. Make sure we don't
+   do that. */
+static inline void *i_memcpy(void *dest, const void *src, size_t n) {
+	i_assert(dest != NULL && src != NULL);
+	return memcpy(dest, src, n);
+}
+#ifndef __cplusplus
+#  define memcpy(dest, src, n) i_memcpy(dest, src, n)
+#endif
 
 /* /dev/null opened as O_WRONLY. Opened at lib_init(), so it can be accessed
    also inside chroots. */

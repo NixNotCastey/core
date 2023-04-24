@@ -78,6 +78,12 @@ mail_cache_field_update(struct mail_cache *cache,
 	   internal fields and for mail_*cache_fields settings? */
 	initial_registering = cache->file_fields_count == 0;
 
+	if (newfield->decision == MAIL_CACHE_DECISION_NO) {
+		/* reset the cached flag, it will be set again anyway on first
+		   access if that is the case */
+		cache->headers_capped = FALSE;
+	}
+
 	orig = &cache->fields[newfield->idx];
 	if ((newfield->decision & MAIL_CACHE_DECISION_FORCED) != 0 ||
 	    ((orig->field.decision & MAIL_CACHE_DECISION_FORCED) == 0 &&
@@ -100,12 +106,33 @@ mail_cache_field_update(struct mail_cache *cache,
 
 void mail_cache_register_fields(struct mail_cache *cache,
 				struct mail_cache_field *fields,
-				unsigned int fields_count)
+				unsigned int fields_count,
+				pool_t fields_modify_pool)
 {
 	char *name;
 	void *value;
 	unsigned int new_idx;
 	unsigned int i, j, registered_count;
+
+	struct mail_index_cache_optimization_settings *set =
+		&cache->index->optimization_set.cache;
+
+	if (set->max_header_name_length > 0) {
+		if (fields_modify_pool == NULL)
+			fields_modify_pool = cache->field_pool;
+
+		unsigned int maxlen = strlen("hdr.") + set->max_header_name_length;
+		for (i = 0; i < fields_count; i++) {
+			if (fields[i].type == MAIL_CACHE_FIELD_HEADER &&
+			    strlen(fields[i].name) > maxlen) {
+				i_assert(fields_modify_pool !=
+					 MAIL_CACHE_TRUNCATE_NAME_FAIL);
+				fields[i].name = p_strndup(
+					fields_modify_pool,
+					fields[i].name, maxlen);
+			}
+		}
+	}
 
 	new_idx = cache->fields_count;
 	for (i = 0; i < fields_count; i++) {
@@ -171,6 +198,16 @@ mail_cache_register_lookup(struct mail_cache *cache, const char *name)
 	char *key;
 	void *value;
 
+	struct mail_index_cache_optimization_settings *set =
+		&cache->index->optimization_set.cache;
+
+	if (set->max_header_name_length > 0) {
+		unsigned int maxlen = strlen("hdr.") + set->max_header_name_length;
+		if (str_begins_icase_with(name, "hdr.") &&
+		    strlen(name) > maxlen)
+			name = t_strndup(name, maxlen);
+	}
+
 	if (hash_table_lookup_full(cache->field_name_hash, name, &key, &value))
 		return POINTER_CAST_TO(value, unsigned int);
 	else
@@ -186,7 +223,7 @@ mail_cache_register_get_field(struct mail_cache *cache, unsigned int field_idx)
 }
 
 struct mail_cache_field *
-mail_cache_register_get_list(struct mail_cache *cache, pool_t pool,
+mail_cache_register_get_list(struct mail_cache *cache, pool_t *pool_r,
 			     unsigned int *count_r)
 {
         struct mail_cache_field *list;
@@ -195,11 +232,12 @@ mail_cache_register_get_list(struct mail_cache *cache, pool_t pool,
 	if (!cache->opened)
 		(void)mail_cache_open_and_verify(cache);
 
+	*pool_r = pool_alloconly_create("mail cache register fields", 1024);
 	list = cache->fields_count == 0 ? NULL :
-		p_new(pool, struct mail_cache_field, cache->fields_count);
+		p_new(*pool_r, struct mail_cache_field, cache->fields_count);
 	for (i = 0; i < cache->fields_count; i++) {
 		list[i] = cache->fields[i].field;
-		list[i].name = p_strdup(pool, list[i].name);
+		list[i].name = p_strdup(*pool_r, list[i].name);
 	}
 
 	*count_r = cache->fields_count;
@@ -288,8 +326,8 @@ mail_cache_header_fields_get_offset(struct mail_cache *cache,
 	cache->last_field_header_offset = offset;
 
 	if (next_count > cache->index->optimization_set.cache.purge_header_continue_count) {
-		mail_cache_purge_later(cache, t_strdup_printf(
-			"Too many continued headers (%u)", next_count));
+		mail_cache_purge_later(cache,
+			"Too many continued headers (%u)", next_count);
 	}
 
 	if (field_hdr_r != NULL) {
@@ -345,6 +383,10 @@ int mail_cache_header_fields_read(struct mail_cache *cache)
 		mail_cache_set_corrupted(cache, "invalid field header size");
 		return -1;
 	}
+
+	/* reset the cached flag, it will be set again anyway on first access if
+	   that is the case */
+	cache->headers_capped = FALSE;
 
 	new_fields_count = field_hdr->fields_count;
 	if (new_fields_count != 0) {
@@ -424,7 +466,8 @@ int mail_cache_header_fields_read(struct mail_cache *cache)
 			field.type = types[i];
 			field.field_size = sizes[i];
 			field.decision = file_dec;
-			mail_cache_register_fields(cache, &field, 1);
+			mail_cache_register_fields(cache, &field, 1,
+						   cache->field_pool);
 			fidx = field.idx;
 		}
 		if (cache->field_file_map[fidx] != (uint32_t)-1) {
@@ -452,19 +495,19 @@ int mail_cache_header_fields_read(struct mail_cache *cache)
 		case MAIL_CACHE_PURGE_DROP_DECISION_NONE:
 			break;
 		case MAIL_CACHE_PURGE_DROP_DECISION_DROP:
-			mail_cache_purge_later(cache, t_strdup_printf(
+			mail_cache_purge_later(cache,
 				"Drop old field %s (last_used=%"PRIdTIME_T")",
 				cache->fields[fidx].field.name,
-				cache->fields[fidx].field.last_used));
+				cache->fields[fidx].field.last_used);
 			break;
 		case MAIL_CACHE_PURGE_DROP_DECISION_TO_TEMP:
 			/* This cache decision change can cause the field to be
 			   dropped for old mails, so do it via purging. */
-			mail_cache_purge_later(cache, t_strdup_printf(
+			mail_cache_purge_later(cache,
 				"Change cache decision to temp for old field %s "
 				"(last_used=%"PRIdTIME_T")",
 				cache->fields[fidx].field.name,
-				cache->fields[fidx].field.last_used));
+				cache->fields[fidx].field.last_used);
 			break;
 		}
 

@@ -18,6 +18,7 @@
 #include "smtp-dovecot.h"
 #include "auth-proxy.h"
 #include "auth-master.h"
+#include "master-service-settings.h"
 #include "master-service-ssl-settings.h"
 #include "mail-storage-service.h"
 #include "lda-settings.h"
@@ -45,8 +46,8 @@ struct lmtp_proxy_recipient {
 
 	struct smtp_address *address;
 
-	const unsigned char *forward_fields;
-	size_t forward_fields_size;
+	const unsigned char *auth_forward_fields;
+	size_t auth_forward_fields_size;
 
 	unsigned int proxy_ttl;
 
@@ -125,6 +126,12 @@ lmtp_proxy_init(struct client *client,
 					      &lmtp_set.proxy_data);
 	lmtp_set.proxy_data.source_ip = client->remote_ip;
 	lmtp_set.proxy_data.source_port = client->remote_port;
+	bool end_client_tls_secured =
+		client->end_client_tls_secured_set ?
+		client->end_client_tls_secured :
+		smtp_server_connection_is_ssl_secured(client->conn);
+	lmtp_set.proxy_data.client_transport = end_client_tls_secured ?
+		CLIENT_TRANSPORT_TLS : CLIENT_TRANSPORT_INSECURE;
 	/* This initial session_id is used only locally by lib-smtp. Each LMTP
 	   proxy connection gets a more specific updated session_id. */
 	lmtp_set.proxy_data.session = trans->id;
@@ -200,7 +207,8 @@ lmtp_proxy_connection_init_ssl(struct lmtp_proxy_connection *conn,
 		return;
 	}
 
-	master_ssl_set = master_service_ssl_settings_get(master_service);
+	master_ssl_set = master_service_settings_get_root_set(master_service,
+			&master_service_ssl_setting_parser_info);
 	master_service_ssl_client_settings_to_iostream_set(
 		master_ssl_set, pool_datastack_create(), ssl_set_r);
 	if ((conn->set.set.ssl_flags & AUTH_PROXY_SSL_FLAG_ANY_CERT) != 0)
@@ -394,6 +402,7 @@ lmtp_proxy_rcpt_parse_fields(struct lmtp_proxy_recipient *lprcpt,
 	struct smtp_server_recipient *rcpt = lprcpt->rcpt->rcpt;
 	const char *p, *key, *value, *error;
 	in_port_t orig_port = set->set.port;
+	string_t *fwfields = NULL;
 	int ret;
 
 	set->set.proxy = FALSE;
@@ -438,6 +447,15 @@ lmtp_proxy_rcpt_parse_fields(struct lmtp_proxy_recipient *lprcpt,
 		} else if (strcmp(key, "user") == 0) {
 			/* Changing the username */
 			*address = value;
+		} else if (str_begins_icase(key, "forward_", &key)) {
+			if (fwfields == NULL)
+				fwfields = t_str_new(128);
+			else
+				str_append_c(fwfields, '\t');
+
+			str_append_tabescaped(fwfields, key);
+			str_append_c(fwfields, '=');
+			str_append_tabescaped(fwfields, value);
 		} else {
 			/* Just ignore it */
 		}
@@ -457,6 +475,13 @@ lmtp_proxy_rcpt_parse_fields(struct lmtp_proxy_recipient *lprcpt,
 	}
 	if (set->set.redirect_reauth)
 		lprcpt->proxy_redirect_reauth = TRUE;
+
+	/* Copy forward fields returned from passdb */
+	if (fwfields != NULL) {
+		lprcpt->auth_forward_fields = p_memdup(
+			rcpt->pool, str_data(fwfields), str_len(fwfields));
+		lprcpt->auth_forward_fields_size = str_len(fwfields);
+	}
 	return 1;
 }
 
@@ -558,6 +583,11 @@ lmtp_proxy_rcpt_get_connection(struct lmtp_proxy_recipient *lprcpt,
 	conn = lmtp_proxy_get_connection(client->proxy, set);
 	i_assert(conn != lprcpt->conn);
 
+	event_add_str(lprcpt->rcpt->rcpt->event, "dest_host", set->set.host);
+	if (set->set.host_ip.family != 0) {
+		event_add_ip(lprcpt->rcpt->rcpt->event, "dest_ip",
+			     &set->set.host_ip);
+	}
 	*conn_r = lprcpt->conn = conn;
 	return 0;
 }
@@ -648,7 +678,6 @@ lmtp_proxy_rcpt_redirect_relookup(struct lmtp_proxy_recipient *lprcpt,
 {
 	struct lmtp_recipient *lrcpt = lprcpt->rcpt;
 	struct smtp_server_recipient *rcpt = lrcpt->rcpt;
-	const struct ip_addr *ip = &set->set.host_ip;
 	in_port_t port = set->set.port;
 	struct auth_master_connection *auth_conn;
 	struct auth_user_info info;
@@ -663,7 +692,7 @@ lmtp_proxy_rcpt_redirect_relookup(struct lmtp_proxy_recipient *lprcpt,
 	lmtp_proxy_rcpt_get_redirect_path(lprcpt, hosts_attempted);
 	const char *const extra_fields[] = {
 		t_strdup_printf("proxy_redirect_host_next=%s:%u",
-				net_ip2addr(ip), port),
+				set->set.host, port),
 		str_c(hosts_attempted),
 		t_strdup_printf("destuser=%s", str_tabescape(destuser)),
 		t_strdup_printf("proxy_timeout=%u", lprcpt->conn->set.set.timeout_msecs),
@@ -690,14 +719,29 @@ lmtp_proxy_rcpt_redirect_relookup(struct lmtp_proxy_recipient *lprcpt,
 		return;
 	}
 
-	if (lmtp_proxy_rcpt_parse_fields(lprcpt, set, fields, &username) <= 0) {
+	ret = lmtp_proxy_rcpt_parse_fields(lprcpt, set, fields, &username);
+	if (ret == 0 && (!lprcpt->nologin || set->set.host == NULL)) {
+		e_error(lprcpt->rcpt->rcpt->event,
+			"Redirect authentication is missing proxy or nologin field");
+		ret = -1;
+	}
+	if (ret < 0) {
 		smtp_server_recipient_reply(
 			rcpt, 451, "4.3.0",
 			"Redirect lookup yielded invalid result");
-		return;
+	} else if (ret == 0) {
+		/* referral */
+		const struct smtp_proxy_redirect predir = {
+			.username = username,
+			.host = set->set.host,
+			.host_ip = set->set.host_ip,
+			.port = set->set.port,
+		};
+		smtp_server_recipient_reply_redirect(rcpt, 0, &predir);
+	} else {
+		lmtp_proxy_rcpt_redirect_finish(lprcpt, set);
 	}
-
-	lmtp_proxy_rcpt_redirect_finish(lprcpt, set);
+	pool_unref(&auth_pool);
 }
 
 static void
@@ -803,7 +847,7 @@ lmtp_proxy_rcpt_login_cb(const struct smtp_reply *proxy_reply, void *context)
 		add_orcpt_param = TRUE;
 
 	/* Add forward fields parameter when passdb returned forward_* fields */
-	if (lprcpt->forward_fields != NULL &&
+	if (lprcpt->auth_forward_fields != NULL &&
 	    lmtp_proxy_connection_has_rcpt_forward(conn))
 		add_xrcptforward_param = TRUE;
 
@@ -824,7 +868,8 @@ lmtp_proxy_rcpt_login_cb(const struct smtp_reply *proxy_reply, void *context)
 	if (add_xrcptforward_param) {
 		smtp_params_rcpt_encode_extra(
 			rcpt_params, param_pool, LMTP_RCPT_FORWARD_PARAMETER,
-			lprcpt->forward_fields, lprcpt->forward_fields_size);
+			lprcpt->auth_forward_fields,
+			lprcpt->auth_forward_fields_size);
 	}
 
 	relay_rcpt = smtp_client_transaction_add_pool_rcpt(
@@ -876,7 +921,6 @@ int lmtp_proxy_rcpt(struct client *client,
 	struct mail_storage_service_input input;
 	const char *const *fields, *errstr, *username, *orig_username;
 	struct smtp_address *user;
-	string_t *fwfields;
 	pool_t auth_pool;
 	int ret;
 
@@ -887,7 +931,7 @@ int lmtp_proxy_rcpt(struct client *client,
 	lrcpt->backend_context = lprcpt;
 
 	i_zero(&input);
-	input.module = input.service = "lmtp";
+	input.service = "lmtp";
 	mail_storage_service_init_settings(storage_service, &input);
 
 	lmtp_proxy_rcpt_init_auth_user_info(lrcpt, &info);
@@ -980,25 +1024,6 @@ int lmtp_proxy_rcpt(struct client *client,
 	smtp_server_recipient_add_hook(
 		rcpt, SMTP_SERVER_RECIPIENT_HOOK_APPROVED,
 		lmtp_proxy_rcpt_approved, lprcpt);
-
-	/* Copy forward fields returned from passdb */
-	fwfields = NULL;
-	for (const char *const *ptr = fields; *ptr != NULL; ptr++) {
-		if (!str_begins_icase_with(*ptr, "forward_"))
-			continue;
-
-		if (fwfields == NULL)
-			fwfields = t_str_new(128);
-		else
-			str_append_c(fwfields, '\t');
-
-		str_append_tabescaped(fwfields, (*ptr) + 8);
-	}
-	if (fwfields != NULL) {
-		lprcpt->forward_fields = p_memdup(
-			rcpt->pool, str_data(fwfields), str_len(fwfields));
-		lprcpt->forward_fields_size = str_len(fwfields);
-	}
 
 	pool_unref(&auth_pool);
 

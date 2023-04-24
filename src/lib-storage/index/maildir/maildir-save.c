@@ -587,8 +587,9 @@ static int maildir_save_finish_real(struct mail_save_context *_ctx)
 		   (!maildir_filename_get_size(ctx->file_last->dest_basename,
 					       MAILDIR_EXTRA_FILE_SIZE, &size) ||
 		    size != ctx->file_last->size)) {
-		/* e.g. zlib plugin was used. the "physical size" must be in
-		   the maildir filename, since stat() will return wrong size */
+		/* e.g. mail-compress plugin was used. the "physical size" must
+		   be in the maildir filename, since stat() will return wrong
+		   size */
 		ctx->file_last->preserve_filename = FALSE;
 		/* preserve the GUID if needed */
 		if (ctx->file_last->guid == NULL)
@@ -872,7 +873,7 @@ maildir_save_move_files_to_newcur(struct maildir_save_context *ctx)
 	/* put files into an array sorted by the destination filename.
 	   this way we can easily check if there are duplicate destination
 	   filenames within this transaction. */
-	t_array_init(&files, ctx->files_count);
+	p_array_init(&files, ctx->pool, ctx->files_count);
 	for (mf = ctx->files; mf != NULL; mf = mf->next)
 		array_push_back(&files, &mf);
 	array_sort(&files, maildir_filename_dest_basename_cmp);

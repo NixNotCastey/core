@@ -5,6 +5,7 @@
 #include "ostream.h"
 #include "str.h"
 #include "strescape.h"
+#include "str-parse.h"
 #include "stats-dist.h"
 #include "time-util.h"
 #include "dict-private.h"
@@ -382,18 +383,23 @@ dict_connection_transaction_array_remove(struct dict_connection *conn,
 static int cmd_begin(struct dict_connection_cmd *cmd, const char *const *args)
 {
 	struct dict_connection_transaction *trans;
-	unsigned int id;
-	const char *username;
+	unsigned int id, args_count = str_array_length(args);
 
-	if (str_array_length(args) < 1) {
+	if (args_count < 1) {
 		e_error(cmd->event, "BEGIN: broken input");
 		return -1;
 	}
-	username = args[1];
+	struct dict_op_settings set = {
+		.username = args[1],
+	};
 
-	/* <id> [<username>] */
+	/* <id> [<username> [<expire secs>]] */
 	if (str_to_uint(args[0], &id) < 0) {
 		e_error(cmd->event, "Invalid transaction ID %s", args[0]);
+		return -1;
+	}
+	if (args_count >= 3 && str_to_uint(args[2], &set.expire_secs) < 0) {
+		e_error(cmd->event, "Invalid expire_secs %s", args[2]);
 		return -1;
 	}
 	if (dict_connection_transaction_lookup(cmd->conn, id) != NULL) {
@@ -404,9 +410,6 @@ static int cmd_begin(struct dict_connection_cmd *cmd, const char *const *args)
 	if (!array_is_created(&cmd->conn->transactions))
 		i_array_init(&cmd->conn->transactions, 4);
 
-	struct dict_op_settings set = {
-		.username = username,
-	};
 	trans = array_append_space(&cmd->conn->transactions);
 	trans->id = id;
 	trans->conn = cmd->conn;
@@ -595,6 +598,27 @@ static int cmd_timestamp(struct dict_connection_cmd *cmd, const char *const *arg
 	return 0;
 }
 
+static int
+cmd_hide_log_values(struct dict_connection_cmd *cmd, const char *const *args)
+{
+	struct dict_connection_transaction *trans;
+	const char *error;
+	bool value;
+
+	/* <id> <hide_log_values> */
+	if (str_array_length(args) != 2 ||
+	    str_parse_get_bool(args[1], &value, &error) < 0) {
+		e_error(cmd->event, "HIDE_LOG_VALUES: broken input");
+		return -1;
+	}
+
+	if (dict_connection_transaction_lookup_parse(cmd->conn, args[0], &trans) < 0)
+		return -1;
+
+	dict_transaction_set_hide_log_values(trans->ctx, value);
+	return 0;
+}
+
 static const struct dict_cmd_func cmds[] = {
 	{ DICT_PROTOCOL_CMD_LOOKUP, cmd_lookup },
 	{ DICT_PROTOCOL_CMD_ITERATE, cmd_iterate },
@@ -605,6 +629,7 @@ static const struct dict_cmd_func cmds[] = {
 	{ DICT_PROTOCOL_CMD_UNSET, cmd_unset },
 	{ DICT_PROTOCOL_CMD_ATOMIC_INC, cmd_atomic_inc },
 	{ DICT_PROTOCOL_CMD_TIMESTAMP, cmd_timestamp },
+	{ DICT_PROTOCOL_CMD_HIDE_LOG_VALUES, cmd_hide_log_values },
 
 	{ 0, NULL }
 };
@@ -657,7 +682,14 @@ static bool dict_connection_cmds_try_output_more(struct dict_connection *conn)
 	array_foreach_elem(&conn->cmds, cmd) {
 		if (cmd->iter == NULL) {
 			/* not an iterator */
-		} else if (cmd_iterate_flush(cmd) == 0) {
+			continue;
+		}
+
+		int ret;
+		T_BEGIN {
+			ret = cmd_iterate_flush(cmd);
+		} T_END;
+		if (ret == 0) {
 			/* unfinished */
 		} else {
 			dict_connection_cmd_try_flush(&cmd);

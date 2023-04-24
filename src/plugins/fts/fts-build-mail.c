@@ -222,6 +222,13 @@ fts_build_body_begin(struct fts_mail_build_context *ctx,
 	storage = mailbox_get_storage(ctx->mail->box);
 	parser_context.user = mail_storage_get_user(storage);
 	parser_context.content_disposition = ctx->content_disposition;
+	parser_context.event = event_create(ctx->mail->box->event);
+	event_add_category(parser_context.event, &event_category_fts);
+	T_BEGIN {
+		const char *prefix =
+			t_strdup_printf("fts-%s: ", ctx->update_ctx->backend->name);
+		event_set_append_log_prefix(parser_context.event, prefix);
+	} T_END;
 
 	if (fts_parser_init(&parser_context, &ctx->body_parser)) {
 		/* extract text using the the returned parser */
@@ -235,8 +242,10 @@ fts_build_body_begin(struct fts_mail_build_context *ctx,
 	} else {
 		/* possibly binary */
 		if ((ctx->update_ctx->backend->flags &
-		     FTS_BACKEND_FLAG_BINARY_MIME_PARTS) == 0)
+		     FTS_BACKEND_FLAG_BINARY_MIME_PARTS) == 0) {
+			event_unref(&parser_context.event);
 			return FALSE;
+		     }
 		*binary_body_r = TRUE;
 		key.type = FTS_BACKEND_BUILD_KEY_BODY_PART_BINARY;
 	}
@@ -246,8 +255,11 @@ fts_build_body_begin(struct fts_mail_build_context *ctx,
 	if (!fts_backend_update_set_build_key(ctx->update_ctx, &key)) {
 		if (ctx->body_parser != NULL)
 			(void)fts_parser_deinit(&ctx->body_parser, NULL);
+		event_unref(&parser_context.event);
 		return FALSE;
 	}
+
+	event_unref(&parser_context.event);
 	return TRUE;
 }
 
@@ -579,7 +591,7 @@ fts_build_mail_real(struct fts_backend_update_context *update_ctx,
 		if (mail->expunged)
 			return 0;
 		mail_set_critical(mail, "Failed to read stream: %s",
-			mailbox_get_last_internal_error(mail->box, NULL));
+			mail_get_last_internal_error(mail, NULL));
 		return -1;
 	}
 
@@ -590,7 +602,8 @@ fts_build_mail_real(struct fts_backend_update_context *update_ctx,
 		ctx.pending_input = buffer_create_dynamic(default_pool, 128);
 
 	prev_part = NULL;
-	parser = message_parser_init(pool_datastack_create(), input, &parser_set);
+	pool_t parts_pool = pool_alloconly_create("fts message parts", 512);
+	parser = message_parser_init(parts_pool, input, &parser_set);
 
 	decoder = message_decoder_init(update_ctx->normalizer, 0);
 	for (;;) {
@@ -687,12 +700,14 @@ fts_build_mail_real(struct fts_backend_update_context *update_ctx,
 	i_free(ctx.content_disposition);
 	buffer_free(&ctx.word_buf);
 	buffer_free(&ctx.pending_input);
+	pool_unref(&parts_pool);
 	return ret < 0 ? -1 : 1;
 }
 
 int fts_build_mail(struct fts_backend_update_context *update_ctx,
 		   struct mail *mail)
 {
+	struct event *event = update_ctx->backend->event;
 	int ret;
 	/* Number of attempts to be taken if retry is needed */
 	unsigned int attempts = 2;
@@ -709,7 +724,10 @@ int fts_build_mail(struct fts_backend_update_context *update_ctx,
 				   because e.g. Tika doesn't differentiate
 				   between temporary errors and invalid
 				   document input. */
-				i_info("%s - ignoring", retriable_err_msg);
+				e_info(event,
+				       "Mailbox %s: UID %u: %s - ignoring",
+				       mailbox_get_vname(mail->box), mail->uid,
+				       retriable_err_msg);
 				ret = 0;
 				break;
 			}

@@ -11,7 +11,13 @@
 
 /* <settings checks> */
 static struct file_listener_settings imap_login_unix_listeners_array[] = {
-	{ "srv.imap-login/%{pid}", 0600, "", "" },
+	{
+		.path = "srv.imap-login/%{pid}",
+		.type = "admin",
+		.mode = 0600,
+		.user = "",
+		.group = "",
+	},
 };
 static struct file_listener_settings *imap_login_unix_listeners[] = {
 	&imap_login_unix_listeners_array[0],
@@ -21,8 +27,17 @@ static buffer_t imap_login_unix_listeners_buf = {
 };
 
 static struct inet_listener_settings imap_login_inet_listeners_array[] = {
-	{ .name = "imap", .address = "", .port = 143 },
-	{ .name = "imaps", .address = "", .port = 993, .ssl = TRUE }
+	{
+		.name = "imap",
+		.address = "",
+		.port = 143,
+	},
+	{
+		.name = "imaps",
+		.address = "",
+		.port = 993,
+		.ssl = TRUE,
+	},
 };
 static struct inet_listener_settings *imap_login_inet_listeners[] = {
 	&imap_login_inet_listeners_array[0],
@@ -67,7 +82,6 @@ struct service_settings imap_login_service_settings = {
 static const struct setting_define imap_login_setting_defines[] = {
 	DEF(STR, imap_capability),
 	DEF(STR, imap_id_send),
-	DEF(STR, imap_id_log),
 	DEF(BOOL, imap_literal_minus),
 	DEF(BOOL, imap_id_retain),
 
@@ -77,7 +91,6 @@ static const struct setting_define imap_login_setting_defines[] = {
 static const struct imap_login_settings imap_login_default_settings = {
 	.imap_capability = "",
 	.imap_id_send = "name *",
-	.imap_id_log = "",
 	.imap_literal_minus = FALSE,
 	.imap_id_retain = FALSE,
 };

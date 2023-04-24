@@ -92,10 +92,10 @@ static void sdbox_sync_add(struct sdbox_sync_context *ctx,
 		return;
 	}
 
-	for (seq = seq1; seq <= seq2; seq++) {
+	for (seq = seq1; seq <= seq2; seq++) T_BEGIN {
 		mail_index_lookup_uid(ctx->sync_view, seq, &uid);
 		sdbox_sync_file(ctx, seq, uid, type);
-	}
+	} T_END;
 }
 
 static int sdbox_sync_index(struct sdbox_sync_context *ctx)
@@ -279,8 +279,8 @@ int sdbox_sync_finish(struct sdbox_sync_context **_ctx, bool success)
 			ret = -1;
 		} else {
 			dbox_sync_expunge_files(ctx);
-			mail_index_view_close(&ctx->sync_view);
 		}
+		mail_index_view_close(&ctx->sync_view);
 	} else {
 		mail_index_sync_rollback(&ctx->index_sync_ctx);
 	}

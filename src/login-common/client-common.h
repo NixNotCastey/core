@@ -6,7 +6,7 @@ struct module;
 #include "net.h"
 #include "login-proxy.h"
 #include "sasl-server.h"
-#include "master-login.h" /* for LOGIN_MAX_SESSION_ID_LEN */
+#include "login-client.h"
 
 #define LOGIN_MAX_SESSION_ID_LEN 64
 #define LOGIN_MAX_MASTER_PREFIX_LEN 128
@@ -19,7 +19,7 @@ struct module;
    POP3: Max. length of a command line (spec says 512 would be enough)
 */
 #define LOGIN_MAX_INBUF_SIZE \
-	(MASTER_AUTH_MAX_DATA_SIZE - LOGIN_MAX_MASTER_PREFIX_LEN - \
+	(LOGIN_REQUEST_MAX_DATA_SIZE - LOGIN_MAX_MASTER_PREFIX_LEN - \
 	 LOGIN_MAX_SESSION_ID_LEN)
 /* max. size of output buffer. if it gets full, the client is disconnected.
    SASL authentication gives the largest output. */
@@ -41,6 +41,9 @@ struct module;
 #define CLIENT_UNAUTHENTICATED_LOGOUT_MSG \
 	"Aborted login by logging out"
 
+#define CLIENT_TRANSPORT_TLS "TLS"
+#define CLIENT_TRANSPORT_INSECURE "insecure"
+
 struct master_service_connection;
 
 enum client_disconnect_reason {
@@ -61,6 +64,8 @@ enum client_auth_fail_code {
 	CLIENT_AUTH_FAIL_CODE_MECH_INVALID,
 	CLIENT_AUTH_FAIL_CODE_MECH_SSL_REQUIRED,
 	CLIENT_AUTH_FAIL_CODE_ANONYMOUS_DENIED,
+
+	CLIENT_AUTH_FAIL_CODE_COUNT
 };
 
 enum client_auth_result {
@@ -157,6 +162,7 @@ struct client {
 	struct timeval created;
 	int refcount;
 	struct event *event;
+	struct event *event_auth;
 
 	struct ip_addr local_ip;
 	struct ip_addr ip;
@@ -172,7 +178,7 @@ struct client {
 	const char *client_cert_common_name;
 
 	string_t *client_id;
-	string_t *forward_fields;
+	ARRAY_TYPE(const_string) forward_fields;
 
 	int fd;
 	struct istream *input;
@@ -193,16 +199,21 @@ struct client {
 
 	char *auth_mech_name;
 	enum sasl_server_auth_flags auth_flags;
+	/* Auth request set while the client is authenticating.
+	   During this time authenticating=TRUE also. */
 	struct auth_client_request *auth_request;
 	struct auth_client_request *reauth_request;
 	string_t *auth_response;
-	time_t auth_first_started, auth_finished;
+	struct timeval auth_first_started, auth_finished;
 	const char *sasl_final_resp;
 	const char *const *auth_passdb_args;
 	struct anvil_query *anvil_query;
 	struct anvil_request *anvil_request;
 
 	unsigned int master_auth_id;
+	/* Tag that can be used with login_client_request_abort() to abort
+	   sending client fd to mail process. authenticating is always TRUE
+	   while this is non-zero. */
 	unsigned int master_tag;
 	sasl_server_callback_t *sasl_callback;
 
@@ -220,25 +231,48 @@ struct client {
 	   as in global_alt_usernames. If some field doesn't exist, it's "".
 	   Can also be NULL if there are no user_* fields. */
 	const char **alt_usernames;
-	/* director_username_hash cached, if non-zero */
-	unsigned int director_username_hash_cache;
 
 	bool create_finished:1;
 	bool disconnected:1;
 	bool destroyed:1;
 	bool input_blocked:1;
 	bool login_success:1;
-	bool no_extra_disconnect_reason:1;
-	bool starttls:1;
-	bool tls:1;
-	bool proxied_ssl:1;
-	bool secured:1;
-	bool ssl_secured:1;
-	bool trusted:1;
+	/* Client/proxy connection is using TLS. Either Dovecot or HAProxy
+	   has terminated the TLS connection. */
+	bool connection_tls_secured:1;
+	/* connection_tls_secured=TRUE was started via STARTTLS command. */
+	bool connection_used_starttls:1;
+	/* HAProxy terminated the TLS connection. */
+	bool haproxy_terminated_tls:1;
+	/* Connection from the previous hop (client, proxy, haproxy) is
+	   considered secured. Either because TLS is used, or because the
+	   connection is otherwise considered not to need TLS. Note that this
+	   doesn't necessarily mean that the client connection behind the
+	   previous hop is secured. */
+	bool connection_secured:1;
+	/* End client is using TLS connection. The TLS termination may be either
+	   on Dovecot side or HAProxy side. This value is forwarded through
+	   trusted Dovecot proxies. */
+	bool end_client_tls_secured:1;
+	/* TRUE if end_client_tls_secured is set via ID/XCLIENT and must not
+	   be changed anymore. */
+	bool end_client_tls_secured_set:1;
+	/* Connection is from a trusted client/proxy, which is allowed to e.g.
+	   forward the original client IP address. Note that a trusted
+	   connection is not necessarily considered secured. */
+	bool connection_trusted:1;
 	bool ssl_servername_settings_read:1;
 	bool banner_sent:1;
+	/* Authentication is going on. This is set a bit before auth_request is
+	   created, and it can fail early e.g. due to unknown SASL mechanism.
+	   Also this is still TRUE while the client fd is being sent to the
+	   mail process (master_tag != 0). */
 	bool authenticating:1;
-	bool auth_try_aborted:1;
+	/* SASL authentication is waiting for client to send a continuation */
+	bool auth_client_continue_pending:1;
+	/* Client asked for SASL authentication to be aborted by sending
+	   "*" line. */
+	bool auth_aborted_by_client:1;
 	bool auth_initializing:1;
 	bool auth_process_comm_fail:1;
 	bool auth_anonymous:1;
@@ -248,10 +282,11 @@ struct client {
 	bool proxy_nopipelining:1;
 	bool proxy_not_trusted:1;
 	bool proxy_redirect_reauth:1;
-	bool auth_waiting:1;
 	bool notified_auth_ready:1;
 	bool notified_disconnect:1;
 	bool fd_proxying:1;
+	bool shutting_down:1;
+	bool resource_constraint:1;
 	/* ... */
 };
 
@@ -301,10 +336,15 @@ struct client *clients_get_first_fd_proxy(void);
 
 void client_add_forward_field(struct client *client, const char *key,
 			      const char *value);
+bool client_forward_decode_base64(struct client *client, const char *value);
 void client_set_title(struct client *client);
-const char *client_get_extra_disconnect_reason(struct client *client);
+bool client_get_extra_disconnect_reason(struct client *client,
+					const char **human_reason_r,
+					const char **event_reason_r);
 
 void client_auth_respond(struct client *client, const char *response);
+/* Called when client asks for SASL authentication to be aborted by sending
+   "*" line. */
 void client_auth_abort(struct client *client);
 bool client_is_tls_enabled(struct client *client);
 void client_auth_fail(struct client *client, const char *text);

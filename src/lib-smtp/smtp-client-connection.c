@@ -657,6 +657,13 @@ void smtp_client_connection_send_xclient(struct smtp_client_connection *conn)
 						   "SESSION", xclient->session);
 	}
 
+	/* CLIENT-TRANSPORT */
+	if (xclient->client_transport != NULL &&
+	    str_array_icase_find(xclient_args, "CLIENT-TRANSPORT")) {
+		smtp_client_connection_xclient_add(conn, str, offset,
+			"CLIENT-TRANSPORT", xclient->client_transport);
+	}
+
 	/* TTL */
 	if (xclient->ttl_plus_1 > 0 &&
 	    str_array_icase_find(xclient_args, "TTL")) {
@@ -1610,6 +1617,7 @@ smtp_client_connection_ssl_init(struct smtp_client_connection *conn,
 	connection_input_halt(&conn->conn);
 	if (io_stream_create_ssl_client(
 		conn->ssl_ctx, conn->host, conn->set.ssl,
+		conn->event,
 		&conn->conn.input, &conn->conn.output,
 		&conn->ssl_iostream, &error) < 0) {
 		*error_r = t_strdup_printf(
@@ -1754,8 +1762,6 @@ smtp_client_connection_do_connect(struct smtp_client_connection *conn)
 	/* don't use connection.h timeout because we want this timeout
 	   to include also the SSL handshake */
 	msecs = conn->set.connect_timeout_msecs;
-	if (msecs == 0)
-		msecs = conn->set.command_timeout_msecs;
 	i_assert(conn->to_connect == NULL);
 	if (msecs > 0) {
 		conn->to_connect = timeout_add(
@@ -2204,6 +2210,7 @@ smtp_client_connection_do_create(struct smtp_client *client, const char *name,
 				smtp_protocol_name(conn->protocol)));
 	event_add_str(conn_event, "protocol",
 		      smtp_protocol_name(conn->protocol));
+	event_add_category(conn_event, &event_category_smtp_client);
 	event_set_forced_debug(conn_event, (set != NULL && set->debug));
 
 	conn->conn.event_parent = conn_event;

@@ -31,7 +31,7 @@ YACC=/bin/false
 event-filter-parser.h: event-filter-parser.c
 
 $(srcdir)/UnicodeData.txt:
-	$(AM_V_GEN)test -f $@ || wget -O $@ https://dovecot.org/res/UnicodeData.txt
+	$(AM_V_at)test -f $@ || $(WGET) -nv -O $@ https://dovecot.org/res/UnicodeData.txt
 
 $(srcdir)/unicodemap.c: $(srcdir)/unicodemap.pl $(srcdir)/UnicodeData.txt
 	$(AM_V_GEN)perl $(srcdir)/unicodemap.pl < $(srcdir)/UnicodeData.txt > $@
@@ -49,7 +49,6 @@ liblib_la_SOURCES = \
 	buffer.c \
 	buffer-istream.c \
 	child-wait.c \
-	compat.c \
 	connection.c \
 	cpu-limit.c \
 	crc32.c \
@@ -105,6 +104,7 @@ liblib_la_SOURCES = \
 	istream-jsonstr.c \
 	istream-limit.c \
 	istream-multiplex.c \
+	istream-nonuls.c \
 	istream-noop.c \
 	istream-rawlog.c \
 	istream-seekable.c \
@@ -183,6 +183,7 @@ liblib_la_SOURCES = \
 	str.c \
 	str-find.c \
 	str-sanitize.c \
+	str-parse.c \
 	str-table.c \
 	strescape.c \
 	strfuncs.c \
@@ -271,6 +272,7 @@ headers = \
 	istream-hash.h \
 	istream-jsonstr.h \
 	istream-multiplex.h \
+	istream-nonuls.h \
 	istream-private.h \
 	istream-rawlog.h \
 	istream-seekable.h \
@@ -342,6 +344,7 @@ headers = \
 	str.h \
 	str-find.h \
 	str-sanitize.h \
+	str-parse.h \
 	str-table.h \
 	strescape.h \
 	strfuncs.h \
@@ -458,6 +461,7 @@ test_lib_SOURCES = \
 	test-strnum.c \
 	test-str-find.c \
 	test-str-sanitize.c \
+	test-str-parse.c \
 	test-str-table.c \
 	test-time-util.c \
 	test-unichar.c \

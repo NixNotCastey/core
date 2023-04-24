@@ -63,75 +63,41 @@ struct path_cmd_context {
 
 static const char *mailbox_list_path_type_names[] = {
 	"dir", "alt-dir", "mailbox", "alt-mailbox",
-	"control", "index", "index-private"
+	"control", "index", "index-private", "index-cache", "list-index",
 };
+static_assert_array_size(mailbox_list_path_type_names, MAILBOX_LIST_PATH_TYPE_COUNT);
+
+static void doveadm_mailbox_arg_check(const char *arg)
+{
+	if (!uni_utf8_str_is_valid(arg)) {
+		i_fatal_status(EX_DATAERR,
+			"Mailbox name not valid UTF-8: %s", arg);
+	}
+}
+
+void doveadm_mailbox_args_check_array(ARRAY_TYPE(const_string) *args)
+{
+	const char *arg;
+	array_foreach_elem(args, arg)
+		doveadm_mailbox_arg_check(arg);
+}
 
 void doveadm_mailbox_args_check(const char *const args[])
 {
-	unsigned int i;
-
-	for (i = 0; args[i] != NULL; i++) {
-		if (!uni_utf8_str_is_valid(args[i])) {
-			i_fatal_status(EX_DATAERR,
-				"Mailbox name not valid UTF-8: %s", args[i]);
-		}
-	}
-}
-
-static bool cmd_mailbox_parse_arg(struct doveadm_mail_cmd_context *_ctx, int c)
-{
-	struct doveadm_mailbox_cmd_context *ctx =
-		(struct doveadm_mailbox_cmd_context *)_ctx;
-
-	switch (c) {
-	case 's':
-		ctx->subscriptions = TRUE;
-		break;
-	default:
-		return FALSE;
-	}
-	return TRUE;
+	for (; *args != NULL; args++)
+		doveadm_mailbox_arg_check(*args);
 }
 
 #define doveadm_mailbox_cmd_alloc(type) \
-	(type *)doveadm_mailbox_cmd_alloc_size(sizeof(type))
-static struct doveadm_mail_cmd_context *
-doveadm_mailbox_cmd_alloc_size(size_t size)
-{
-	struct doveadm_mail_cmd_context *ctx;
-
-	ctx = doveadm_mail_cmd_alloc_size(size);
-	ctx->getopt_args = "s";
-	ctx->v.parse_arg = cmd_mailbox_parse_arg;
-	return ctx;
-}
-
-static bool
-cmd_mailbox_list_parse_arg(struct doveadm_mail_cmd_context *_ctx, int c)
-{
-	struct list_cmd_context *ctx = (struct list_cmd_context *)_ctx;
-
-	switch (c) {
-	case '7':
-		ctx->mutf7 = TRUE;
-		break;
-	case '8':
-		ctx->mutf7 = FALSE;
-		break;
-	case 's':
-		ctx->ctx.subscriptions = TRUE;
-		break;
-	default:
-		return FALSE;
-	}
-	return TRUE;
-}
+	((type *) doveadm_mail_cmd_alloc_size(sizeof(type)))
 
 static int
 cmd_mailbox_list_run(struct doveadm_mail_cmd_context *_ctx,
 		     struct mail_user *user)
 {
-	struct list_cmd_context *ctx = (struct list_cmd_context *)_ctx;
+	struct list_cmd_context *ctx =
+		container_of(_ctx, struct list_cmd_context, ctx.ctx);
+
 	enum mailbox_list_iter_flags iter_flags =
 		MAILBOX_LIST_ITER_RETURN_NO_FLAGS;
 	struct doveadm_mailbox_list_iter *iter;
@@ -187,19 +153,27 @@ doveadm_mail_mailbox_search_args_build(const char *const args[])
 	return search_args;
 }
 
-static void cmd_mailbox_list_init(struct doveadm_mail_cmd_context *_ctx,
-				  const char *const args[])
+static void cmd_mailbox_list_init(struct doveadm_mail_cmd_context *_ctx)
 {
-	struct list_cmd_context *ctx = (struct list_cmd_context *)_ctx;
+	struct doveadm_cmd_context *cctx = _ctx->cctx;
+	struct list_cmd_context *ctx =
+		container_of(_ctx, struct list_cmd_context, ctx.ctx);
 
+	ctx->ctx.subscriptions = doveadm_cmd_param_flag(cctx, "subscriptions");
+	ctx->mutf7 = doveadm_cmd_param_flag(cctx, "mutf7");
+	if (doveadm_cmd_param_flag(cctx, "utf8")) ctx->mutf7 = FALSE;
+
+	const char *const *args = empty_str_array;
+	(void)doveadm_cmd_param_array(cctx, "mailbox-mask", &args);
+	ctx->search_args = doveadm_mail_mailbox_search_args_build(args);
 	doveadm_print_header("mailbox", "mailbox",
 			     DOVEADM_PRINT_HEADER_FLAG_HIDE_TITLE);
-	ctx->search_args = doveadm_mail_mailbox_search_args_build(args);
 }
 
 static void cmd_mailbox_list_deinit(struct doveadm_mail_cmd_context *_ctx)
 {
-	struct list_cmd_context *ctx = (struct list_cmd_context *)_ctx;
+	struct list_cmd_context *ctx =
+		container_of(_ctx, struct list_cmd_context, ctx.ctx);
 
 	if (ctx->search_args != NULL)
 		mail_search_args_unref(&ctx->search_args);
@@ -213,8 +187,6 @@ static struct doveadm_mail_cmd_context *cmd_mailbox_list_alloc(void)
 	ctx->ctx.ctx.v.init = cmd_mailbox_list_init;
 	ctx->ctx.ctx.v.deinit = cmd_mailbox_list_deinit;
 	ctx->ctx.ctx.v.run = cmd_mailbox_list_run;
-	ctx->ctx.ctx.v.parse_arg = cmd_mailbox_list_parse_arg;
-	ctx->ctx.ctx.getopt_args = "78s";
 	doveadm_print_init(DOVEADM_PRINT_TYPE_FLOW);
 	return &ctx->ctx.ctx;
 }
@@ -223,7 +195,9 @@ static int
 cmd_mailbox_create_run(struct doveadm_mail_cmd_context *_ctx,
 		       struct mail_user *user)
 {
-	struct create_cmd_context *ctx = (struct create_cmd_context *)_ctx;
+	struct create_cmd_context *ctx =
+		container_of(_ctx, struct create_cmd_context, ctx.ctx);
+
 	struct mail_namespace *ns;
 	struct mailbox *box;
 	const char *name;
@@ -242,14 +216,16 @@ cmd_mailbox_create_run(struct doveadm_mail_cmd_context *_ctx,
 
 		box = mailbox_alloc(ns->list, name, 0);
 		if (mailbox_create(box, &ctx->update, directory) < 0) {
-			i_error("Can't create mailbox %s: %s", name,
+			e_error(ctx->ctx.ctx.cctx->event,
+				"Can't create mailbox %s: %s", name,
 				mailbox_get_last_internal_error(box, NULL));
 			doveadm_mail_failed_mailbox(_ctx, box);
 			ret = -1;
 		}
 		if (ctx->ctx.subscriptions) {
 			if (mailbox_set_subscribed(box, TRUE) < 0) {
-				i_error("Can't subscribe to mailbox %s: %s", name,
+				e_error(ctx->ctx.ctx.cctx->event,
+					"Can't subscribe to mailbox %s: %s", name,
 					mailbox_get_last_internal_error(box, NULL));
 				doveadm_mail_failed_mailbox(_ctx, box);
 				ret = -1;
@@ -260,40 +236,23 @@ cmd_mailbox_create_run(struct doveadm_mail_cmd_context *_ctx,
 	return ret;
 }
 
-static void cmd_mailbox_create_init(struct doveadm_mail_cmd_context *_ctx,
-				    const char *const args[])
+static void cmd_mailbox_create_init(struct doveadm_mail_cmd_context *_ctx)
 {
-	struct mailbox_cmd_context *ctx = (struct mailbox_cmd_context *)_ctx;
-	const char *name;
-	unsigned int i;
+	struct doveadm_cmd_context *cctx = _ctx->cctx;
+	struct create_cmd_context *ctx =
+		container_of(_ctx, struct create_cmd_context, ctx.ctx);
 
-	if (args[0] == NULL)
+	ctx->ctx.subscriptions = doveadm_cmd_param_flag(cctx, "subscriptions");
+
+	const char *guid;
+	if (doveadm_cmd_param_str(cctx, "guid", &guid) &&
+	    guid_128_from_string(guid, ctx->update.mailbox_guid) < 0)
 		doveadm_mail_help_name("mailbox create");
-	doveadm_mailbox_args_check(args);
 
-	for (i = 0; args[i] != NULL; i++) {
-		name = p_strdup(ctx->ctx.ctx.pool, args[i]);
-		array_push_back(&ctx->mailboxes, &name);
-	}
-}
+	if (!doveadm_cmd_param_array_append(cctx, "mailbox", &ctx->mailboxes))
+		doveadm_mail_help_name("mailbox create");
 
-static bool
-cmd_mailbox_create_parse_arg(struct doveadm_mail_cmd_context *_ctx, int c)
-{
-	struct create_cmd_context *ctx = (struct create_cmd_context *)_ctx;
-
-	switch (c) {
-	case 'g':
-		if (guid_128_from_string(optarg, ctx->update.mailbox_guid) < 0)
-			doveadm_mail_help_name("mailbox create");
-		break;
-	case 's':
-		ctx->ctx.subscriptions = TRUE;
-		break;
-	default:
-		return FALSE;
-	}
-	return TRUE;
+	doveadm_mailbox_args_check_array(&ctx->mailboxes);
 }
 
 static struct doveadm_mail_cmd_context *cmd_mailbox_create_alloc(void)
@@ -303,8 +262,6 @@ static struct doveadm_mail_cmd_context *cmd_mailbox_create_alloc(void)
 	ctx = doveadm_mailbox_cmd_alloc(struct create_cmd_context);
 	ctx->ctx.ctx.v.init = cmd_mailbox_create_init;
 	ctx->ctx.ctx.v.run = cmd_mailbox_create_run;
-	ctx->ctx.ctx.v.parse_arg = cmd_mailbox_create_parse_arg;
-	ctx->ctx.ctx.getopt_args = "g:s";
 	p_array_init(&ctx->mailboxes, ctx->ctx.ctx.pool, 16);
 	return &ctx->ctx.ctx;
 }
@@ -339,7 +296,9 @@ static int
 cmd_mailbox_delete_run(struct doveadm_mail_cmd_context *_ctx,
 		       struct mail_user *user)
 {
-	struct delete_cmd_context *ctx = (struct delete_cmd_context *)_ctx;
+	struct delete_cmd_context *ctx =
+		container_of(_ctx, struct delete_cmd_context, ctx.ctx);
+
 	struct mail_namespace *ns;
 	struct mailbox *box;
 	struct mail_storage *storage;
@@ -373,14 +332,16 @@ cmd_mailbox_delete_run(struct doveadm_mail_cmd_context *_ctx,
 		ret2 = ctx->require_empty ? mailbox_delete_empty(box) :
 			mailbox_delete(box);
 		if (ret2 < 0) {
-			i_error("Can't delete mailbox %s: %s", name,
+			e_error(ctx->ctx.ctx.cctx->event,
+				"Can't delete mailbox %s: %s", name,
 				mailbox_get_last_internal_error(box, NULL));
 			doveadm_mail_failed_mailbox(_ctx, box);
 			ret = -1;
 		}
 		if (ctx->ctx.subscriptions) {
 			if (mailbox_set_subscribed(box, FALSE) < 0) {
-				i_error("Can't unsubscribe mailbox %s: %s", name,
+				e_error(ctx->ctx.ctx.cctx->event,
+					"Can't unsubscribe mailbox %s: %s", name,
 					mail_storage_get_last_internal_error(storage, NULL));
 				doveadm_mail_failed_mailbox(_ctx, box);
 				ret = -1;
@@ -391,46 +352,22 @@ cmd_mailbox_delete_run(struct doveadm_mail_cmd_context *_ctx,
 	return ret;
 }
 
-static void cmd_mailbox_delete_init(struct doveadm_mail_cmd_context *_ctx,
-				    const char *const args[])
+static void cmd_mailbox_delete_init(struct doveadm_mail_cmd_context *_ctx)
 {
-	struct delete_cmd_context *ctx = (struct delete_cmd_context *)_ctx;
-	const char *name;
-	unsigned int i;
+	struct doveadm_cmd_context *cctx = _ctx->cctx;
+	struct delete_cmd_context *ctx =
+		container_of(_ctx, struct delete_cmd_context, ctx.ctx);
 
-	if (args[0] == NULL)
+	ctx->recursive = doveadm_cmd_param_flag(cctx, "recursive");
+	ctx->require_empty = doveadm_cmd_param_flag(cctx, "require-empty");
+	ctx->ctx.subscriptions = doveadm_cmd_param_flag(cctx, "subscriptions");
+	ctx->unsafe = doveadm_cmd_param_flag(cctx, "unsafe");
+
+	if (!doveadm_cmd_param_array_append(cctx, "mailbox", &ctx->mailboxes))
 		doveadm_mail_help_name("mailbox delete");
-	doveadm_mailbox_args_check(args);
 
-	for (i = 0; args[i] != NULL; i++) {
-		name = p_strdup(ctx->ctx.ctx.pool, args[i]);
-		array_push_back(&ctx->mailboxes, &name);
-	}
+	doveadm_mailbox_args_check_array(&ctx->mailboxes);
 	array_sort(&ctx->mailboxes, i_strcmp_reverse_p);
-}
-
-static bool
-cmd_mailbox_delete_parse_arg(struct doveadm_mail_cmd_context *_ctx, int c)
-{
-	struct delete_cmd_context *ctx = (struct delete_cmd_context *)_ctx;
-
-	switch (c) {
-	case 'r':
-		ctx->recursive = TRUE;
-		break;
-	case 's':
-		ctx->ctx.subscriptions = TRUE;
-		break;
-	case 'e':
-		ctx->require_empty = TRUE;
-		break;
-	case 'Z':
-		ctx->unsafe = TRUE;
-		break;
-	default:
-		return FALSE;
-	}
-	return TRUE;
 }
 
 static struct doveadm_mail_cmd_context *cmd_mailbox_delete_alloc(void)
@@ -440,8 +377,6 @@ static struct doveadm_mail_cmd_context *cmd_mailbox_delete_alloc(void)
 	ctx = doveadm_mailbox_cmd_alloc(struct delete_cmd_context);
 	ctx->ctx.ctx.v.init = cmd_mailbox_delete_init;
 	ctx->ctx.ctx.v.run = cmd_mailbox_delete_run;
-	ctx->ctx.ctx.v.parse_arg = cmd_mailbox_delete_parse_arg;
-	ctx->ctx.ctx.getopt_args = "ersZ";
 	p_array_init(&ctx->mailboxes, ctx->ctx.ctx.pool, 16);
 	return &ctx->ctx.ctx;
 }
@@ -450,7 +385,9 @@ static int
 cmd_mailbox_rename_run(struct doveadm_mail_cmd_context *_ctx,
 		       struct mail_user *user)
 {
-	struct rename_cmd_context *ctx = (struct rename_cmd_context *)_ctx;
+	struct rename_cmd_context *ctx =
+		container_of(_ctx, struct rename_cmd_context, ctx.ctx);
+
 	struct mail_namespace *oldns, *newns;
 	struct mailbox *oldbox, *newbox;
 	const char *oldname = ctx->oldname;
@@ -462,20 +399,23 @@ cmd_mailbox_rename_run(struct doveadm_mail_cmd_context *_ctx,
 	oldbox = mailbox_alloc(oldns->list, oldname, 0);
 	newbox = mailbox_alloc(newns->list, newname, 0);
 	if (mailbox_rename(oldbox, newbox) < 0) {
-		i_error("Can't rename mailbox %s to %s: %s", oldname, newname,
+		e_error(ctx->ctx.ctx.cctx->event,
+			"Can't rename mailbox %s to %s: %s", oldname, newname,
 			mailbox_get_last_internal_error(oldbox, NULL));
 		doveadm_mail_failed_mailbox(_ctx, oldbox);
 		ret = -1;
 	}
 	if (ctx->ctx.subscriptions) {
 		if (mailbox_set_subscribed(oldbox, FALSE) < 0) {
-			i_error("Can't unsubscribe mailbox %s: %s", ctx->oldname,
+			e_error(ctx->ctx.ctx.cctx->event,
+				"Can't unsubscribe mailbox %s: %s", ctx->oldname,
 				mailbox_get_last_internal_error(oldbox, NULL));
 			doveadm_mail_failed_mailbox(_ctx, oldbox);
 			ret = -1;
 		}
 		if (mailbox_set_subscribed(newbox, TRUE) < 0) {
-			i_error("Can't subscribe to mailbox %s: %s", ctx->newname,
+			e_error(ctx->ctx.ctx.cctx->event,
+				"Can't subscribe to mailbox %s: %s", ctx->newname,
 				mailbox_get_last_internal_error(newbox, NULL));
 			doveadm_mail_failed_mailbox(_ctx, newbox);
 			ret = -1;
@@ -487,17 +427,18 @@ cmd_mailbox_rename_run(struct doveadm_mail_cmd_context *_ctx,
 	return ret;
 }
 
-static void cmd_mailbox_rename_init(struct doveadm_mail_cmd_context *_ctx,
-				    const char *const args[])
+static void cmd_mailbox_rename_init(struct doveadm_mail_cmd_context *_ctx)
 {
-	struct rename_cmd_context *ctx = (struct rename_cmd_context *)_ctx;
+	struct doveadm_cmd_context *cctx = _ctx->cctx;
+	struct rename_cmd_context *ctx =
+		container_of(_ctx, struct rename_cmd_context, ctx.ctx);
 
-	if (str_array_length(args) != 2)
+	ctx->ctx.subscriptions = doveadm_cmd_param_flag(cctx, "subscriptions");
+	if (!doveadm_cmd_param_str(cctx, "mailbox", &ctx->oldname) ||
+	    !doveadm_cmd_param_str(cctx, "new-name", &ctx->newname))
 		doveadm_mail_help_name("mailbox rename");
-	doveadm_mailbox_args_check(args);
-
-	ctx->oldname = p_strdup(ctx->ctx.ctx.pool, args[0]);
-	ctx->newname = p_strdup(ctx->ctx.ctx.pool, args[1]);
+	doveadm_mailbox_arg_check(ctx->oldname);
+	doveadm_mailbox_arg_check(ctx->newname);
 }
 
 static struct doveadm_mail_cmd_context *cmd_mailbox_rename_alloc(void)
@@ -514,7 +455,9 @@ static int
 cmd_mailbox_subscribe_run(struct doveadm_mail_cmd_context *_ctx,
 			  struct mail_user *user)
 {
-	struct mailbox_cmd_context *ctx = (struct mailbox_cmd_context *)_ctx;
+	struct mailbox_cmd_context *ctx =
+		container_of(_ctx, struct mailbox_cmd_context, ctx.ctx);
+
 	struct mail_namespace *ns;
 	struct mailbox *box;
 	const char *name;
@@ -524,9 +467,10 @@ cmd_mailbox_subscribe_run(struct doveadm_mail_cmd_context *_ctx,
 		ns = mail_namespace_find(user->namespaces, name);
 		box = mailbox_alloc(ns->list, name, 0);
 		if (mailbox_set_subscribed(box, ctx->ctx.subscriptions) < 0) {
-			i_error("Can't %s mailbox %s: %s", name,
-				ctx->ctx.subscriptions ? "subscribe to" :
-				"unsubscribe",
+			e_error(ctx->ctx.ctx.cctx->event,
+				"Can't %s mailbox %s: %s", name,
+				ctx->ctx.subscriptions ?
+					"subscribe to" : "unsubscribe",
 				mailbox_get_last_internal_error(box, NULL));
 			doveadm_mail_failed_mailbox(_ctx, box);
 			ret = -1;
@@ -536,24 +480,18 @@ cmd_mailbox_subscribe_run(struct doveadm_mail_cmd_context *_ctx,
 	return ret;
 }
 
-static void cmd_mailbox_subscribe_init(struct doveadm_mail_cmd_context *_ctx,
-				       const char *const args[])
+static void cmd_mailbox_subscribe_init(struct doveadm_mail_cmd_context *_ctx)
 {
-	struct mailbox_cmd_context *ctx = (struct mailbox_cmd_context *)_ctx;
-	const char *name;
-	unsigned int i;
+	struct doveadm_cmd_context *cctx = _ctx->cctx;
+	struct mailbox_cmd_context *ctx =
+		container_of(_ctx, struct mailbox_cmd_context, ctx.ctx);
 
-	if (args[0] == NULL) {
+	if (!doveadm_cmd_param_array_append(cctx, "mailbox", &ctx->mailboxes))
 		doveadm_mail_help_name(ctx->ctx.subscriptions ?
 				       "mailbox subscribe" :
 				       "mailbox unsubscribe");
-	}
-	doveadm_mailbox_args_check(args);
 
-	for (i = 0; args[i] != NULL; i++) {
-		name = p_strdup(ctx->ctx.ctx.pool, args[i]);
-		array_push_back(&ctx->mailboxes, &name);
-	}
+	doveadm_mailbox_args_check_array(&ctx->mailboxes);
 }
 
 static struct doveadm_mail_cmd_context *
@@ -564,7 +502,6 @@ cmd_mailbox_subscriptions_alloc(bool subscriptions)
 	ctx = doveadm_mail_cmd_alloc(struct mailbox_cmd_context);
 	ctx->ctx.subscriptions = subscriptions;
 
-	ctx->ctx.ctx.v.parse_arg = cmd_mailbox_parse_arg;
 	ctx->ctx.ctx.v.init = cmd_mailbox_subscribe_init;
 	ctx->ctx.ctx.v.run = cmd_mailbox_subscribe_run;
 	p_array_init(&ctx->mailboxes, ctx->ctx.ctx.pool, 16);
@@ -582,67 +519,39 @@ static struct doveadm_mail_cmd_context *cmd_mailbox_unsubscribe_alloc(void)
 }
 
 static
-void cmd_mailbox_update_init(struct doveadm_mail_cmd_context *_ctx,
-			     const char *const args[])
+void cmd_mailbox_update_init(struct doveadm_mail_cmd_context *_ctx)
 {
-	struct update_cmd_context *ctx = (struct update_cmd_context *)_ctx;
+	struct doveadm_cmd_context *cctx = _ctx->cctx;
+	struct update_cmd_context *ctx =
+		container_of(_ctx, struct update_cmd_context, ctx.ctx);
 
-	if (str_array_length(args) != 1)
+	const char *value_str;
+	if (doveadm_cmd_param_str(cctx, "mailbox-guid", &value_str) &&
+	    guid_128_from_string(value_str, ctx->update.mailbox_guid) < 0)
 		doveadm_mail_help_name("mailbox update");
 
-	doveadm_mailbox_args_check(args);
+	(void)doveadm_cmd_param_uint32(cctx, "uid-validity", &ctx->update.uid_validity);
+	(void)doveadm_cmd_param_uint32(cctx, "min-next-uid", &ctx->update.min_next_uid);
+	(void)doveadm_cmd_param_uint32(cctx, "min-first-recent-uid", &ctx->update.min_first_recent_uid);
+	(void)doveadm_cmd_param_uint64(cctx, "min-highest-modseq", &ctx->update.min_highest_modseq);
+	(void)doveadm_cmd_param_uint64(cctx, "min-highest-pvt-modseq", &ctx->update.min_highest_pvt_modseq);
 
-	ctx->mailbox = args[0];
+	if (ctx->update.min_first_recent_uid > ctx->update.min_next_uid &&
+	    ctx->update.min_first_recent_uid + ctx->update.min_next_uid > 0)
+		i_fatal_status(EX_DATAERR, "min_first_recent_uid > min_next_uid");
 
-	if ((ctx->update.min_first_recent_uid != 0 ||
-	     ctx->update.min_next_uid != 0) &&
-	    ctx->update.min_first_recent_uid > ctx->update.min_next_uid) {
-		i_fatal_status(EX_DATAERR,
-			"min_first_recent_uid > min_next_uid");
-	}
-}
-
-static
-bool cmd_mailbox_update_parse_arg(struct doveadm_mail_cmd_context *_ctx, int c)
-{
-	struct update_cmd_context *ctx = (struct update_cmd_context *)_ctx;
-
-	switch (c) {
-	case 'g':
-		if (guid_128_from_string(optarg, ctx->update.mailbox_guid) < 0)
-			doveadm_mail_help_name("mailbox update");
-		break;
-	case 'V':
-		if (str_to_uint32(optarg, &(ctx->update.uid_validity)) < 0)
-			doveadm_mail_help_name("mailbox update");
-		break;
-	case 'N':
-		if (str_to_uint32(optarg, &(ctx->update.min_next_uid)) < 0)
-			doveadm_mail_help_name("mailbox update");
-		break;
-	case 'R':
-		if (str_to_uint32(optarg, &(ctx->update.min_first_recent_uid)) < 0)
-			doveadm_mail_help_name("mailbox update");
-		break;
-	case 'H':
-		if (str_to_uint64(optarg, &(ctx->update.min_highest_modseq)) < 0)
-			doveadm_mail_help_name("mailbox update");
-		break;
-	case 'P':
-		if (str_to_uint64(optarg, &(ctx->update.min_highest_pvt_modseq)) < 0)
-			doveadm_mail_help_name("mailbox update");
-		break;
-	default:
-		return FALSE;
-	}
-	return TRUE;
+	if (!doveadm_cmd_param_str(cctx, "mailbox", &ctx->mailbox))
+		doveadm_mail_help_name("mailbox update");
+	doveadm_mailbox_arg_check(ctx->mailbox);
 }
 
 static
 int cmd_mailbox_update_run(struct doveadm_mail_cmd_context *_ctx,
 			   struct mail_user *user)
 {
-	struct update_cmd_context *ctx = (struct update_cmd_context *)_ctx;
+	struct update_cmd_context *ctx =
+		container_of(_ctx, struct update_cmd_context, ctx.ctx);
+
 	struct mail_namespace *ns;
 	struct mailbox *box;
 	enum mail_error mail_error;
@@ -652,9 +561,10 @@ int cmd_mailbox_update_run(struct doveadm_mail_cmd_context *_ctx,
 	box = mailbox_alloc(ns->list, ctx->mailbox, 0);
 
 	if ((ret = mailbox_update(box, &(ctx->update))) != 0) {
-		i_error("Cannot update %s: %s",
-			ctx->mailbox,
-			mailbox_get_last_internal_error(box, &mail_error));
+		const char *error = mailbox_get_last_internal_error(
+			box, &mail_error);
+		e_error(ctx->ctx.ctx.cctx->event,
+			"Cannot update %s: %s", ctx->mailbox, error);
 		doveadm_mail_failed_error(_ctx, mail_error);
 	}
 
@@ -668,25 +578,9 @@ struct doveadm_mail_cmd_context *cmd_mailbox_update_alloc(void)
 {
 	struct update_cmd_context *ctx;
 	ctx = doveadm_mail_cmd_alloc(struct update_cmd_context);
-	ctx->ctx.ctx.v.parse_arg = cmd_mailbox_update_parse_arg;
 	ctx->ctx.ctx.v.init = cmd_mailbox_update_init;
 	ctx->ctx.ctx.v.run = cmd_mailbox_update_run;
 	return &ctx->ctx.ctx;
-}
-
-static void
-cmd_mailbox_path_init(struct doveadm_mail_cmd_context *_ctx,
-		      const char *const args[])
-{
-	struct update_cmd_context *ctx = (struct update_cmd_context *)_ctx;
-
-	if (str_array_length(args) != 1)
-		doveadm_mail_help_name("mailbox path");
-
-	doveadm_mailbox_args_check(args);
-
-	ctx->mailbox = args[0];
-	doveadm_print_header("path", "path", DOVEADM_PRINT_HEADER_FLAG_HIDE_TITLE);
 }
 
 static bool
@@ -704,27 +598,35 @@ mailbox_list_path_type_name_parse(const char *name,
 	return FALSE;
 }
 
-static bool
-cmd_mailbox_path_parse_arg(struct doveadm_mail_cmd_context *_ctx, int c)
+static void
+cmd_mailbox_path_init(struct doveadm_mail_cmd_context *_ctx)
 {
-	struct path_cmd_context *ctx = (struct path_cmd_context *)_ctx;
+	struct doveadm_cmd_context *cctx = _ctx->cctx;
+	struct path_cmd_context *ctx =
+		container_of(_ctx, struct path_cmd_context, ctx.ctx);
 
-	switch (c) {
-	case 't':
-		if (!mailbox_list_path_type_name_parse(optarg, &ctx->path_type))
-			doveadm_mail_help_name("mailbox path");
-		break;
-	default:
-		return FALSE;
-	}
-	return TRUE;
+	const char *value_str;
+	if (doveadm_cmd_param_str(cctx, "type", &value_str) &&
+	    !mailbox_list_path_type_name_parse(value_str, &ctx->path_type))
+		doveadm_mail_help_name("mailbox path");
+
+	const char *const *args;
+	if (!doveadm_cmd_param_array(cctx, "mailbox", &args) ||
+	    args[1] != NULL)
+		doveadm_mail_help_name("mailbox path");
+	ctx->mailbox = args[0];
+
+	doveadm_mailbox_arg_check(ctx->mailbox);
+	doveadm_print_header("path", "path", DOVEADM_PRINT_HEADER_FLAG_HIDE_TITLE);
 }
 
 static int
 cmd_mailbox_path_run(struct doveadm_mail_cmd_context *_ctx,
 		     struct mail_user *user)
 {
-	struct path_cmd_context *ctx = (struct path_cmd_context *)_ctx;
+	struct path_cmd_context *ctx =
+		container_of(_ctx, struct path_cmd_context, ctx.ctx);
+
 	struct mail_namespace *ns;
 	enum mail_error mail_error;
 	const char *storage_name, *path;
@@ -734,9 +636,11 @@ cmd_mailbox_path_run(struct doveadm_mail_cmd_context *_ctx,
 	storage_name = mailbox_list_get_storage_name(ns->list, ctx->mailbox);
 	ret = mailbox_list_get_path(ns->list, storage_name, ctx->path_type, &path);
 	if (ret < 0) {
-		i_error("Failed to lookup mailbox %s path: %s",
-			ctx->mailbox,
-			mailbox_list_get_last_internal_error(ns->list, &mail_error));
+		const char *error = mailbox_list_get_last_internal_error(
+			ns->list, &mail_error);
+		e_error(ctx->ctx.ctx.cctx->event,
+			"Failed to lookup mailbox %s path: %s",
+			ctx->mailbox, error);
 		doveadm_mail_failed_error(_ctx, mail_error);
 	} else if (ret > 0) {
 		doveadm_print(path);
@@ -750,7 +654,6 @@ static struct doveadm_mail_cmd_context *cmd_mailbox_path_alloc(void)
 
 	ctx = doveadm_mail_cmd_alloc(struct path_cmd_context);
 	ctx->path_type = MAILBOX_LIST_PATH_TYPE_INDEX;
-	ctx->ctx.ctx.v.parse_arg = cmd_mailbox_path_parse_arg;
 	ctx->ctx.ctx.v.init = cmd_mailbox_path_init;
 	ctx->ctx.ctx.v.run = cmd_mailbox_path_run;
 	doveadm_print_init(DOVEADM_PRINT_TYPE_FLOW);
@@ -835,11 +738,11 @@ struct doveadm_cmd_ver2 doveadm_cmd_mailbox_update_ver2 = {
 DOVEADM_CMD_PARAMS_START
 DOVEADM_CMD_MAIL_COMMON
 DOVEADM_CMD_PARAM('g', "mailbox-guid", CMD_PARAM_STR, 0)
-DOVEADM_CMD_PARAM('V', "uid-validity", CMD_PARAM_STR, 0)
-DOVEADM_CMD_PARAM('N', "min-next-uid", CMD_PARAM_STR, 0)
-DOVEADM_CMD_PARAM('R', "min-first-recent-uid", CMD_PARAM_STR, 0)
-DOVEADM_CMD_PARAM('H', "min-highest-modseq", CMD_PARAM_STR, 0)
-DOVEADM_CMD_PARAM('P', "min-highest-pvt-modseq", CMD_PARAM_STR, 0)
+DOVEADM_CMD_PARAM('V', "uid-validity", CMD_PARAM_INT64, CMD_PARAM_FLAG_UNSIGNED)
+DOVEADM_CMD_PARAM('N', "min-next-uid", CMD_PARAM_INT64, CMD_PARAM_FLAG_UNSIGNED)
+DOVEADM_CMD_PARAM('R', "min-first-recent-uid", CMD_PARAM_INT64, CMD_PARAM_FLAG_UNSIGNED)
+DOVEADM_CMD_PARAM('H', "min-highest-modseq", CMD_PARAM_INT64, CMD_PARAM_FLAG_UNSIGNED)
+DOVEADM_CMD_PARAM('P', "min-highest-pvt-modseq", CMD_PARAM_INT64, CMD_PARAM_FLAG_UNSIGNED)
 DOVEADM_CMD_PARAM('\0', "mailbox", CMD_PARAM_STR, CMD_PARAM_FLAG_POSITIONAL)
 DOVEADM_CMD_PARAMS_END
 };
@@ -850,6 +753,7 @@ struct doveadm_cmd_ver2 doveadm_cmd_mailbox_path_ver2 = {
 	.usage = DOVEADM_CMD_MAIL_USAGE_PREFIX"[-t <type>] <mailbox>",
 DOVEADM_CMD_PARAMS_START
 DOVEADM_CMD_MAIL_COMMON
+/* should be CMD_PARAM_STR but it would break the http API */
 DOVEADM_CMD_PARAM('\0', "mailbox", CMD_PARAM_ARRAY, CMD_PARAM_FLAG_POSITIONAL)
 DOVEADM_CMD_PARAM('t', "type", CMD_PARAM_STR, 0)
 DOVEADM_CMD_PARAMS_END

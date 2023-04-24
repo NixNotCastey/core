@@ -111,6 +111,14 @@ void *buffer_get_modifiable_data(const buffer_t *buf, size_t *used_size_r)
    the contents. */
 void buffer_set_used_size(buffer_t *buf, size_t used_size);
 
+/* Clear the buffer. */
+static inline void buffer_clear(buffer_t *buf)
+{
+	buffer_set_used_size(buf, 0);
+}
+/* Clear the buffer, but also make sure any contents is zeroed out. */
+void buffer_clear_safe(buffer_t *_buf);
+
 /* Returns the current buffer size. */
 size_t buffer_get_size(const buffer_t *buf) ATTR_PURE;
 /* Returns how many bytes we can write to buffer without increasing its size.
@@ -148,7 +156,7 @@ buffer_get_used_size(const buffer_t *buf)
 void buffer_verify_pool(buffer_t *buf);
 
 /* This will truncate your byte buffer to contain at most
-   given number of bits. 
+   given number of bits.
 
  1 bits:    01 00000001
  2 bits:    03 00000011

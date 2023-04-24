@@ -6,7 +6,7 @@
 #include "llist.h"
 #include "mail-storage.h"
 #include "str.h"
-#include "str-sanitize.h"
+#include "str-parse.h"
 #include "sha1.h"
 #include "unichar.h"
 #include "hex-binary.h"
@@ -21,7 +21,6 @@
 #include "var-expand.h"
 #include "dsasl-client.h"
 #include "imap-date.h"
-#include "settings-parser.h"
 #include "mail-index-private.h"
 #include "mail-index-alloc-cache.h"
 #include "mailbox-tree.h"
@@ -320,7 +319,7 @@ mail_storage_match_class(struct mail_storage *storage,
 
 	if ((storage->class_flags & MAIL_STORAGE_CLASS_FLAG_UNIQUE_ROOT) != 0 &&
 	    strcmp(storage->unique_root_dir,
-	    	(set->root_dir != NULL ? set->root_dir : "")) != 0)
+		(set->root_dir != NULL ? set->root_dir : "")) != 0)
 		return FALSE;
 
 	if (strcmp(storage->name, "shared") == 0) {
@@ -344,10 +343,11 @@ mail_storage_find(struct mail_user *user,
 	return NULL;
 }
 
-int mail_storage_create_full(struct mail_namespace *ns, const char *driver,
-			     const char *data, enum mail_storage_flags flags,
-			     struct mail_storage **storage_r,
-			     const char **error_r)
+static int
+mail_storage_create_full_real(struct mail_namespace *ns, const char *driver,
+			      const char *data, enum mail_storage_flags flags,
+			      struct mail_storage **storage_r,
+			      const char **error_r)
 {
 	struct mail_storage *storage_class, *storage = NULL;
 	struct mailbox_list *list;
@@ -428,9 +428,15 @@ int mail_storage_create_full(struct mail_namespace *ns, const char *driver,
 	storage->user = ns->user;
 	storage->set = ns->mail_set;
 	storage->flags = flags;
+	/* Set to UINT32_MAX manually to denote 'unset', as the default 0 is
+	   used for mails currently being saved. */
+	storage->last_internal_error_mail_uid = UINT32_MAX;
+
 	storage->event = event_create(ns->user->event);
 	if (storage_class->event_category != NULL)
 		event_add_category(storage->event, storage_class->event_category);
+	event_set_append_log_prefix(
+		storage->event, t_strdup_printf("%s: ", storage_class->name));
 	p_array_init(&storage->module_contexts, storage->pool, 5);
 
 	if (storage->v.create != NULL &&
@@ -472,6 +478,19 @@ int mail_storage_create_full(struct mail_namespace *ns, const char *driver,
 	return 0;
 }
 
+int mail_storage_create_full(struct mail_namespace *ns, const char *driver,
+			     const char *data, enum mail_storage_flags flags,
+			     struct mail_storage **storage_r,
+			     const char **error_r)
+{
+	int ret;
+	T_BEGIN {
+		ret = mail_storage_create_full_real(ns, driver, data, flags,
+						    storage_r, error_r);
+	} T_END_PASS_STR_IF(ret < 0, error_r);
+	return ret;
+}
+
 int mail_storage_create(struct mail_namespace *ns, const char *driver,
 			enum mail_storage_flags flags, const char **error_r)
 {
@@ -504,8 +523,7 @@ void mail_storage_unref(struct mail_storage **_storage)
 	DLLIST_REMOVE(&storage->user->storages, storage);
 
 	storage->v.destroy(storage);
-	i_free(storage->last_internal_error);
-	i_free(storage->error_string);
+	mail_storage_clear_error(storage);
 	if (array_is_created(&storage->error_stack)) {
 		i_assert(array_count(&storage->error_stack) == 0);
 		array_free(&storage->error_stack);
@@ -543,8 +561,10 @@ void mail_storage_clear_error(struct mail_storage *storage)
 	i_free_and_null(storage->error_string);
 
 	i_free(storage->last_internal_error);
+	i_free(storage->last_internal_error_mailbox);
 	storage->last_error_is_internal = FALSE;
 	storage->error = MAIL_ERROR_NONE;
+	storage->last_internal_error_mail_uid = UINT32_MAX;
 }
 
 void mail_storage_set_error(struct mail_storage *storage,
@@ -556,6 +576,7 @@ void mail_storage_set_error(struct mail_storage *storage,
 	}
 	storage->last_error_is_internal = FALSE;
 	storage->error = error;
+	storage->last_internal_error_mail_uid = UINT32_MAX;
 }
 
 void mail_storage_set_internal_error(struct mail_storage *storage)
@@ -572,32 +593,50 @@ void mail_storage_set_internal_error(struct mail_storage *storage)
 	   last_error_is_internal can't be TRUE. */
 	storage->last_error_is_internal = FALSE;
 	i_free(storage->last_internal_error);
+	i_free(storage->last_internal_error_mailbox);
+	storage->last_internal_error_mail_uid = UINT32_MAX;
 }
 
-void mail_storage_set_critical(struct mail_storage *storage,
-			       const char *fmt, ...)
+static void
+mail_storage_set_critical_error(struct mail_storage *storage, const char *str,
+				const char *mailbox_vname, uint32_t mail_uid)
 {
 	char *old_error = storage->error_string;
 	char *old_internal_error = storage->last_internal_error;
-	va_list va;
+	char *old_internal_error_mailbox = storage->last_internal_error_mailbox;
 
 	storage->error_string = NULL;
 	storage->last_internal_error = NULL;
+	storage->last_internal_error_mailbox = NULL;
 	/* critical errors may contain sensitive data, so let user
 	   see only "Internal error" with a timestamp to make it
 	   easier to look from log files the actual error message. */
 	mail_storage_set_internal_error(storage);
 
-	va_start(va, fmt);
-	storage->last_internal_error = i_strdup_vprintf(fmt, va);
-	va_end(va);
+	storage->last_internal_error = i_strdup(str);
+	storage->last_internal_error_mailbox = i_strdup(mailbox_vname);
+	storage->last_internal_error_mail_uid = mail_uid;
 	storage->last_error_is_internal = TRUE;
-	e_error(storage->event, "%s", storage->last_internal_error);
 
 	/* free the old_error and old_internal_error only after the new error
 	   is generated, because they may be one of the parameters. */
 	i_free(old_error);
 	i_free(old_internal_error);
+	i_free(old_internal_error_mailbox);
+}
+
+void mail_storage_set_critical(struct mail_storage *storage,
+			       const char *fmt, ...)
+{
+	va_list va;
+
+	va_start(va, fmt);
+	T_BEGIN {
+		const char *str = t_strdup_vprintf(fmt, va);
+		mail_storage_set_critical_error(storage, str, NULL, UINT32_MAX);
+		e_error(storage->event, "%s", str);
+	} T_END;
+	va_end(va);
 }
 
 void mailbox_set_critical(struct mailbox *box, const char *fmt, ...)
@@ -606,8 +645,10 @@ void mailbox_set_critical(struct mailbox *box, const char *fmt, ...)
 
 	va_start(va, fmt);
 	T_BEGIN {
-		mail_storage_set_critical(box->storage, "Mailbox %s: %s",
-			box->vname, t_strdup_vprintf(fmt, va));
+		const char *str = t_strdup_vprintf(fmt, va);
+		mail_storage_set_critical_error(box->storage, str, box->vname,
+						UINT32_MAX);
+		e_error(box->event, "%s", str);
 	} T_END;
 	va_end(va);
 }
@@ -618,17 +659,17 @@ void mail_set_critical(struct mail *mail, const char *fmt, ...)
 
 	va_start(va, fmt);
 	T_BEGIN {
-		if (mail->saving) {
-			mailbox_set_critical(mail->box, "Saving mail: %s",
-				t_strdup_vprintf(fmt, va));
-		} else {
-			mailbox_set_critical(mail->box, "UID=%u: %s",
-				mail->uid, t_strdup_vprintf(fmt, va));
-		}
+		const char *formatted_msg = t_strdup_vprintf(fmt, va);
+		mail_storage_set_critical_error(mail->box->storage, formatted_msg,
+						mail->box->vname, mail->uid);
+		e_error(mail_event(mail), "%s", formatted_msg);
 	} T_END;
 	va_end(va);
 }
 
+/* Note: mail_storage_get_last_internal_error() will always include
+	 the mailbox prefix, while mailbox_get_last_internal_error() and
+	 mail_get_last_internal_error() usually will not. */
 const char *mail_storage_get_last_internal_error(struct mail_storage *storage,
 						 enum mail_error *error_r)
 {
@@ -636,16 +677,79 @@ const char *mail_storage_get_last_internal_error(struct mail_storage *storage,
 		*error_r = storage->error;
 	if (storage->last_error_is_internal) {
 		i_assert(storage->last_internal_error != NULL);
+
+		bool is_mailbox_error_set = storage->last_internal_error_mailbox != NULL;
+		bool is_mail_error_set =
+			storage->last_internal_error_mail_uid != UINT32_MAX;
+
+		if (is_mail_error_set) {
+			i_assert(is_mailbox_error_set);
+			return t_strdup_printf(
+				"Mailbox %s: UID %u: %s",
+				mailbox_name_sanitize(storage->last_internal_error_mailbox),
+				storage->last_internal_error_mail_uid,
+				storage->last_internal_error);
+		}
+		if (is_mailbox_error_set)
+			return t_strdup_printf(
+				"Mailbox %s: %s",
+				mailbox_name_sanitize(storage->last_internal_error_mailbox),
+				storage->last_internal_error);
+
 		return storage->last_internal_error;
 	}
 	return mail_storage_get_last_error(storage, error_r);
 }
 
+/* Note: mailbox_get_last_internal_error() will include the mailbox prefix only
+	 when mailbox->vname does not match last_internal_error_mailbox, which
+	 might happen with e.g. virtual mailboxes logging about physical
+	 mailboxes, while mail_storage_get_last_internal_error() always does. */
 const char *mailbox_get_last_internal_error(struct mailbox *box,
 					    enum mail_error *error_r)
 {
-	return mail_storage_get_last_internal_error(mailbox_get_storage(box),
-						    error_r);
+	struct mail_storage *storage = mailbox_get_storage(box);
+	const char *last_mailbox = storage->last_internal_error_mailbox;
+	if (last_mailbox != NULL &&
+	    strcmp(last_mailbox, box->vname) != 0)
+		return mail_storage_get_last_internal_error(storage, error_r);
+
+	if (error_r != NULL)
+		*error_r = storage->error;
+	if (storage->last_error_is_internal) {
+		i_assert(storage->last_internal_error != NULL);
+		if (storage->last_internal_error_mail_uid != UINT32_MAX)
+			return t_strdup_printf("UID %u: %s",
+					       storage->last_internal_error_mail_uid,
+					       storage->last_internal_error);
+		return storage->last_internal_error;
+	}
+	return mail_storage_get_last_error(storage, error_r);
+}
+
+/* Note: mail_get_last_internal_error() will include the mail prefix only when
+	 mail->uid does not match last_internal_error_mail_uid, while
+	 mail_storage_get_last_internal_error() always does. */
+const char *
+mail_get_last_internal_error(struct mail *mail, enum mail_error *error_r)
+{
+	struct mail_storage *storage = mailbox_get_storage(mail->box);
+	const char *last_mailbox = storage->last_internal_error_mailbox;
+	if (last_mailbox != NULL &&
+	    strcmp(last_mailbox, mail->box->vname) != 0)
+		return mail_storage_get_last_internal_error(storage, error_r);
+
+	uint32_t last_mail_uid = storage->last_internal_error_mail_uid;
+	if (last_mail_uid == UINT32_MAX || last_mail_uid != mail->uid)
+		return mailbox_get_last_internal_error(mail->box, error_r);
+
+	if (error_r != NULL)
+		*error_r = storage->error;
+	if (storage->last_error_is_internal) {
+		i_assert(storage->last_internal_error != NULL);
+		return storage->last_internal_error;
+	}
+	return mail_storage_get_last_error(storage, error_r);
 }
 
 void mail_storage_copy_error(struct mail_storage *dest,
@@ -677,6 +781,8 @@ void mailbox_set_index_error(struct mailbox *box)
 		mailbox_set_deleted(box);
 		mail_index_reset_error(box->index);
 	} else {
+		i_free(box->storage->last_internal_error_mailbox);
+		box->storage->last_internal_error_mailbox = i_strdup(box->vname);
 		mail_storage_set_index_error(box->storage, box->index);
 	}
 }
@@ -717,8 +823,14 @@ void mail_storage_set_callbacks(struct mail_storage *storage,
 
 int mail_storage_purge(struct mail_storage *storage)
 {
-	return storage->v.purge == NULL ? 0 :
-		storage->v.purge(storage);
+	if (storage->v.purge == NULL)
+		return 0;
+
+	int ret;
+	T_BEGIN {
+		ret = storage->v.purge(storage);
+	} T_END;
+	return ret;
 }
 
 const char *mail_storage_get_last_error(struct mail_storage *storage,
@@ -770,8 +882,17 @@ void mail_storage_last_error_push(struct mail_storage *storage)
 	err->error_string = i_strdup(storage->error_string);
 	err->error = storage->error;
 	err->last_error_is_internal = storage->last_error_is_internal;
-	if (err->last_error_is_internal)
+	/* Initially set to UINT32_MAX manually to denote 'unset', as the
+	   default 0 is used for mails currently being saved. If there is no
+	   internal error, the attribute would not be set otherwise. */
+	err->last_internal_error_mail_uid = UINT32_MAX;
+	if (err->last_error_is_internal) {
 		err->last_internal_error = i_strdup(storage->last_internal_error);
+		err->last_internal_error_mailbox =
+			i_strdup(storage->last_internal_error_mailbox);
+		err->last_internal_error_mail_uid =
+			storage->last_internal_error_mail_uid;
+	}
 }
 
 void mail_storage_last_error_pop(struct mail_storage *storage)
@@ -782,10 +903,13 @@ void mail_storage_last_error_pop(struct mail_storage *storage)
 
 	i_free(storage->error_string);
 	i_free(storage->last_internal_error);
+	i_free(storage->last_internal_error_mailbox);
 	storage->error_string = err->error_string;
 	storage->error = err->error;
 	storage->last_error_is_internal = err->last_error_is_internal;
 	storage->last_internal_error = err->last_internal_error;
+	storage->last_internal_error_mailbox = err->last_internal_error_mailbox;
+	storage->last_internal_error_mail_uid = err->last_internal_error_mail_uid;
 	array_delete(&storage->error_stack, count-1, 1);
 }
 
@@ -871,7 +995,12 @@ struct mailbox *mailbox_alloc(struct mailbox_list *list, const char *vname,
 	}
 
 	T_BEGIN {
-		if (mailbox_list_get_storage(&new_list, vname, &storage) < 0) {
+		const char *orig_vname = vname;
+		enum mailbox_list_get_storage_flags storage_flags = 0;
+		if ((flags & MAILBOX_FLAG_SAVEONLY) != 0)
+			storage_flags |= MAILBOX_LIST_GET_STORAGE_FLAG_SAVEONLY;
+		if (mailbox_list_get_storage(&new_list, &vname,
+					     storage_flags, &storage) < 0) {
 			/* do a delayed failure at mailbox_open() */
 			storage = mail_namespace_get_default_storage(list->ns);
 			errstr = mailbox_list_get_last_error(new_list, &open_error);
@@ -883,6 +1012,8 @@ struct mailbox *mailbox_alloc(struct mailbox_list *list, const char *vname,
 		box->open_error = open_error;
 		if (open_error != 0)
 			mail_storage_set_error(storage, open_error, errstr);
+		if (strcmp(orig_vname, vname) != 0)
+			box->mailbox_not_original = TRUE;
 		hook_mailbox_allocated(box);
 	} T_END;
 
@@ -956,7 +1087,7 @@ str_contains_special_use(const char *str, const char *special_use)
 
 static int
 namespace_find_special_use(struct mail_namespace *ns, const char *special_use,
-		           const char **vname_r, enum mail_error *error_code_r)
+			   const char **vname_r, enum mail_error *error_code_r)
 {
 	struct mailbox_list *list = ns->list;
 	struct mailbox_list_iterate_context *ctx;
@@ -1243,7 +1374,7 @@ static int mailbox_verify_name_int(struct mailbox *box)
 	if (!mailbox_verify_name_prefix(box->list->ns, &vname, &error)) {
 		mail_storage_set_error(box->storage, MAIL_ERROR_PARAMS,
 			t_strdup_printf("Invalid mailbox name '%s': %s",
-					str_sanitize(vname, 80), error));
+					mailbox_name_sanitize(vname), error));
 		return -1;
 	}
 
@@ -1430,7 +1561,11 @@ int mailbox_exists(struct mailbox *box, bool auto_boxes,
 		return 0;
 	}
 
-	if (box->v.exists(box, auto_boxes, existence_r) < 0)
+	int ret;
+	T_BEGIN {
+		ret = box->v.exists(box, auto_boxes, existence_r);
+	} T_END;
+	if (ret < 0)
 		return -1;
 
 	if (!box->inbox_user && *existence_r == MAILBOX_EXISTENCE_NOSELECT &&
@@ -1485,10 +1620,7 @@ mailbox_open_full(struct mailbox *box, struct istream *input)
 		i_stream_ref(box->input);
 	}
 
-	T_BEGIN {
-		ret = box->v.open(box);
-	} T_END;
-
+	ret = box->v.open(box);
 	if (ret < 0 && box->storage->error == MAIL_ERROR_NOTFOUND &&
 	    !box->deleting && !box->creating &&
 	    box->input == NULL && mailbox_is_autocreated(box)) T_BEGIN {
@@ -1534,7 +1666,12 @@ static bool mailbox_try_undelete(struct mailbox *box)
 
 int mailbox_open(struct mailbox *box)
 {
-	if (mailbox_open_full(box, NULL) < 0) {
+	int ret;
+
+	T_BEGIN {
+		ret = mailbox_open_full(box, NULL);
+	} T_END;
+	if (ret < 0) {
 		if (!box->mailbox_deleted || box->mailbox_undeleting)
 			return -1;
 
@@ -1549,7 +1686,10 @@ int mailbox_open(struct mailbox *box)
 		   may not have fully opened the mailbox while it was being
 		   undeleted. */
 		mailbox_close(box);
-		if (mailbox_open_full(box, NULL) < 0)
+		T_BEGIN {
+			ret = mailbox_open_full(box, NULL);
+		} T_END;
+		if (ret < 0)
 			return -1;
 	}
 	return 0;
@@ -1613,7 +1753,12 @@ int mailbox_enable(struct mailbox *box, enum mailbox_feature features)
 {
 	if (mailbox_verify_name(box) < 0)
 		return -1;
-	return box->v.enable(box, features);
+
+	int ret;
+	T_BEGIN {
+		ret = box->v.enable(box, features);
+	} T_END;
+	return ret;
 }
 
 enum mailbox_feature mailbox_get_enabled_features(struct mailbox *box)
@@ -1640,7 +1785,9 @@ void mailbox_close(struct mailbox *box)
 		i_panic("Trying to close mailbox %s with open transactions",
 			box->name);
 	}
-	box->v.close(box);
+	T_BEGIN {
+		box->v.close(box);
+	} T_END;
 
 	if (box->storage->binary_cache.box == box)
 		mail_storage_free_binary_cache(box->storage);
@@ -1682,7 +1829,7 @@ bool mailbox_equals(const struct mailbox *box1,
 	if (ns1 != ns2)
 		return FALSE;
 
-        name1 = mailbox_get_vname(box1);
+	name1 = mailbox_get_vname(box1);
 	if (strcmp(name1, vname2) == 0)
 		return TRUE;
 
@@ -1744,6 +1891,11 @@ int mailbox_create(struct mailbox *box, const struct mailbox_update *update,
 		return -1;
 	}
 	box->creating = TRUE;
+	if ((box->list->props & MAILBOX_LIST_PROP_NO_NOSELECT) != 0) {
+		/* Layout doesn't support creating \NoSelect mailboxes.
+		   Switch to creating a selectable mailbox */
+		directory = FALSE;
+	}
 	T_BEGIN {
 		ret = box->v.create_box(box, update, directory);
 	} T_END;
@@ -1778,7 +1930,9 @@ int mailbox_update(struct mailbox *box, const struct mailbox_update *update)
 		return -1;
 
 	struct event_reason *reason = event_reason_begin("mailbox:update");
-	ret = box->v.update_box(box, update);
+	T_BEGIN {
+		ret = box->v.update_box(box, update);
+	} T_END;
 	if (!guid_128_is_empty(update->mailbox_guid))
 		box->list->guid_cache_invalidated = TRUE;
 	event_reason_end(&reason);
@@ -2092,8 +2246,9 @@ int mailbox_set_subscribed(struct mailbox *box, bool set)
 		ret = -1;
 	} else if (mailbox_is_subscribed(box) == set)
 		ret = 0;
-	else
+	else T_BEGIN {
 		ret = box->v.set_subscribed(box, set);
+	} T_END;
 	event_reason_end(&reason);
 	return ret;
 }
@@ -2177,7 +2332,11 @@ int mailbox_get_status(struct mailbox *box,
 	if (mailbox_verify_existing_name(box) < 0)
 		return -1;
 
-	if (box->v.get_status(box, items, status_r) < 0)
+	int ret;
+	T_BEGIN {
+		ret = box->v.get_status(box, items, status_r);
+	} T_END;
+	if (ret < 0)
 		return -1;
 	i_assert(status_r->have_guids || !status_r->have_save_guids);
 	return 0;
@@ -2191,8 +2350,10 @@ void mailbox_get_open_status(struct mailbox *box,
 	i_assert((items & MAILBOX_STATUS_FAILING_ITEMS) == 0);
 
 	mailbox_get_status_set_defaults(box, status_r);
-	if (box->v.get_status(box, items, status_r) < 0)
-		i_unreached();
+	T_BEGIN {
+		if (box->v.get_status(box, items, status_r) < 0)
+			i_unreached();
+	} T_END;
 }
 
 int mailbox_get_metadata(struct mailbox *box, enum mailbox_metadata_items items,
@@ -2202,6 +2363,8 @@ int mailbox_get_metadata(struct mailbox *box, enum mailbox_metadata_items items,
 	if (mailbox_verify_existing_name(box) < 0)
 		return -1;
 
+	/* NOTE: metadata_r->cache_fields is currently returned from
+	   data stack, so can't use a data stack frame here. */
 	if (box->v.get_metadata(box, items, metadata_r) < 0)
 		return -1;
 
@@ -2249,7 +2412,12 @@ bool mailbox_sync_next(struct mailbox_sync_context *ctx,
 {
 	if (ctx->open_failed)
 		return FALSE;
-	return ctx->box->v.sync_next(ctx, sync_rec_r);
+
+	bool ret;
+	T_BEGIN {
+		ret = ctx->box->v.sync_next(ctx, sync_rec_r);
+	} T_END;
+	return ret;
 }
 
 int mailbox_sync_deinit(struct mailbox_sync_context **_ctx,
@@ -2265,9 +2433,11 @@ int mailbox_sync_deinit(struct mailbox_sync_context **_ctx,
 
 	i_zero(status_r);
 
-	if (!ctx->open_failed)
-		ret = box->v.sync_deinit(ctx, status_r);
-	else {
+	if (!ctx->open_failed) {
+		T_BEGIN {
+			ret = box->v.sync_deinit(ctx, status_r);
+		} T_END;
+	} else {
 		i_free(ctx);
 		ret = -1;
 	}
@@ -2308,7 +2478,9 @@ void mailbox_notify_changes(struct mailbox *box,
 	box->notify_callback = callback;
 	box->notify_context = context;
 
-	box->v.notify_changes(box);
+	T_BEGIN {
+		box->v.notify_changes(box);
+	} T_END;
 }
 
 void mailbox_notify_changes_stop(struct mailbox *box)
@@ -2318,7 +2490,9 @@ void mailbox_notify_changes_stop(struct mailbox *box)
 	box->notify_callback = NULL;
 	box->notify_context = NULL;
 
-	box->v.notify_changes(box);
+	T_BEGIN {
+		box->v.notify_changes(box);
+	} T_END;
 }
 
 struct mail_search_context *
@@ -2333,8 +2507,13 @@ mailbox_search_init(struct mailbox_transaction_context *t,
 	mail_search_args_ref(args);
 	if (!args->simplified)
 		mail_search_args_simplify(args);
-	return t->box->v.search_init(t, args, sort_program,
-				     wanted_fields, wanted_headers);
+
+	struct mail_search_context *ctx;
+	T_BEGIN {
+		ctx = t->box->v.search_init(t, args, sort_program,
+					    wanted_fields, wanted_headers);
+	} T_END;
+	return ctx;
 }
 
 int mailbox_search_deinit(struct mail_search_context **_ctx)
@@ -2345,7 +2524,9 @@ int mailbox_search_deinit(struct mail_search_context **_ctx)
 
 	*_ctx = NULL;
 	mailbox_search_results_initial_done(ctx);
-	ret = ctx->transaction->box->v.search_deinit(ctx);
+	T_BEGIN {
+		ret = ctx->transaction->box->v.search_deinit(ctx);
+	} T_END;
 	mail_search_args_unref(&args);
 	return ret;
 }
@@ -2365,11 +2546,15 @@ bool mailbox_search_next_nonblock(struct mail_search_context *ctx,
 				  struct mail **mail_r, bool *tryagain_r)
 {
 	struct mailbox *box = ctx->transaction->box;
+	bool ret;
 
 	*mail_r = NULL;
 	*tryagain_r = FALSE;
 
-	if (!box->v.search_next_nonblock(ctx, mail_r, tryagain_r))
+	T_BEGIN {
+		ret = box->v.search_next_nonblock(ctx, mail_r, tryagain_r);
+	} T_END;
+	if (!ret)
 		return FALSE;
 	else {
 		mailbox_search_results_add(ctx, (*mail_r)->uid);
@@ -2429,7 +2614,9 @@ mailbox_transaction_begin(struct mailbox *box,
 	i_assert(box->opened);
 
 	box->transaction_count++;
-	trans = box->v.transaction_begin(box, flags, reason);
+	T_BEGIN {
+		trans = box->v.transaction_begin(box, flags, reason);
+	} T_END;
 	i_assert(trans->reason != NULL);
 	return trans;
 }
@@ -2481,6 +2668,16 @@ int mailbox_transaction_commit_get_changes(
 	   finished */
 	box->transaction_count--;
 	event_reason_end(&reason);
+	if (ret == 0 && box->mailbox_not_original) {
+		/* The mailbox name changed while opening it. This is
+		   intentional when virtual mailbox is opened for saving mails,
+		   which causes the backend mailbox to be opened instead. In
+		   this situation the UIDVALIDITY / UIDs are for the physical
+		   mailbox, not the virtual mailbox. Use this flag to prevent
+		   IMAP APPEND from returning any UIDs in the tagged reply,
+		   since they would be wrong. */
+		changes_r->no_read_perm = TRUE;
+	}
 	if (ret < 0 && changes_r->pool != NULL)
 		pool_unref(&changes_r->pool);
 	return ret;
@@ -2492,7 +2689,9 @@ void mailbox_transaction_rollback(struct mailbox_transaction_context **_t)
 	struct mailbox *box = t->box;
 
 	*_t = NULL;
-	box->v.transaction_rollback(t);
+	T_BEGIN {
+		box->v.transaction_rollback(t);
+	} T_END;
 	box->transaction_count--;
 }
 
@@ -2518,7 +2717,9 @@ static void mailbox_save_dest_mail_close(struct mail_save_context *ctx)
 {
 	struct mail_private *mail = (struct mail_private *)ctx->dest_mail;
 
-	mail->v.close(&mail->mail);
+	T_BEGIN {
+		mail->v.close(&mail->mail);
+	} T_END;
 }
 
 struct mail_save_context *
@@ -3124,12 +3325,26 @@ mail_storage_settings_to_index_flags(const struct mail_storage_settings *set)
 	return index_flags;
 }
 
+
+struct event *
+mail_storage_mailbox_create_event(struct event *parent, const char* vname)
+{
+	struct event *event = event_create(parent);
+	event_add_category(event, &event_category_mailbox);
+	event_add_str(event, "mailbox", vname);
+	event_drop_parent_log_prefixes(event, 1);
+	event_set_append_log_prefix(event, t_strdup_printf(
+		"Mailbox %s: ", mailbox_name_sanitize(vname)));
+	return event;
+}
+
 int mail_parse_human_timestamp(const char *str, time_t *timestamp_r,
 			       bool *utc_r)
 {
 	struct tm tm;
 	unsigned int secs;
 	const char *error;
+	int tz;
 
 	if (i_isdigit(str[0]) && i_isdigit(str[1]) &&
 	    i_isdigit(str[2]) && i_isdigit(str[3]) && str[4] == '-' &&
@@ -3145,14 +3360,18 @@ int mail_parse_human_timestamp(const char *str, time_t *timestamp_r,
 		*utc_r = TRUE;
 		return 0;
 	} else if (imap_parse_date(str, timestamp_r)) {
-		/* imap date */
+		/* imap datetime */
 		*utc_r = FALSE;
+		return 0;
+	} else if (imap_parse_datetime(str, timestamp_r, &tz)) {
+		/* imap datetime */
+		*utc_r = TRUE;
 		return 0;
 	} else if (str_to_time(str, timestamp_r) == 0) {
 		/* unix timestamp */
 		*utc_r = TRUE;
 		return 0;
-	} else if (settings_get_time(str, &secs, &error) == 0) {
+	} else if (str_parse_get_interval(str, &secs, &error) == 0) {
 		*timestamp_r = ioloop_time - secs;
 		*utc_r = TRUE;
 		return 0;
@@ -3173,9 +3392,7 @@ void mail_set_mail_cache_corrupted(struct mail *mail, const char *fmt, ...)
 
 	T_BEGIN {
 		mail_cache_set_seq_corrupted_reason(cache_view, mail->seq,
-			t_strdup_printf("UID %u: %s",
-					mail->uid,
-					t_strdup_vprintf(fmt, va)));
+						    t_strdup_vprintf(fmt, va));
 	} T_END;
 
 	/* update also the storage's internal error */
@@ -3276,8 +3493,9 @@ int mailbox_lock_file_create(struct mailbox *box, const char *lock_fname,
 void mailbox_sync_notify(struct mailbox *box, uint32_t uid,
 			 enum mailbox_sync_type sync_type)
 {
-	if (box->v.sync_notify != NULL)
+	if (box->v.sync_notify != NULL) T_BEGIN {
 		box->v.sync_notify(box, uid, sync_type);
+	} T_END;
 
 	/* Send an event for expunged mail. */
 	if (sync_type == MAILBOX_SYNC_TYPE_EXPUNGE) {

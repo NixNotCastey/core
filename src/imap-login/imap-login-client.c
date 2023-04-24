@@ -12,7 +12,7 @@
 #include "imap-resp-code.h"
 #include "master-service.h"
 #include "master-service-ssl-settings.h"
-#include "master-auth.h"
+#include "login-client.h"
 #include "imap-login-client.h"
 #include "client-authenticate.h"
 #include "auth-client.h"
@@ -74,14 +74,14 @@ bool client_handle_parser_error(struct imap_client *client,
 
 static bool is_login_cmd_disabled(struct client *client)
 {
-	if (client->secured) {
+	if (client->connection_secured) {
 		if (sasl_server_find_available_mech(client, "PLAIN") == NULL) {
 			/* no PLAIN authentication, can't use LOGIN command */
 			return TRUE;
 		}
 		return FALSE;
 	}
-	if (client->set->disable_plaintext_auth)
+	if (!client->set->auth_allow_cleartext)
 		return TRUE;
 	if (strcmp(client->ssl_set->ssl, "required") == 0)
 		return TRUE;
@@ -112,7 +112,8 @@ static const char *get_capability(struct client *client)
 			str_append(cap_str, " LITERAL+");
 	}
 
-	if (client_is_tls_enabled(client) && !client->tls)
+	if (client_is_tls_enabled(client) && !client->connection_tls_secured &&
+	    !client->haproxy_terminated_tls)
 		str_append(cap_str, " STARTTLS");
 	if (is_login_cmd_disabled(client))
 		str_append(cap_str, " LOGINDISABLED");
@@ -129,7 +130,7 @@ static int cmd_capability(struct imap_client *imap_client,
 	/* Client is required to send CAPABILITY after STARTTLS, so the
 	   capability resp-code workaround checks only pre-STARTTLS
 	   CAPABILITY commands. */
-	if (!client->starttls)
+	if (!client->connection_used_starttls)
 		imap_client->client_ignores_capability_resp_code = TRUE;
 	client_send_raw(client, t_strconcat(
 		"* CAPABILITY ", get_capability(client), "\r\n", NULL));
@@ -355,7 +356,11 @@ static void imap_client_input(struct client *client)
 			client->input_blocked = TRUE;
 			break;
 		} else {
-			if (!client_handle_input(imap_client))
+			bool ret;
+			T_BEGIN {
+				ret = client_handle_input(imap_client);
+			} T_END;
+			if (!ret)
 				break;
 		}
 	}
@@ -388,6 +393,13 @@ static void imap_client_create(struct client *client, void **other_sets)
 static void imap_client_destroy(struct client *client)
 {
 	struct imap_client *imap_client = (struct imap_client *)client;
+
+	/* Prevent memory leak of ID command if client got disconnected before
+	   command was finished. */
+	if (imap_client->cmd_id != NULL) {
+		i_assert(!imap_client->cmd_finished);
+		cmd_id_free(imap_client);
+	}
 
 	i_free_and_null(imap_client->proxy_backend_capability);
 	imap_parser_unref(&imap_client->parser);
@@ -486,7 +498,7 @@ imap_client_notify_status(struct client *client, bool bad, const char *text)
 		client_send_reply_raw(client, "OK", NULL, text, FALSE);
 }
 
-static void 
+static void
 imap_client_notify_disconnect(struct client *client,
 			      enum client_disconnect_reason reason,
 			      const char *text)

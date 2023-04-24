@@ -141,7 +141,6 @@ mail_crypt_acl_unset_private_keys(struct mailbox *src_box,
 static int
 mail_crypt_acl_user_create(struct mail_user *user, const char *dest_username,
 			   struct mail_user **dest_user_r,
-			   struct mail_storage_service_user **dest_service_user_r,
 			   const char **error_r)
 {
 	const struct mail_storage_service_input *old_input;
@@ -151,15 +150,13 @@ mail_crypt_acl_user_create(struct mail_user *user, const char *dest_username,
 
 	int ret;
 
-	i_assert(user->_service_user != NULL);
-	service_ctx = mail_storage_service_user_get_service_ctx(user->_service_user);
-	old_input = mail_storage_service_user_get_input(user->_service_user);
+	service_ctx = mail_storage_service_user_get_service_ctx(user->service_user);
+	old_input = mail_storage_service_user_get_input(user->service_user);
 
 	if ((cur_ioloop_ctx = io_loop_get_current_context(current_ioloop)) != NULL)
 		io_loop_context_deactivate(cur_ioloop_ctx);
 
 	i_zero(&input);
-	input.module = old_input->module;
 	input.service = old_input->service;
 	input.username = dest_username;
 	input.session_id_prefix = user->session_id;
@@ -168,7 +165,6 @@ mail_crypt_acl_user_create(struct mail_user *user, const char *dest_username,
 	input.flags_override_remove = MAIL_STORAGE_SERVICE_FLAG_NO_NAMESPACES;
 
 	ret = mail_storage_service_lookup_next(service_ctx, &input,
-						dest_service_user_r,
 						dest_user_r, error_r);
 
 	return ret;
@@ -244,9 +240,9 @@ static int mail_crypt_acl_object_update(struct acl_object *aclobj,
 	const char *error;
 	struct mail_crypt_acl_mailbox_list *mlist =
 		MAIL_CRYPT_ACL_LIST_CONTEXT(aclobj->backend->list);
+	struct event *event = aclobj->backend->event;
 	const char *username;
 	struct mail_user *dest_user;
-	struct mail_storage_service_user *dest_service_user;
 	struct ioloop_context *cur_ioloop_ctx;
 	bool have_rights;
 	int ret = 0;
@@ -270,44 +266,42 @@ static int mail_crypt_acl_object_update(struct acl_object *aclobj,
 		ret = mail_crypt_acl_has_user_read_right(aclobj, username, &error);
 
 		if (ret < 0) {
-			i_error("mail-crypt-acl-plugin: "
-				"mail_crypt_acl_has_user_read_right(%s) failed: %s",
-				username,
-				error);
+			e_error(event,
+				"mail-crypt-acl-plugin: mail_crypt_acl_has_user_read_right(%s) failed: %s",
+				username, error);
 			break;
 		}
 
 		have_rights = ret > 0;
 
 		ret = mail_crypt_acl_user_create(aclobj->backend->list->ns->user,
-						 username, &dest_user,
-						 &dest_service_user, &error);
+						 username, &dest_user, &error);
 
 		/* to make sure we get correct logging context */
 		if (ret > 0)
-			mail_storage_service_io_deactivate_user(dest_service_user);
+			mail_storage_service_io_deactivate_user(dest_user->service_user);
 		mail_storage_service_io_activate_user(
-			aclobj->backend->list->ns->user->_service_user
+			aclobj->backend->list->ns->user->service_user
 		);
 
 		if (ret <= 0) {
-			i_error("mail-crypt-acl-plugin: "
-				"Cannot initialize destination user %s: %s",
+			e_error(event,
+				"mail-crypt-acl-plugin: Cannot initialize destination user %s: %s",
 				username, error);
 			break;
 		} else {
 			i_assert(dest_user != NULL);
 			if ((ret = mailbox_open(box)) < 0) {
-				i_error("mail-crypt-acl-plugin: "
-					"mailbox_open(%s) failed: %s",
+				e_error(event,
+					"mail-crypt-acl-plugin: mailbox_open(%s) failed: %s",
 					mailbox_get_vname(box),
 					mailbox_get_last_internal_error(box, NULL));
 			} else if ((ret = mail_crypt_acl_update_private_key(box, dest_user,
 									have_rights,
 									disallow_insecure,
 									&error)) < 0) {
-				i_error("mail-crypt-acl-plugin: "
-					"acl_update_private_key(%s, %s) failed: %s",
+				e_error(event,
+					"mail-crypt-acl-plugin: acl_update_private_key(%s, %s) failed: %s",
 					mailbox_get_vname(box),
 					username,
 					error);
@@ -316,17 +310,16 @@ static int mail_crypt_acl_object_update(struct acl_object *aclobj,
 
 		/* logging context swap again */
 		mail_storage_service_io_deactivate_user(
-			aclobj->backend->list->ns->user->_service_user
+			aclobj->backend->list->ns->user->service_user
 		);
-		mail_storage_service_io_activate_user(dest_service_user);
+		mail_storage_service_io_activate_user(dest_user->service_user);
 
 		mail_user_deinit(&dest_user);
-		mail_storage_service_user_unref(&dest_service_user);
 
 		if ((cur_ioloop_ctx = io_loop_get_current_context(current_ioloop)) != NULL)
 			io_loop_context_deactivate(cur_ioloop_ctx);
 		mail_storage_service_io_activate_user(
-			aclobj->backend->list->ns->user->_service_user
+			aclobj->backend->list->ns->user->service_user
 		);
 		break;
 	case ACL_ID_OWNER:
@@ -337,7 +330,7 @@ static int mail_crypt_acl_object_update(struct acl_object *aclobj,
 	case ACL_ID_GROUP:
 	case ACL_ID_GROUP_OVERRIDE:
 		if (disallow_insecure) {
-			i_error("mail-crypt-acl-plugin: "
+			e_error(event, "mail-crypt-acl-plugin: "
 				"Secure key sharing is enabled -"
 				"Remove or set plugin { %s = no }",
 				MAIL_CRYPT_ACL_SECURE_SHARE_SETTING);
@@ -349,9 +342,9 @@ static int mail_crypt_acl_object_update(struct acl_object *aclobj,
 		   users belonging to the group would able to decrypt with
 		   their private key, but that becomes quite complicated. */
 		if ((ret = mail_crypt_acl_has_nonuser_read_right(aclobj, &error)) < 0) {
-		    i_error("mail-crypt-acl-plugin: %s", error);
+		    	e_error(event, "mail-crypt-acl-plugin: %s", error);
 		} else if ((ret = mailbox_open(box)) < 0) {
-			i_error("mail-crypt-acl-plugin: "
+			e_error(event, "mail-crypt-acl-plugin: "
 				"mailbox_open(%s) failed: %s",
 				mailbox_get_vname(box),
 				mailbox_get_last_internal_error(box, NULL));
@@ -360,11 +353,9 @@ static int mail_crypt_acl_object_update(struct acl_object *aclobj,
 								    TRUE,
 								    disallow_insecure,
 								    &error)) < 0) {
-			i_error("mail-crypt-acl-plugin: "
+			e_error(event, "mail-crypt-acl-plugin: "
 				"acl_update_private_key(%s, %s) failed: %s",
-				mailbox_get_vname(box),
-				"",
-				error);
+				mailbox_get_vname(box), "", error);
 		}
 		break;
 	case ACL_ID_TYPE_COUNT:

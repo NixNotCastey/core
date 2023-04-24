@@ -20,6 +20,7 @@
 struct index_cmd_context {
 	struct doveadm_mail_cmd_context ctx;
 
+	const char *const *mailboxes;
 	struct istream *queue_input;
 	struct ostream *queue_output;
 	unsigned int max_recent_msgs;
@@ -30,6 +31,7 @@ struct index_cmd_context {
 static int cmd_index_box_precache(struct doveadm_mail_cmd_context *dctx,
 				  struct mailbox *box)
 {
+	struct event *event = dctx->cctx->event;
 	struct mailbox_status status;
 	struct mailbox_transaction_context *trans;
 	struct mail_search_args *search_args;
@@ -42,13 +44,13 @@ static int cmd_index_box_precache(struct doveadm_mail_cmd_context *dctx,
 
 	if (mailbox_get_metadata(box, MAILBOX_METADATA_PRECACHE_FIELDS,
 				 &metadata) < 0) {
-		i_error("Mailbox %s: Precache-fields lookup failed: %s",
+		e_error(event, "Mailbox %s: Precache-fields lookup failed: %s",
 			mailbox_get_vname(box),
 			mailbox_get_last_internal_error(box, NULL));
 	}
 	if (mailbox_get_status(box, STATUS_MESSAGES | STATUS_LAST_CACHED_SEQ,
 			       &status) < 0) {
-		i_error("Mailbox %s: Status lookup failed: %s",
+		e_error(event, "Mailbox %s: Status lookup failed: %s",
 			mailbox_get_vname(box),
 			mailbox_get_last_internal_error(box, NULL));
 		return -1;
@@ -57,13 +59,13 @@ static int cmd_index_box_precache(struct doveadm_mail_cmd_context *dctx,
 	seq = status.last_cached_seq + 1;
 	if (seq > status.messages) {
 		if (doveadm_verbose) {
-			i_info("%s: Cache is already up to date",
+			e_info(event, "%s: Cache is already up to date",
 			       mailbox_get_vname(box));
 		}
 		return 0;
 	}
 	if (doveadm_verbose) {
-		i_info("%s: Caching mails seq=%u..%u",
+		e_info(event, "%s: Caching mails seq=%u..%u",
 		       mailbox_get_vname(box), seq, status.messages);
 	}
 
@@ -78,9 +80,10 @@ static int cmd_index_box_precache(struct doveadm_mail_cmd_context *dctx,
 	max = status.messages - seq + 1;
 	while (mailbox_search_next(ctx, &mail)) {
 		if (mail_precache(mail) < 0) {
-			i_error("Mailbox %s: Precache for UID=%u failed: %s",
+			e_error(event,
+				"Mailbox %s: Precache for UID=%u failed: %s",
 				mailbox_get_vname(box), mail->uid,
-				mailbox_get_last_internal_error(box, NULL));
+				mail_get_last_internal_error(mail, NULL));
 			ret = -1;
 			break;
 		}
@@ -92,13 +95,13 @@ static int cmd_index_box_precache(struct doveadm_mail_cmd_context *dctx,
 	if (doveadm_verbose)
 		printf("\r%u/%u\n", counter, max);
 	if (mailbox_search_deinit(&ctx) < 0) {
-		i_error("Mailbox %s: Mail search failed: %s",
+		e_error(event, "Mailbox %s: Mail search failed: %s",
 			mailbox_get_vname(box),
 			mailbox_get_last_internal_error(box, NULL));
 		ret = -1;
 	}
 	if (mailbox_transaction_commit(&trans) < 0) {
-		i_error("Mailbox %s: Transaction commit failed: %s",
+		e_error(event, "Mailbox %s: Transaction commit failed: %s",
 			mailbox_get_vname(box),
 			mailbox_get_last_internal_error(box, NULL));
 		ret = -1;
@@ -109,6 +112,7 @@ static int cmd_index_box_precache(struct doveadm_mail_cmd_context *dctx,
 static int
 cmd_index_box(struct index_cmd_context *ctx, const struct mailbox_info *info)
 {
+	struct event *event = ctx->ctx.cctx->event;
 	struct mailbox *box;
 	struct mailbox_status status;
 	int ret = 0;
@@ -120,12 +124,13 @@ cmd_index_box(struct index_cmd_context *ctx, const struct mailbox_info *info)
 		   don't bother syncing the mailbox, that alone can take a
 		   while with large maildirs. */
 		if (mailbox_open(box) < 0) {
-			i_error("Opening mailbox %s failed: %s", info->vname,
+			e_error(event,
+				"Opening mailbox %s failed: %s", info->vname,
 				mailbox_get_last_internal_error(box, NULL));
 			doveadm_mail_failed_mailbox(&ctx->ctx, box);
 			mailbox_free(&box);
 			return -1;
-		} 
+		}
 
 		mailbox_get_open_status(box, STATUS_RECENT, &status);
 		if (status.recent > ctx->max_recent_msgs) {
@@ -135,7 +140,7 @@ cmd_index_box(struct index_cmd_context *ctx, const struct mailbox_info *info)
 	}
 
 	if (mailbox_sync(box, MAILBOX_SYNC_FLAG_FULL_READ) < 0) {
-		i_error("Syncing mailbox %s failed: %s", info->vname,
+		e_error(event, "Syncing mailbox %s failed: %s", info->vname,
 			mailbox_get_last_internal_error(box, NULL));
 		doveadm_mail_failed_mailbox(&ctx->ctx, box);
 		ret = -1;
@@ -200,7 +205,9 @@ static void cmd_index_queue(struct index_cmd_context *ctx,
 static int
 cmd_index_run(struct doveadm_mail_cmd_context *_ctx, struct mail_user *user)
 {
-	struct index_cmd_context *ctx = (struct index_cmd_context *)_ctx;
+	struct index_cmd_context *ctx =
+		container_of(_ctx, struct index_cmd_context, ctx);
+	struct event *event = ctx->ctx.cctx->event;
 	const enum mailbox_list_iter_flags iter_flags =
 		MAILBOX_LIST_ITER_NO_AUTO_BOXES |
 		MAILBOX_LIST_ITER_RETURN_NO_FLAGS |
@@ -208,18 +215,18 @@ cmd_index_run(struct doveadm_mail_cmd_context *_ctx, struct mail_user *user)
 	const enum mail_namespace_type ns_mask = MAIL_NAMESPACE_TYPE_MASK_ALL;
 	struct mailbox_list_iterate_context *iter;
 	const struct mailbox_info *info;
-	unsigned int i;
 	int ret = 0;
 
 	if (ctx->queue && !ctx->have_wildcards) {
 		/* we can do this quickly without going through the mailboxes */
-		for (i = 0; _ctx->args[i] != NULL; i++)
-			cmd_index_queue(ctx, user, _ctx->args[i]);
+		const char *const *box = ctx->mailboxes;
+		for (; *box != NULL; box++)
+			cmd_index_queue(ctx, user, *box);
 		return 0;
 	}
 
-	iter = mailbox_list_iter_init_namespaces(user->namespaces, _ctx->args,
-						 ns_mask, iter_flags);
+	iter = mailbox_list_iter_init_namespaces(
+		user->namespaces, ctx->mailboxes, ns_mask, iter_flags);
 	while ((info = mailbox_list_iter_next(iter)) != NULL) {
 		if ((info->flags & (MAILBOX_NOSELECT |
 				    MAILBOX_NONEXISTENT)) == 0) T_BEGIN {
@@ -232,7 +239,7 @@ cmd_index_run(struct doveadm_mail_cmd_context *_ctx, struct mail_user *user)
 		} T_END;
 	}
 	if (mailbox_list_iter_deinit(&iter) < 0) {
-		i_error("Listing mailboxes failed: %s",
+		e_error(event, "Listing mailboxes failed: %s",
 			mailbox_list_get_last_internal_error(user->namespaces->list, NULL));
 		doveadm_mail_failed_error(_ctx, MAIL_ERROR_TEMP);
 		ret = -1;
@@ -240,50 +247,32 @@ cmd_index_run(struct doveadm_mail_cmd_context *_ctx, struct mail_user *user)
 	return ret;
 }
 
-static void cmd_index_init(struct doveadm_mail_cmd_context *_ctx,
-			   const char *const args[])
+static void cmd_index_init(struct doveadm_mail_cmd_context *_ctx)
 {
-	struct index_cmd_context *ctx = (struct index_cmd_context *)_ctx;
-	unsigned int i;
+	struct doveadm_cmd_context *cctx = _ctx->cctx;
+	struct index_cmd_context *ctx =
+		container_of(_ctx, struct index_cmd_context, ctx);
 
-	if (args[0] == NULL)
+	ctx->queue = doveadm_cmd_param_flag(cctx, "queue");
+	(void)doveadm_cmd_param_uint32(cctx, "max-recent", &ctx->max_recent_msgs);
+
+	if (!doveadm_cmd_param_array(cctx, "mailbox-mask", &ctx->mailboxes))
 		doveadm_mail_help_name("index");
-	for (i = 0; args[i] != NULL; i++) {
-		if (strchr(args[i], '*') != NULL ||
-		    strchr(args[i], '%') != NULL) {
-			ctx->have_wildcards = TRUE;
-			break;
-		}
-	}
+
+	const char *const *box = ctx->mailboxes;
+	for (; !ctx->have_wildcards && *box != NULL; box++)
+		ctx->have_wildcards =
+			strchr(*box, '*') != NULL ||
+			strchr(*box, '%') != NULL;
 }
 
 static void cmd_index_deinit(struct doveadm_mail_cmd_context *_ctx)
 {
-	struct index_cmd_context *ctx = (struct index_cmd_context *)_ctx;
+	struct index_cmd_context *ctx =
+		container_of(_ctx, struct index_cmd_context, ctx);
 
 	o_stream_destroy(&ctx->queue_output);
 	i_stream_destroy(&ctx->queue_input);
-}
-
-static bool
-cmd_index_parse_arg(struct doveadm_mail_cmd_context *_ctx, int c)
-{
-	struct index_cmd_context *ctx = (struct index_cmd_context *)_ctx;
-
-	switch (c) {
-	case 'q':
-		ctx->queue = TRUE;
-		break;
-	case 'n':
-		if (str_to_uint(optarg, &ctx->max_recent_msgs) < 0) {
-			i_fatal_status(EX_USAGE,
-				"Invalid -n parameter number: %s", optarg);
-		}
-		break;
-	default:
-		return FALSE;
-	}
-	return TRUE;
 }
 
 static struct doveadm_mail_cmd_context *cmd_index_alloc(void)
@@ -291,8 +280,6 @@ static struct doveadm_mail_cmd_context *cmd_index_alloc(void)
 	struct index_cmd_context *ctx;
 
 	ctx = doveadm_mail_cmd_alloc(struct index_cmd_context);
-	ctx->ctx.getopt_args = "qn:";
-	ctx->ctx.v.parse_arg = cmd_index_parse_arg;
 	ctx->ctx.v.init = cmd_index_init;
 	ctx->ctx.v.deinit = cmd_index_deinit;
 	ctx->ctx.v.run = cmd_index_run;
@@ -306,7 +293,7 @@ struct doveadm_cmd_ver2 doveadm_cmd_index_ver2 = {
 DOVEADM_CMD_PARAMS_START
 DOVEADM_CMD_MAIL_COMMON
 DOVEADM_CMD_PARAM('q',"queue",CMD_PARAM_BOOL,0)
-DOVEADM_CMD_PARAM('n',"max-recent",CMD_PARAM_STR,0)
-DOVEADM_CMD_PARAM('\0',"mailbox-mask",CMD_PARAM_STR,CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAM('n',"max-recent",CMD_PARAM_INT64,CMD_PARAM_FLAG_UNSIGNED)
+DOVEADM_CMD_PARAM('\0',"mailbox-mask",CMD_PARAM_ARRAY,CMD_PARAM_FLAG_POSITIONAL)
 DOVEADM_CMD_PARAMS_END
 };

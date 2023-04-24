@@ -7,7 +7,7 @@ See [INSTALL.md](INSTALL.md) file.
 Configuration
 =============
 
-See [doc/documentation.txt](doc/documentation.txt) or [http://wiki2.dovecot.org/](http://wiki2.dovecot.org/)
+See [doc/documentation.txt](doc/documentation.txt) or [https://doc.dovecot.org](https://doc.dovecot.org)
 
 
 RFCs conformed
@@ -121,6 +121,6 @@ SMTP/LMTP extensions
 Contact info
 ============
 
-Timo Sirainen tss@iki.fi, [http://www.dovecot.org/](http://www.dovecot.org/)
+[https://www.dovecot.org/](https://www.dovecot.org/)
 
-Please use the Dovecot mailing list dovecot@dovecot.org for questions about Dovecot. You can post to the list without subscribing, the mail then waits in a moderator queue for a while. See [http://dovecot.org/mailinglists.html](http://dovecot.org/mailinglists.html)
+Please use the Dovecot mailing list dovecot@dovecot.org for questions about Dovecot. You can post to the list without subscribing, the mail then waits in a moderator queue for a while. See [https://www.dovecot.org/mailinglists.html](https://www.dovecot.org/mailinglists.html)

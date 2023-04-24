@@ -688,22 +688,22 @@ fs_posix_lock(struct fs_file *_file, unsigned int secs, struct fs_lock **lock_r)
 	struct posix_fs *fs = container_of(_file->fs, struct posix_fs, fs);
 	struct dotlock_settings dotlock_set;
 	struct posix_fs_lock fs_lock, *ret_lock;
-	const char *error;
 	int ret = -1;
 
 	i_zero(&fs_lock);
 	fs_lock.lock.file = _file;
 
-	struct file_lock_settings lock_set = {
-		.lock_method = FILE_LOCK_METHOD_FLOCK,
-	};
 	switch (fs->lock_method) {
-	case FS_POSIX_LOCK_METHOD_FLOCK:
+	case FS_POSIX_LOCK_METHOD_FLOCK: {
 #ifndef HAVE_FLOCK
 		fs_set_error(_file->event, ENOTSUP,
 			     "flock() not supported by OS (for file %s)",
 			     file->full_path);
 #else
+		const char *error;
+		struct file_lock_settings lock_set = {
+			.lock_method = FILE_LOCK_METHOD_FLOCK,
+		};
 		if (secs == 0) {
 			ret = file_try_lock(file->fd, file->full_path, F_WRLCK,
 					    &lock_set, &fs_lock.file_lock,
@@ -719,6 +719,7 @@ fs_posix_lock(struct fs_file *_file, unsigned int secs, struct fs_lock **lock_r)
 		}
 #endif
 		break;
+	}
 	case FS_POSIX_LOCK_METHOD_DOTLOCK:
 		i_zero(&dotlock_set);
 		dotlock_set.stale_timeout = FS_POSIX_DOTLOCK_STALE_TIMEOUT_SECS;
@@ -992,37 +993,38 @@ static int fs_posix_iter_deinit(struct fs_iter *_iter)
 const struct fs fs_class_posix = {
 	.name = "posix",
 	.v = {
-		fs_posix_alloc,
-		fs_posix_init,
-		NULL,
-		fs_posix_free,
-		fs_posix_get_properties,
-		fs_posix_file_alloc,
-		fs_posix_file_init,
-		fs_posix_file_deinit,
-		fs_posix_file_close,
-		NULL,
-		NULL, NULL,
-		fs_default_set_metadata,
-		NULL,
-		fs_posix_prefetch,
-		fs_posix_read,
-		fs_posix_read_stream,
-		fs_posix_write,
-		fs_posix_write_stream,
-		fs_posix_write_stream_finish,
-		fs_posix_lock,
-		fs_posix_unlock,
-		fs_posix_exists,
-		fs_posix_stat,
-		fs_posix_copy,
-		fs_posix_rename,
-		fs_posix_delete,
-		fs_posix_iter_alloc,
-		fs_posix_iter_init,
-		fs_posix_iter_next,
-		fs_posix_iter_deinit,
-		NULL,
-		NULL,
+		.alloc = fs_posix_alloc,
+		.init = fs_posix_init,
+		.deinit = NULL,
+		.free = fs_posix_free,
+		.get_properties = fs_posix_get_properties,
+		.file_alloc = fs_posix_file_alloc,
+		.file_init = fs_posix_file_init,
+		.file_deinit = fs_posix_file_deinit,
+		.file_close = fs_posix_file_close,
+		.get_path = NULL,
+		.set_async_callback = NULL,
+		.wait_async = NULL,
+		.set_metadata = fs_default_set_metadata,
+		.get_metadata = NULL,
+		.prefetch = fs_posix_prefetch,
+		.read = fs_posix_read,
+		.read_stream = fs_posix_read_stream,
+		.write = fs_posix_write,
+		.write_stream = fs_posix_write_stream,
+		.write_stream_finish = fs_posix_write_stream_finish,
+		.lock = fs_posix_lock,
+		.unlock = fs_posix_unlock,
+		.exists = fs_posix_exists,
+		.stat = fs_posix_stat,
+		.copy = fs_posix_copy,
+		.rename = fs_posix_rename,
+		.delete_file = fs_posix_delete,
+		.iter_alloc = fs_posix_iter_alloc,
+		.iter_init = fs_posix_iter_init,
+		.iter_next = fs_posix_iter_next,
+		.iter_deinit = fs_posix_iter_deinit,
+		.switch_ioloop = NULL,
+		.get_nlinks = NULL,
 	}
 };

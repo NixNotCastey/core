@@ -5,7 +5,7 @@
 #include "array.h"
 #include "str.h"
 #include "unichar.h"
-#include "settings-parser.h"
+#include "str-parse.h"
 #include "mail-storage.h"
 #include "mail-search-register.h"
 #include "mail-search-parser.h"
@@ -90,7 +90,7 @@ arg_new_human_size(struct mail_search_build_context *ctx,
 	if (mail_search_parse_string(ctx->parser, &value) < 0)
 		return NULL;
 
-	if (settings_get_size(value, &sarg->value.size, &error) < 0) {
+	if (str_parse_get_size(value, &sarg->value.size, &error) < 0) {
 		ctx->_error = p_strdup(ctx->pool, error);
 		return NULL;
 	}
@@ -99,13 +99,13 @@ arg_new_human_size(struct mail_search_build_context *ctx,
 
 static struct mail_search_arg *
 human_search_larger(struct mail_search_build_context *ctx)
-{ 
+{
 	return arg_new_human_size(ctx, SEARCH_LARGER);
 }
 
 static struct mail_search_arg *
 human_search_smaller(struct mail_search_build_context *ctx)
-{ 
+{
 	return arg_new_human_size(ctx, SEARCH_SMALLER);
 }
 

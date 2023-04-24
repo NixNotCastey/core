@@ -15,8 +15,11 @@ struct iostream_ssl_vfuncs {
 	void (*context_ref)(struct ssl_iostream_context *ctx);
 	void (*context_unref)(struct ssl_iostream_context *ctx);
 
-	int (*create)(struct ssl_iostream_context *ctx, const char *host,
+	int (*create)(struct ssl_iostream_context *ctx,
+		      struct event *event_parent,
+		      const char *host,
 		      const struct ssl_iostream_settings *set,
+		      bool client,
 		      struct istream **input, struct ostream **output,
 		      struct ssl_iostream **iostream_r, const char **error_r);
 	void (*unref)(struct ssl_iostream *ssl_io);
@@ -47,6 +50,7 @@ struct iostream_ssl_vfuncs {
 	const char *(*get_cipher)(struct ssl_iostream *ssl_io, unsigned int *bits_r);
 	const char *(*get_pfs)(struct ssl_iostream *ssl_io);
 	const char *(*get_protocol_name)(struct ssl_iostream *ssl_io);
+	const char *(*get_ja3)(struct ssl_iostream *ssl_io);
 };
 
 void iostream_ssl_module_init(const struct iostream_ssl_vfuncs *vfuncs);

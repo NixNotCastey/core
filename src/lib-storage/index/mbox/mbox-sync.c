@@ -1007,13 +1007,14 @@ static void mbox_sync_hdr_update(struct mbox_sync_context *sync_ctx,
 static bool mbox_sync_imapbase(struct mbox_sync_context *sync_ctx,
 			       struct mbox_sync_mail_context *mail_ctx)
 {
+	struct event *event = sync_ctx->mbox->box.event;
 	if (sync_ctx->base_uid_validity != 0 &&
 	    sync_ctx->hdr->uid_validity != 0 &&
 	    sync_ctx->base_uid_validity != sync_ctx->hdr->uid_validity) {
-		i_warning("UIDVALIDITY changed (%u -> %u) in mbox file %s",
+		e_warning(event,
+			  "UIDVALIDITY changed (%u -> %u)",
 			  sync_ctx->hdr->uid_validity,
-			  sync_ctx->base_uid_validity,
-			  mailbox_get_path(&sync_ctx->mbox->box));
+			  sync_ctx->base_uid_validity);
 		sync_ctx->index_reset = TRUE;
 		return TRUE;
 	}
@@ -1308,7 +1309,7 @@ static int mbox_append_zero(struct mbox_sync_context *sync_ctx,
 static int mbox_sync_handle_eof_updates(struct mbox_sync_context *sync_ctx,
 					struct mbox_sync_mail_context *mail_ctx)
 {
-	uoff_t file_size, offset, padding, trailer_size;
+	uoff_t file_size, offset, trailer_size;
 	int ret;
 
 	if (!istream_raw_mbox_is_eof(sync_ctx->input)) {
@@ -1342,8 +1343,8 @@ static int mbox_sync_handle_eof_updates(struct mbox_sync_context *sync_ctx,
 		i_assert(sync_ctx->write_fd != -1);
 
 		i_assert(sync_ctx->space_diff < 0);
-		padding = MBOX_HEADER_PADDING *
-			(sync_ctx->seq - sync_ctx->need_space_seq + 1);
+		off_t padding = MBOX_HEADER_PADDING *
+			(off_t)(sync_ctx->seq - sync_ctx->need_space_seq + 1);
 		sync_ctx->space_diff -= padding;
 
 		i_assert(sync_ctx->expunged_space <= -sync_ctx->space_diff);

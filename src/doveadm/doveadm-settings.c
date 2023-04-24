@@ -16,12 +16,19 @@ ARRAY_TYPE(doveadm_setting_root) doveadm_setting_roots;
 bool doveadm_verbose_proctitle;
 
 static pool_t doveadm_settings_pool = NULL;
+static int global_config_fd = -1;
 
 static bool doveadm_settings_check(void *_set, pool_t pool, const char **error_r);
 
 /* <settings checks> */
 static struct file_listener_settings doveadm_unix_listeners_array[] = {
-	{ "doveadm-server", 0600, "", "" }
+	{
+		.path = "doveadm-server",
+		.type = "tcp",
+		.mode = 0600,
+		.user = "",
+		.group = "",
+	},
 };
 static struct file_listener_settings *doveadm_unix_listeners[] = {
 	&doveadm_unix_listeners_array[0]
@@ -79,7 +86,6 @@ static const struct setting_define doveadm_setting_defines[] = {
 	DEF(STR, doveadm_allowed_commands),
 	DEF(STR, dsync_alt_char),
 	DEF(STR, dsync_remote_cmd),
-	DEF(STR, director_username_hash),
 	DEF(STR, doveadm_api_key),
 	DEF(STR, dsync_features),
 	DEF(UINT, dsync_commit_msgs_interval),
@@ -112,7 +118,6 @@ const struct doveadm_settings doveadm_default_settings = {
 	.dsync_features = "",
 	.dsync_hashed_headers = "Date Message-ID",
 	.dsync_commit_msgs_interval = 100,
-	.director_username_hash = "%Lu",
 	.doveadm_api_key = "",
 	.doveadm_http_rawlog_dir = "",
 
@@ -155,6 +160,7 @@ struct dsync_feature_list {
 
 static const struct dsync_feature_list dsync_feature_list[] = {
 	{ "empty-header-workaround", DSYNC_FEATURE_EMPTY_HDR_WORKAROUND },
+	{ "no-header-hashes", DSYNC_FEATURE_NO_HEADER_HASHES },
 	{ NULL, 0 }
 };
 
@@ -237,55 +243,54 @@ void doveadm_read_settings(void)
 	const struct doveadm_settings *set;
 	struct doveadm_setting_root *root;
 	ARRAY(const struct setting_parser_info *) set_roots;
-	ARRAY_TYPE(const_string) module_names;
-	void **sets;
 	const char *error;
 
 	t_array_init(&set_roots, N_ELEMENTS(default_set_roots) +
 		     array_count(&doveadm_setting_roots) + 1);
 	array_append(&set_roots, default_set_roots,
 		     N_ELEMENTS(default_set_roots));
-	t_array_init(&module_names, 4);
-	array_foreach_modifiable(&doveadm_setting_roots, root) {
-		array_push_back(&module_names, &root->info->module_name);
+	array_foreach_modifiable(&doveadm_setting_roots, root)
 		array_push_back(&set_roots, &root->info);
-	}
-	array_append_zero(&module_names);
 	array_append_zero(&set_roots);
 
 	i_zero(&input);
 	input.roots = array_front(&set_roots);
-	input.module = "doveadm";
-	input.extra_modules = array_front(&module_names);
 	input.service = "doveadm";
 	input.preserve_user = TRUE;
 	input.preserve_home = TRUE;
+	input.return_config_fd = TRUE; /* for doveadm exec */
 	if (master_service_settings_read(master_service, &input,
 					 &output, &error) < 0)
 		i_fatal("Error reading configuration: %s", error);
+	i_assert(global_config_fd == -1);
+	global_config_fd = output.config_fd;
+	fd_close_on_exec(output.config_fd, TRUE);
 
 	doveadm_settings_pool = pool_alloconly_create("doveadm settings", 1024);
-	service_set = master_service_settings_get(master_service);
-	service_set = settings_dup(&master_service_setting_parser_info,
-				   service_set, doveadm_settings_pool);
+	service_set = master_service_settings_get_root_set_dup(master_service,
+		&master_service_setting_parser_info, doveadm_settings_pool);
 	doveadm_verbose_proctitle = service_set->verbose_proctitle;
 
-	sets = master_service_settings_get_others(master_service);
-	set = sets[1];
+	set = master_service_settings_get_root_set(
+		master_service, &doveadm_setting_parser_info);
 	doveadm_settings = settings_dup(&doveadm_setting_parser_info, set,
 					doveadm_settings_pool);
-	doveadm_ssl_set = settings_dup(&master_service_ssl_setting_parser_info,
-				       master_service_ssl_settings_get(master_service),
-				       doveadm_settings_pool);
+	doveadm_ssl_set = master_service_settings_get_root_set_dup(
+		master_service, &master_service_ssl_setting_parser_info,
+		doveadm_settings_pool);
 	doveadm_settings_expand(doveadm_settings, doveadm_settings_pool);
 	doveadm_settings->parsed_features = set->parsed_features; /* copy this value by hand */
 
 	array_foreach_modifiable(&doveadm_setting_roots, root) {
-		unsigned int idx =
-			array_foreach_idx(&doveadm_setting_roots, root);
-		root->settings = settings_dup(root->info, sets[2+idx],
-					      doveadm_settings_pool);
+		root->settings = master_service_settings_get_root_set_dup(
+			master_service, root->info, doveadm_settings_pool);
 	}
+}
+
+int doveadm_settings_get_config_fd(void)
+{
+	i_assert(global_config_fd != -1);
+	return global_config_fd;
 }
 
 void doveadm_setting_roots_add(const struct setting_parser_info *info)

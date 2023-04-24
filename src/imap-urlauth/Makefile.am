@@ -6,8 +6,9 @@ pkglibexec_PROGRAMS = imap-urlauth-login imap-urlauth imap-urlauth-worker
 AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib \
 	-I$(top_srcdir)/src/lib-settings \
-	-I$(top_srcdir)/src/lib-auth \
+	-I$(top_srcdir)/src/lib-auth-client \
 	-I$(top_srcdir)/src/lib-master \
+	-I$(top_srcdir)/src/lib-login \
 	$(BINARY_CFLAGS)
 
 # imap-urlauth-login
@@ -45,6 +46,7 @@ imap_urlauth_LDADD = $(LIBDOVECOT) \
 imap_urlauth_DEPENDENCIES = $(LIBDOVECOT_DEPS)
 
 imap_urlauth_SOURCES = \
+	imap-urlauth-worker-client.c \
 	imap-urlauth.c \
 	imap-urlauth-client.c \
 	imap-urlauth-settings.c
@@ -81,5 +83,7 @@ noinst_HEADERS = \
 	imap-urlauth-common.h \
 	imap-urlauth-settings.h \
 	imap-urlauth-login-settings.h \
+	imap-urlauth-worker-common.h \
+	imap-urlauth-worker-client.h \
 	imap-urlauth-worker-settings.h
 

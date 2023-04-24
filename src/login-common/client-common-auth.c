@@ -8,9 +8,9 @@
 #include "ostream.h"
 #include "str.h"
 #include "strescape.h"
+#include "str-parse.h"
 #include "safe-memset.h"
 #include "time-util.h"
-#include "settings-parser.h"
 #include "login-proxy.h"
 #include "auth-client.h"
 #include "dsasl-client.h"
@@ -21,6 +21,8 @@
    send a "waiting" message. */
 #define AUTH_WAITING_TIMEOUT_MSECS (30*1000)
 #define AUTH_WAITING_WARNING_TIMEOUT_MSECS (10*1000)
+
+#define CLIENT_REFERRAL_NOLOGIN_REASON "Try this server instead."
 
 struct client_auth_fail_code_id {
 	const char *id;
@@ -131,13 +133,15 @@ static void alt_username_set(ARRAY_TYPE(const_string) *alt_usernames, pool_t poo
 }
 
 static bool client_auth_parse_args(const struct client *client, bool success,
-				   const char *const *args,
-				   struct client_auth_reply *reply_r)
+				   bool reauth, const char *const *args,
+				   struct client_auth_reply *reply_r,
+				   const char **username_r)
 {
 	const char *key, *value, *p, *error;
 	int ret;
 
 	i_zero(reply_r);
+	*username_r = NULL;
 	t_array_init(&reply_r->alt_usernames, 4);
 	reply_r->proxy_host_immediate_failure_after_secs =
 		LOGIN_PROXY_DEFAULT_HOST_IMMEDIATE_FAILURE_AFTER_SECS;
@@ -167,7 +171,7 @@ static bool client_auth_parse_args(const struct client *client, bool success,
 		} else if (strcmp(key, "reason") == 0)
 			reply_r->reason = value;
 		else if (strcmp(key, "proxy_host_immediate_failure_after") == 0) {
-			if (settings_get_time(value,
+			if (str_parse_get_interval(value,
 				&reply_r->proxy_host_immediate_failure_after_secs,
 				&error) < 0) {
 				e_error(client->event,
@@ -189,8 +193,11 @@ static bool client_auth_parse_args(const struct client *client, bool success,
 			} else {
 				reply_r->fail_code = client_auth_fail_code_lookup(value);
 			}
-		} else if (strcmp(key, "user") == 0 ||
-			   strcmp(key, "postlogin_socket") == 0) {
+		} else if (strcmp(key, "user") == 0) {
+			/* Usually this is already handled in sasl-server.c,
+			   but this needs to be saved when handling reauth. */
+			*username_r = value;
+		} else if (strcmp(key, "postlogin_socket") == 0) {
 			/* already handled in sasl-server.c */
 		} else if (str_begins_with(key, "user_")) {
 			if (success) {
@@ -199,8 +206,12 @@ static bool client_auth_parse_args(const struct client *client, bool success,
 			}
 		} else if (str_begins_with(key, "forward_")) {
 			/* these are passed to upstream */
+		} else if (str_begins(key, "event_", &key)) {
+			/* add key to event */
+			event_add_str(client->event_auth, key, value);
 		} else
-			e_debug(event_auth, "Ignoring unknown passdb extra field: %s", key);
+			e_debug(client->event_auth,
+				"Ignoring unknown passdb extra field: %s", key);
 	}
 	if (reply_r->proxy.port == 0) {
 		if ((reply_r->proxy.ssl_flags & AUTH_PROXY_SSL_FLAG_YES) != 0 &&
@@ -214,7 +225,7 @@ static bool client_auth_parse_args(const struct client *client, bool success,
 		reply_r->proxy.username = client->virtual_user;
 
 	if (reply_r->proxy.proxy) {
-		if (reply_r->proxy.password == NULL) {
+		if (reply_r->proxy.password == NULL && !reauth) {
 			e_error(client->event, "proxy: pass field is missing");
 			return FALSE;
 		}
@@ -249,7 +260,7 @@ static void client_proxy_append_conn_info(string_t *str, struct client *client)
 {
 	const char *source_host;
 
-	source_host = login_proxy_get_source_host(client->login_proxy);
+	source_host = net_ip2addr(login_proxy_get_source_host(client->login_proxy));
 	if (source_host[0] != '\0')
 		str_printfa(str, " from %s", source_host);
 	if (strcmp(client->virtual_user, client->proxy_user) != 0) {
@@ -380,34 +391,54 @@ proxy_redirect_reauth_callback(struct auth_client_request *request,
 {
 	struct client *client = context;
 	struct client_auth_reply reply;
-	const char *error = NULL;
+	const char *username, *error = NULL;
 
 	i_assert(client->reauth_request == request);
 
-	client->reauth_request = NULL;
+	if (status != AUTH_REQUEST_STATUS_CONTINUE)
+		client->reauth_request = NULL;
 	switch (status) {
 	case AUTH_REQUEST_STATUS_CONTINUE:
 		error = "Unexpected SASL continuation request received";
 		break;
 	case AUTH_REQUEST_STATUS_OK:
-		if (!client_auth_parse_args(client, FALSE, args, &reply)) {
+		if (!client_auth_parse_args(client, FALSE, TRUE, args,
+					    &reply, &username)) {
 			error = "Redirect authentication returned invalid input";
 			break;
 		}
 
-		if (!reply.proxy.proxy) {
-			error = "Redirect authentication is missing proxy field";
-			break;
+		/* Replace the saved passdb args with the reauth reply. This
+		   way reauth can replace (all of) the forward_* fields. */
+		client->auth_passdb_args = p_strarray_dup(client->pool, args);
+		if (reply.proxy.proxy) {
+			login_proxy_redirect_finish(client->login_proxy,
+						    &reply.proxy.host_ip,
+						    reply.proxy.port);
+			return;
+		} else if (reply.nologin && reply.proxy.host != NULL) {
+			client->auth_nologin_referral = TRUE;
+			/* Update the username */
+			reply.proxy.username = username;
+			/* Send referral to client */
+			client->v.auth_result(client,
+				CLIENT_AUTH_RESULT_REFERRAL_NOLOGIN, &reply,
+				CLIENT_REFERRAL_NOLOGIN_REASON);
+			/* Disconnect from the original backend */
+			login_proxy_failed(client->login_proxy,
+				login_proxy_get_event(client->login_proxy),
+				LOGIN_PROXY_FAILURE_TYPE_AUTH,
+				t_strdup_printf("Redirected to %s", reply.proxy.host));
+			return;
 		}
-		login_proxy_redirect_finish(client->login_proxy,
-					    &reply.proxy.host_ip,
-					    reply.proxy.port);
-		return;
+		error = "Redirect authentication is missing proxy or nologin field";
+		break;
 	case AUTH_REQUEST_STATUS_INTERNAL_FAIL:
 		error = "Internal authentication failure";
 		break;
 	case AUTH_REQUEST_STATUS_FAIL:
-		if (!client_auth_parse_args(client, FALSE, args, &reply))
+		if (!client_auth_parse_args(client, FALSE, TRUE, args,
+					    &reply, &username))
 			error = "Failed to parse auth reply";
 		else if (reply.reason == NULL || reply.reason[0] == '\0')
 			error = "Redirect authentication unexpectedly failed";
@@ -417,6 +448,8 @@ proxy_redirect_reauth_callback(struct auth_client_request *request,
 				reply.reason);
 		break;
 	case AUTH_REQUEST_STATUS_ABORT:
+		if (client->login_proxy == NULL)
+			return;
 		error = "Redirect authentication aborted";
 		break;
 	}
@@ -428,11 +461,13 @@ proxy_redirect_reauth_callback(struct auth_client_request *request,
 
 static void
 proxy_redirect_reauth(struct client *client, const char *destuser,
-		      const struct ip_addr *ip, in_port_t port)
+		      const char *host, in_port_t port)
 {
 	struct auth_request_info info;
 	const char *client_error;
 
+	e_debug(client->event, "Reauthenticating user %s (redirect to %s:%u)",
+		destuser, host, port);
 	if (sasl_server_auth_request_info_fill(client, &info, &client_error) < 0) {
 		const char *error = t_strdup_printf(
 			"Unexpected failure on reauth: %s", client_error);
@@ -447,8 +482,7 @@ proxy_redirect_reauth(struct client *client, const char *destuser,
 	unsigned int connect_timeout_msecs =
 		login_proxy_get_connect_timeout_msecs(client->login_proxy);
 	const char *const extra_fields[] = {
-		t_strdup_printf("proxy_redirect_host_next=%s",
-				net_ipport2str(ip, port)),
+		t_strdup_printf("proxy_redirect_host_next=%s:%u", host, port),
 		str_c(hosts_attempted),
 		t_strdup_printf("destuser=%s", str_tabescape(destuser)),
 		t_strdup_printf("proxy_timeout=%u", connect_timeout_msecs),
@@ -457,6 +491,11 @@ proxy_redirect_reauth(struct client *client, const char *destuser,
 	t_array_init(&info.extra_fields, N_ELEMENTS(extra_fields));
 	array_append(&info.extra_fields, extra_fields,
 		     N_ELEMENTS(extra_fields));
+	if (array_is_created(&client->forward_fields)) {
+		array_append_zero(&client->forward_fields);
+		array_pop_back(&client->forward_fields);
+		info.forward_fields = array_front(&client->forward_fields);
+	}
 	client->reauth_request =
 		auth_client_request_new(auth_client, &info,
 					proxy_redirect_reauth_callback, client);
@@ -477,23 +516,25 @@ proxy_try_redirect(struct client *client, const char *destination,
 	}
 	if (net_str2hostport(destination,
 			     login_proxy_get_port(client->login_proxy),
-			     &host, &port) < 0) {
+			     &host, &port) < 0 || host[0] == '\0') {
 		*error_r = t_strdup_printf(
 			"Failed to parse host:port '%s'", destination);
 		return FALSE;
 	}
+	/* At least for now we support sending the destuser only for reauth
+	   requests. */
+	if (client->proxy_redirect_reauth) {
+		proxy_redirect_reauth(client, destuser, host, port);
+		return TRUE;
+	}
+
 	if (net_addr2ip(host, &ip) < 0) {
 		*error_r = t_strdup_printf(
 			"Failed to parse IP '%s' (DNS lookups not supported)",
 			host);
 		return FALSE;
 	}
-	/* At least for now we support sending the destuser only for reauth
-	   requests. */
-	if (client->proxy_redirect_reauth)
-		proxy_redirect_reauth(client, destuser, &ip, port);
-	else
-		login_proxy_redirect_finish(client->login_proxy, &ip, port);
+	login_proxy_redirect_finish(client->login_proxy, &ip, port);
 	return TRUE;
 }
 
@@ -682,7 +723,7 @@ client_auth_handle_reply(struct client *client,
 		if (reply->reason != NULL)
 			reason = reply->reason;
 		else if (reply->nologin)
-			reason = "Try this server instead.";
+			reason = CLIENT_REFERRAL_NOLOGIN_REASON;
 		else
 			reason = "Logged in, but you should use this server instead.";
 
@@ -759,7 +800,7 @@ client_auth_handle_reply(struct client *client,
 
 void client_auth_respond(struct client *client, const char *response)
 {
-	client->auth_waiting = FALSE;
+	client->auth_client_continue_pending = FALSE;
 	client_set_auth_waiting(client);
 	auth_client_request_continue(client->auth_request, response);
 	if (!client_does_custom_io(client))
@@ -849,10 +890,12 @@ client_auth_reply_args(struct client *client, enum sasl_server_reply sasl_reply,
 		       struct client_auth_reply *reply_r)
 {
 	bool success = sasl_reply == SASL_SERVER_REPLY_SUCCESS;
+	const char *username;
 
 	timeout_remove(&client->to_auth_waiting);
 	if (args != NULL) {
-		if (!client_auth_parse_args(client, success, args, reply_r)) {
+		if (!client_auth_parse_args(client, success, FALSE, args,
+					    reply_r, &username)) {
 			client_auth_result(client,
 				CLIENT_AUTH_RESULT_AUTHFAILED, reply_r,
 				AUTH_FAILED_MSG);
@@ -939,7 +982,6 @@ sasl_callback(struct client *client, enum sasl_server_reply sasl_reply,
 			data = t_strdup_printf("Internal login failure (pid=%s id=%u)",
 					       my_pid, client->master_auth_id);
 		}
-		client->no_extra_disconnect_reason = TRUE;
 		client_destroy(client, data);
 		break;
 	case SASL_SERVER_REPLY_CONTINUE:
@@ -952,7 +994,7 @@ sasl_callback(struct client *client, enum sasl_server_reply sasl_reply,
 			str_truncate(client->auth_response, 0);
 
 		i_assert(client->io == NULL);
-		client->auth_waiting = TRUE;
+		client->auth_client_continue_pending = TRUE;
 		if (!client_does_custom_io(client)) {
 			client->io = io_add_istream(client->input,
 						    client_auth_input, client);
@@ -969,14 +1011,13 @@ client_auth_begin_common(struct client *client, const char *mech_name,
 			 enum sasl_server_auth_flags auth_flags,
 			 const char *init_resp)
 {
-	if (!client->secured && strcmp(client->ssl_set->ssl, "required") == 0) {
-		if (client->set->auth_verbose) {
-			e_info(client->event, "Login failed: "
-			       "SSL required for authentication");
-		}
+	if (!client->connection_secured &&
+	    strcmp(client->ssl_set->ssl, "required") == 0) {
+		e_info(client->event_auth, "Login failed: "
+			"SSL required for authentication");
 		client->auth_attempts++;
 		client_auth_result(client, CLIENT_AUTH_RESULT_SSL_REQUIRED, NULL,
-			"Authentication not allowed until SSL/TLS is enabled.");
+			"Authentication disallowed on non-secure (SSL/TLS) connections.");
 		return 1;
 	}
 
@@ -1021,27 +1062,27 @@ bool client_check_plaintext_auth(struct client *client, bool pass_sent)
 {
 	bool ssl_required = (strcmp(client->ssl_set->ssl, "required") == 0);
 
-	if (client->secured || (!client->set->disable_plaintext_auth &&
-				!ssl_required))
+	i_assert(!ssl_required || !client->set->auth_allow_cleartext);
+
+	if (client->set->auth_allow_cleartext ||
+	    client->connection_secured)
 		return TRUE;
 
-	if (client->set->auth_verbose) {
-		e_info(client->event, "Login failed: "
-		       "Plaintext authentication disabled");
-	}
+	e_info(client->event_auth, "Login failed: "
+		"Cleartext authentication disabled");
 	if (pass_sent) {
 		client_notify_status(client, TRUE,
-			 "Plaintext authentication not allowed "
+			 "cleartext authentication not allowed "
 			 "without SSL/TLS, but your client did it anyway. "
 			 "If anyone was listening, the password was exposed.");
 	}
 
 	if (ssl_required) {
 		client_auth_result(client, CLIENT_AUTH_RESULT_SSL_REQUIRED, NULL,
-			   AUTH_PLAINTEXT_DISABLED_MSG);
+			   AUTH_CLEARTEXT_DISABLED_MSG);
 	} else {
 		client_auth_result(client, CLIENT_AUTH_RESULT_MECH_SSL_REQUIRED, NULL,
-			   AUTH_PLAINTEXT_DISABLED_MSG);
+			   AUTH_CLEARTEXT_DISABLED_MSG);
 	}
 	client->auth_attempts++;
 	return FALSE;
@@ -1056,7 +1097,9 @@ void clients_notify_auth_connected(void)
 
 		timeout_remove(&client->to_auth_waiting);
 
-		client_notify_auth_ready(client);
+		T_BEGIN {
+			client_notify_auth_ready(client);
+		} T_END;
 
 		if (!client_does_custom_io(client) && client->input_blocked) {
 			client->input_blocked = FALSE;

@@ -50,6 +50,7 @@ enum dsync_box_state {
 
 struct dsync_brain {
 	pool_t pool;
+	struct event *event;
 	struct mail_user *user;
 	struct dsync_ibc *ibc;
 	const char *process_title_prefix;
@@ -124,6 +125,7 @@ struct dsync_brain {
 	bool no_notify:1;
 	bool failed:1;
 	bool empty_hdr_workaround:1;
+	bool no_header_hashes:1;
 };
 
 extern const char *dsync_box_state_names[DSYNC_BOX_STATE_DONE+1];

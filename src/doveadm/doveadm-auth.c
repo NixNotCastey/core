@@ -10,13 +10,14 @@
 #include "strescape.h"
 #include "var-expand.h"
 #include "wildcard-match.h"
+#include "dsasl-client.h"
 #include "settings-parser.h"
 #include "master-service.h"
 #include "master-service-settings.h"
 #include "auth-client.h"
 #include "auth-master.h"
-#include "master-auth.h"
-#include "master-login-auth.h"
+#include "login-interface.h"
+#include "login-server-auth.h"
 #include "mail-storage-service.h"
 #include "mail-user.h"
 #include "doveadm.h"
@@ -31,14 +32,18 @@ static struct event_category event_category_auth = {
 
 struct authtest_input {
 	pool_t pool;
+	struct event *event;
+	const char *mechanism;
 	const char *username;
 	const char *master_user;
 	const char *password;
 	struct auth_user_info info;
 	bool success;
 
+	const struct dsasl_client_mech *sasl_mech;
+	struct dsasl_client *sasl_client;
+
 	struct auth_client_request *request;
-	struct master_auth_request master_auth_req;
 
 	unsigned int auth_id;
 	unsigned int auth_pid;
@@ -74,7 +79,8 @@ doveadm_get_auth_master_conn(const char *auth_socket_path)
 static int
 cmd_user_input(struct auth_master_connection *conn,
 	       const struct authtest_input *input,
-	       const char *show_field, bool userdb)
+	       const char *show_field, bool userdb,
+	       struct event *event)
 {
 	const char *lookup_name = userdb ? "userdb lookup" : "passdb lookup";
 	pool_t pool;
@@ -92,9 +98,11 @@ cmd_user_input(struct auth_master_connection *conn,
 	}
 	if (ret < 0) {
 		if (fields[0] == NULL)
-			i_error("%s failed for %s", lookup_name, input->username);
+			e_error(event,
+				"%s failed for %s", lookup_name, input->username);
 		else {
-			i_error("%s failed for %s: %s", lookup_name,
+			e_error(event,
+				"%s failed for %s: %s", lookup_name,
 				input->username, fields[0]);
 		}
 		ret = -1;
@@ -130,12 +138,16 @@ cmd_user_input(struct auth_master_connection *conn,
 }
 
 static void
-auth_callback(struct auth_client_request *request ATTR_UNUSED,
-	      enum auth_request_status status,
-	      const char *data_base64 ATTR_UNUSED,
+auth_callback(struct auth_client_request *request,
+	      enum auth_request_status status, const char *data_base64,
 	      const char *const *args, void *context)
 {
 	struct authtest_input *input = context;
+	const unsigned char *sasl_output;
+	string_t *base64_output;
+	size_t input_len, sasl_output_len;
+	buffer_t *buf;
+	const char *error;
 
 	input->request = NULL;
 	input->auth_id = auth_client_request_get_id(request);
@@ -146,9 +158,6 @@ auth_callback(struct auth_client_request *request ATTR_UNUSED,
 	if (!io_loop_is_running(current_ioloop))
 		return;
 
-	if (status == 0)
-		i_fatal("passdb expects SASL continuation");
-
 	switch (status) {
 	case AUTH_REQUEST_STATUS_ABORT:
 		i_unreached();
@@ -157,9 +166,26 @@ auth_callback(struct auth_client_request *request ATTR_UNUSED,
 		printf("passdb: %s auth failed\n", input->username);
 		break;
 	case AUTH_REQUEST_STATUS_CONTINUE:
-		printf("passdb: %s auth unexpectedly requested continuation\n",
-		       input->username);
-		break;
+		input_len = strlen(data_base64);
+		buf = t_buffer_create(MAX_BASE64_DECODED_SIZE(input_len));
+		if (base64_decode(data_base64, input_len, buf) < 0)
+			i_fatal("Server sent invalid base64 input");
+		if (dsasl_client_input(input->sasl_client, buf->data, buf->used,
+				       &error) < 0) {
+			printf("passdb: %s auth failed: %s\n",
+			       input->username, error);
+			break;
+		} else if (dsasl_client_output(input->sasl_client, &sasl_output,
+					       &sasl_output_len, &error) < 0) {
+			printf("passdb: %s auth failed: %s\n",
+			       input->username, error);
+			break;
+		}
+		base64_output =
+			t_str_new(MAX_BASE64_ENCODED_SIZE(sasl_output_len)+2);
+		base64_encode(sasl_output, sasl_output_len, base64_output);
+		auth_client_request_continue(request, str_c(base64_output));
+		return;
 	case AUTH_REQUEST_STATUS_OK:
 		input->success = TRUE;
 		printf("passdb: %s auth succeeded\n", input->username);
@@ -178,27 +204,27 @@ static void auth_connected(struct auth_client *client,
 			   bool connected, void *context)
 {
 	struct authtest_input *input = context;
+	const char *mech = dsasl_client_mech_get_name(input->sasl_mech);
 	struct auth_request_info info;
-	string_t *init_resp, *base64_resp;
+	const unsigned char *sasl_output;
+	size_t sasl_output_len;
+	string_t *sasl_output_base64;
+	const char *error;
 
 	if (!connected)
 		i_fatal("Couldn't connect to auth socket");
+	if (auth_client_find_mech(client, mech) == NULL)
+		i_fatal("SASL mechanism '%s' not supported by server", mech);
 
-	init_resp = t_str_new(128);
-	str_append(init_resp, input->username);
-	str_append_c(init_resp, '\0');
-	if (input->master_user != NULL)
-		str_append(init_resp, input->master_user);
-	else
-		str_append(init_resp, input->username);
-	str_append_c(init_resp, '\0');
-	str_append(init_resp, input->password);
-
-	base64_resp = t_str_new(128);
-	base64_encode(str_data(init_resp), str_len(init_resp), base64_resp);
+	if (dsasl_client_output(input->sasl_client, &sasl_output,
+				&sasl_output_len, &error) < 0)
+		i_fatal("Failed to create initial SASL reply: %s", error);
+	sasl_output_base64 =
+		t_str_new(MAX_BASE64_ENCODED_SIZE(sasl_output_len));
+	base64_encode(sasl_output, sasl_output_len, sasl_output_base64);
 
 	i_zero(&info);
-	info.mech = "PLAIN";
+	info.mech = mech;
 	info.service = input->info.service;
 	info.session_id = input->info.session_id;
 	info.local_name = input->info.local_name;
@@ -212,12 +238,42 @@ static void auth_connected(struct auth_client *client,
 	info.real_remote_port = input->info.real_remote_port;
 	info.extra_fields = input->info.extra_fields;
 	info.forward_fields = input->info.forward_fields;
-	info.initial_resp_base64 = str_c(base64_resp);
+	info.initial_resp_base64 = str_c(sasl_output_base64);
 	if (auth_want_log_debug())
 		info.flags |= AUTH_REQUEST_FLAG_DEBUG;
 
 	input->request = auth_client_request_new(client, &info,
 						 auth_callback, input);
+}
+
+static void cmd_auth_init_sasl_client(struct authtest_input *input)
+{
+	struct dsasl_client_settings sasl_set;
+
+	if (input->mechanism != NULL) {
+		input->sasl_mech = dsasl_client_mech_find(input->mechanism);
+		if (input->sasl_mech == NULL)
+			i_fatal("SASL mechanism '%s' not supported by client",
+				input->mechanism);
+	}
+	if (input->sasl_mech == NULL)
+		input->sasl_mech = &dsasl_client_mech_plain;
+
+	i_zero(&sasl_set);
+	if (input->master_user == NULL)
+		sasl_set.authid = input->username;
+	else {
+		sasl_set.authid = input->master_user;
+		sasl_set.authzid = input->username;
+	}
+	sasl_set.password = input->password;
+
+	input->sasl_client = dsasl_client_new(input->sasl_mech, &sasl_set);
+}
+
+static void cmd_auth_deinit_sasl_client(struct authtest_input *input)
+{
+	dsasl_client_free(&input->sasl_client);
 }
 
 static void
@@ -230,6 +286,8 @@ cmd_auth_input(const char *auth_socket_path, struct authtest_input *input)
 					       "/auth-client", NULL);
 	}
 
+	cmd_auth_init_sasl_client(input);
+
 	client = auth_client_init(auth_socket_path, getpid(), FALSE);
 	auth_client_connect(client);
 	auth_client_set_connect_notify(client, auth_connected, input);
@@ -239,10 +297,13 @@ cmd_auth_input(const char *auth_socket_path, struct authtest_input *input)
 
 	auth_client_set_connect_notify(client, NULL, NULL);
 	auth_client_deinit(&client);
+
+	cmd_auth_deinit_sasl_client(input);
 }
 
 static void
-auth_user_info_parse_arg(struct auth_user_info *info, const char *arg)
+auth_user_info_parse_arg(struct auth_user_info *info, const char *arg,
+			 ARRAY_TYPE(const_string) *forward_fields)
 {
 	const char *key, *value;
 
@@ -277,21 +338,7 @@ auth_user_info_parse_arg(struct auth_user_info *info, const char *arg)
 		if (net_str2port(value, &info->real_remote_port) < 0)
 			i_fatal("real_rport: Invalid port number");
 	} else if (str_begins(arg, "forward_", &key)) {
-		value = strchr(key, '=');
-
-		if (value == NULL)
-			value = "";
-		else
-			key = t_strdup_until(key, value++);
-		key = str_tabescape(key);
-		value = str_tabescape(value);
-		if (info->forward_fields == NULL) {
-			info->forward_fields =
-				t_strdup_printf("%s=%s", key, value);
-		} else {
-			info->forward_fields =
-				t_strdup_printf("%s\t%s=%s", info->forward_fields, key, value);
-		}
+		array_push_back(forward_fields, &key);
 	} else {
 		if (!array_is_created(&info->extra_fields))
 			t_array_init(&info->extra_fields, 4);
@@ -302,8 +349,14 @@ auth_user_info_parse_arg(struct auth_user_info *info, const char *arg)
 static void
 auth_user_info_parse(struct auth_user_info *info, const char *const *args)
 {
+	ARRAY_TYPE(const_string) forward_fields;
+	t_array_init(&forward_fields, 8);
 	for (unsigned int i = 0; args[i] != NULL; i++)
-		auth_user_info_parse_arg(info, args[i]);
+		auth_user_info_parse_arg(info, args[i], &forward_fields);
+	if (array_count(&forward_fields) > 0) {
+		array_append_zero(&forward_fields);
+		info->forward_fields = array_front(&forward_fields);
+	}
 }
 
 static void
@@ -346,7 +399,7 @@ static void cmd_auth_cache_flush(struct doveadm_cmd_context *cctx)
 
 	conn = doveadm_get_auth_master_conn(master_socket_path);
 	if (auth_master_cache_flush(conn, users, &count) < 0) {
-		i_error("Cache flush failed");
+		e_error(cctx->event, "Cache flush failed");
 		doveadm_exit_code = EX_TEMPFAIL;
 	} else {
 		printf("%u cache entries flushed\n", count);
@@ -370,6 +423,7 @@ static void cmd_auth_test(struct doveadm_cmd_context *cctx)
 	authtest_input_init(&input);
 	(void)doveadm_cmd_param_str(cctx, "socket-path", &auth_socket_path);
 	(void)doveadm_cmd_param_str(cctx, "master-user", &input.master_user);
+	(void)doveadm_cmd_param_str(cctx, "sasl-mech", &input.mechanism);
 	if (doveadm_cmd_param_array(cctx, "auth-info", &auth_info))
 		auth_user_info_parse(&input.info, auth_info);
 
@@ -383,20 +437,24 @@ static void cmd_auth_test(struct doveadm_cmd_context *cctx)
 }
 
 static void
-master_auth_callback(const char *const *auth_args,
-		     const char *errormsg, void *context)
+login_server_auth_callback(const char *const *auth_args,
+			   const char *errormsg, void *context)
 {
 	struct authtest_input *input = context;
-	unsigned int i;
 
 	io_loop_stop(current_ioloop);
 	if (errormsg != NULL) {
-		i_error("userdb lookup failed: %s", errormsg);
+		e_error(input->event, "userdb lookup failed: %s", errormsg);
 		return;
 	}
-	printf("userdb extra fields:\n");
-	for (i = 0; auth_args[i] != NULL; i++)
-		printf("  %s\n", auth_args[i]);
+
+	if (*auth_args != NULL) {
+		printf("userdb user: %s\n", *auth_args++);
+		printf("userdb extra fields:\n");
+		while (*auth_args != NULL)
+			printf("  %s\n", *auth_args++);
+	}
+
 	input->success = TRUE;
 }
 
@@ -404,31 +462,31 @@ static void
 cmd_auth_master_input(const char *auth_master_socket_path,
 		      struct authtest_input *input)
 {
-	struct master_login_auth *master_auth;
-	struct master_auth_request master_auth_req;
+	struct login_server_auth *auth;
+	struct login_request login_req;
 	buffer_t buf;
 
-	i_zero(&master_auth_req);
-	master_auth_req.tag = 1;
-	master_auth_req.auth_pid = input->auth_pid;
-	master_auth_req.auth_id = input->auth_id;
-	master_auth_req.client_pid = getpid();
-	master_auth_req.local_ip = input->info.local_ip;
-	master_auth_req.remote_ip = input->info.remote_ip;
+	i_zero(&login_req);
+	login_req.tag = 1;
+	login_req.auth_pid = input->auth_pid;
+	login_req.auth_id = input->auth_id;
+	login_req.client_pid = getpid();
+	login_req.local_ip = input->info.local_ip;
+	login_req.remote_ip = input->info.remote_ip;
 
-	buffer_create_from_data(&buf, master_auth_req.cookie,
-				sizeof(master_auth_req.cookie));
-	if (strlen(input->auth_cookie) == MASTER_AUTH_COOKIE_SIZE*2)
+	buffer_create_from_data(&buf, login_req.cookie,
+				sizeof(login_req.cookie));
+	if (strlen(input->auth_cookie) == LOGIN_REQUEST_COOKIE_SIZE*2)
 		(void)hex_to_binary(input->auth_cookie, &buf);
 
 	input->success = FALSE;
-	master_auth = master_login_auth_init(auth_master_socket_path, FALSE);
+	auth = login_server_auth_init(auth_master_socket_path, FALSE);
 	io_loop_set_running(current_ioloop);
-	master_login_auth_request(master_auth, &master_auth_req,
-				  master_auth_callback, input);
+	login_server_auth_request(auth, &login_req,
+				  login_server_auth_callback, input);
 	if (io_loop_is_running(current_ioloop))
 		io_loop_run(current_ioloop);
-	master_login_auth_deinit(&master_auth);
+	login_server_auth_deinit(&auth);
 }
 
 static void cmd_auth_login(struct doveadm_cmd_context *cctx)
@@ -452,6 +510,7 @@ static void cmd_auth_login(struct doveadm_cmd_context *cctx)
 				    "/auth-master", NULL);
 	}
 	(void)doveadm_cmd_param_str(cctx, "master-user", &input.master_user);
+	(void)doveadm_cmd_param_str(cctx, "sasl-mech", &input.mechanism);
 	if (doveadm_cmd_param_array(cctx, "auth-info", &auth_info))
 		auth_user_info_parse(&input.info, auth_info);
 	if (!doveadm_cmd_param_str(cctx, "user", &input.username))
@@ -459,7 +518,10 @@ static void cmd_auth_login(struct doveadm_cmd_context *cctx)
 	if (!doveadm_cmd_param_str(cctx, "password", &input.password))
 		input.password = t_askpass("Password: ");
 
+	cmd_auth_init_sasl_client(&input);
+
 	input.pool = pool_alloconly_create("auth login", 256);
+	input.event = event_create(cctx->event);
 	/* authenticate */
 	auth_client = auth_client_init(auth_login_socket_path, getpid(), FALSE);
 	auth_client_connect(auth_client);
@@ -473,6 +535,8 @@ static void cmd_auth_login(struct doveadm_cmd_context *cctx)
 	if (!input.success)
 		doveadm_exit_code = EX_NOPERM;
 	auth_client_deinit(&auth_client);
+	event_unref(&input.event);
+	cmd_auth_deinit_sasl_client(&input);
 	pool_unref(&input.pool);
 }
 
@@ -503,7 +567,7 @@ static void cmd_auth_lookup(struct doveadm_cmd_context *cctx)
 		else
 			putchar('\n');
 
-		ret = cmd_user_input(conn, &input, show_field, FALSE);
+		ret = cmd_user_input(conn, &input, show_field, FALSE, cctx->event);
 		switch (ret) {
 		case -1:
 			doveadm_exit_code = EX_TEMPFAIL;
@@ -567,17 +631,16 @@ cmd_user_mail_print_fields(const struct authtest_input *input,
 static int
 cmd_user_mail_input(struct mail_storage_service_ctx *storage_service,
 		    const struct authtest_input *input,
-		    const char *show_field, const char *expand_field)
+		    const char *show_field, const char *expand_field,
+		    struct event *event)
 {
 	struct mail_storage_service_input service_input;
-	struct mail_storage_service_user *service_user;
 	struct mail_user *user;
 	const char *error, *const *userdb_fields;
 	pool_t pool;
 	int ret;
 
 	i_zero(&service_input);
-	service_input.module = "mail";
 	service_input.service = input->info.service;
 	service_input.username = input->username;
 	service_input.local_ip = input->info.local_ip;
@@ -591,8 +654,7 @@ cmd_user_mail_input(struct mail_storage_service_ctx *storage_service,
 						&userdb_fields);
 
 	if ((ret = mail_storage_service_lookup_next(storage_service, &service_input,
-						    &service_user, &user,
-						    &error)) <= 0) {
+						    &user, &error)) <= 0) {
 		pool_unref(&pool);
 		if (ret < 0)
 			return -1;
@@ -610,14 +672,13 @@ cmd_user_mail_input(struct mail_storage_service_ctx *storage_service,
 					  mail_user_var_expand_table(user),
 					  mail_user_var_expand_func_table, user,
 					  &error) <= 0) {
-			i_error("Failed to expand %s: %s", expand_field, error);
+			e_error(event, "Failed to expand %s: %s", expand_field, error);
 		} else {
 			printf("%s\n", str_c(str));
 		}
 	}
 
 	mail_user_deinit(&user);
-	mail_storage_service_user_unref(&service_user);
 	pool_unref(&pool);
 	return 1;
 }
@@ -646,12 +707,12 @@ static void cmd_user(struct doveadm_cmd_context *cctx)
 		auth_cmd_help(cctx);
 
 	if (expand_field != NULL && userdb_only) {
-		i_error("-e can't be used with -u");
+		e_error(cctx->event, "-e can't be used with -u");
 		doveadm_exit_code = EX_USAGE;
 		return;
 	}
 	if (expand_field != NULL && show_field != NULL) {
-		i_error("-e can't be used with -f");
+		e_error(cctx->event, "-e can't be used with -f");
 		doveadm_exit_code = EX_USAGE;
 		return;
 	}
@@ -698,8 +759,9 @@ static void cmd_user(struct doveadm_cmd_context *cctx)
 			putchar('\n');
 
 		ret = !userdb_only ?
-			cmd_user_mail_input(storage_service, &input, show_field, expand_field) :
-			cmd_user_input(conn, &input, show_field, TRUE);
+			cmd_user_mail_input(storage_service, &input, show_field,
+					    expand_field, cctx->event) :
+			cmd_user_input(conn, &input, show_field, TRUE, cctx->event);
 		switch (ret) {
 		case -1:
 			doveadm_exit_code = EX_TEMPFAIL;
@@ -719,9 +781,10 @@ struct doveadm_cmd_ver2 doveadm_cmd_auth[] = {
 {
 	.cmd = cmd_auth_test,
 	.name = "auth test",
-	.usage = "[-a <auth socket path>] [-x <auth info>] [-M <master user>] <user> [<password>]",
+	.usage = "[-a <auth socket path>] [-A <sasl mech>] [-x <auth info>] [-M <master user>] <user> [<password>]",
 DOVEADM_CMD_PARAMS_START
 DOVEADM_CMD_PARAM('a', "socket-path", CMD_PARAM_STR, 0)
+DOVEADM_CMD_PARAM('A', "sasl-mech", CMD_PARAM_STR, 0)
 DOVEADM_CMD_PARAM('x', "auth-info", CMD_PARAM_ARRAY, 0)
 DOVEADM_CMD_PARAM('M', "master-user", CMD_PARAM_STR, 0)
 DOVEADM_CMD_PARAM('\0', "user", CMD_PARAM_STR, CMD_PARAM_FLAG_POSITIONAL)
@@ -731,10 +794,11 @@ DOVEADM_CMD_PARAMS_END
 {
 	.cmd = cmd_auth_login,
 	.name = "auth login",
-	.usage = "[-a <auth-login socket path>] [-m <auth-master socket path>] [-x <auth info>] [-M <master user>] <user> [<password>]",
+	.usage = "[-a <auth-login socket path>] [-m <auth-master socket path>] [-A <sasl mech>] [-x <auth info>] [-M <master user>] <user> [<password>]",
 DOVEADM_CMD_PARAMS_START
 DOVEADM_CMD_PARAM('a', "auth-login-socket-path", CMD_PARAM_STR, 0)
 DOVEADM_CMD_PARAM('m', "auth-master-socket-path", CMD_PARAM_STR, 0)
+DOVEADM_CMD_PARAM('A', "sasl-mech", CMD_PARAM_STR, 0)
 DOVEADM_CMD_PARAM('x', "auth-info", CMD_PARAM_ARRAY, 0)
 DOVEADM_CMD_PARAM('M', "master-user", CMD_PARAM_STR, 0)
 DOVEADM_CMD_PARAM('\0', "user", CMD_PARAM_STR, CMD_PARAM_FLAG_POSITIONAL)

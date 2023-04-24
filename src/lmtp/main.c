@@ -68,7 +68,6 @@ static void drop_privileges(void)
 	struct master_service_settings_output output;
 
 	i_zero(&input);
-	input.module = "lmtp";
 	input.service = "lmtp";
 	if (master_service_settings_read(master_service,
 					 &input, &output, &error) < 0)
@@ -126,7 +125,6 @@ int main(int argc, char *argv[])
 	enum mail_storage_service_flags storage_service_flags =
 		MAIL_STORAGE_SERVICE_FLAG_USERDB_LOOKUP |
 		MAIL_STORAGE_SERVICE_FLAG_TEMP_PRIV_DROP |
-		MAIL_STORAGE_SERVICE_FLAG_NO_LOG_INIT |
 		MAIL_STORAGE_SERVICE_FLAG_NO_IDLE_TIMEOUT;
 	const char *tmp_base_dir;
 	int c;
@@ -134,8 +132,6 @@ int main(int argc, char *argv[])
 	if (IS_STANDALONE()) {
 		service_flags |= MASTER_SERVICE_FLAG_STANDALONE |
 			MASTER_SERVICE_FLAG_STD_CLIENT;
-	} else {
-		service_flags |= MASTER_SERVICE_FLAG_KEEP_CONFIG_OPEN  ;
 	}
 
 	master_service = master_service_init("lmtp", service_flags,

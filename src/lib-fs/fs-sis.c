@@ -3,6 +3,7 @@
 #include "lib.h"
 #include "str.h"
 #include "istream.h"
+#include "istream-nonuls.h"
 #include "ostream.h"
 #include "ostream-cmp.h"
 #include "fs-sis-common.h"
@@ -178,70 +179,26 @@ static bool fs_sis_try_link(struct sis_fs_file *file)
 	return TRUE;
 }
 
-static void fs_sis_replace_hash_file(struct sis_fs_file *file)
+static struct istream *
+fs_sis_read_stream(struct fs_file *_file, size_t max_buffer_size)
 {
-	struct fs *super_fs = file->file.parent->fs;
-	struct fs_file *temp_file;
-	const char *hash_fname;
-	string_t *temp_path;
-	int ret;
-
-	if (file->hash_input == NULL) {
-		/* hash file didn't exist previously. we should be able to
-		   create it with link() */
-		if (fs_copy(file->file.parent, file->hash_file) < 0) {
-			if (errno == EEXIST) {
-				/* the file was just created. it's probably
-				   a duplicate, but it's too much trouble
-				   trying to deduplicate it anymore */
-			} else {
-				e_error(file->file.event, "%s",
-					fs_file_last_error(file->hash_file));
-			}
-		}
-		return;
+	struct istream *result = fs_read_stream(_file->parent, max_buffer_size);
+	if (result->stream_errno == ENOENT) {
+		const char *file_size_str;
+		uoff_t file_size;
+		if (fs_lookup_metadata(_file, FS_METADATA_FILE_SIZE, &file_size_str) <= 0)
+			return result;
+		if (str_to_uoff(file_size_str, &file_size) < 0)
+			return result;
+		i_stream_unref(&result);
+		e_warning(_file->event, "File %s is missing, replacing with spaces", _file->path);
+		struct istream *zeroes_stream = i_stream_create_file("/dev/zero", max_buffer_size);
+		struct istream *space_stream = i_stream_create_nonuls(zeroes_stream, ' ');
+		result = i_stream_create_limit(space_stream, file_size);
+		i_stream_unref(&space_stream);
+		i_stream_unref(&zeroes_stream);
 	}
-
-	temp_path = t_str_new(256);
-	hash_fname = strrchr(file->hash_path, '/');
-	if (hash_fname == NULL)
-		hash_fname = file->hash_path;
-	else {
-		str_append_data(temp_path, file->hash_path,
-				(hash_fname-file->hash_path) + 1);
-		hash_fname++;
-	}
-	str_printfa(temp_path, "%s%s.tmp",
-		    super_fs->set.temp_file_prefix, hash_fname);
-
-	/* replace existing hash file atomically */
-	temp_file = fs_file_init_parent(&file->file, str_c(temp_path),
-					FS_OPEN_MODE_READONLY, 0);
-	ret = fs_copy(file->file.parent, temp_file);
-	if (ret < 0 && errno == EEXIST) {
-		/* either someone's racing us or it's a stale file.
-		   try to continue. */
-		if (fs_delete(temp_file) < 0 &&
-		    errno != ENOENT)
-			e_error(file->file.event, "%s", fs_file_last_error(temp_file));
-		ret = fs_copy(file->file.parent, temp_file);
-	}
-	if (ret < 0) {
-		e_error(file->file.event, "%s", fs_file_last_error(temp_file));
-		fs_file_deinit(&temp_file);
-		return;
-	}
-
-	if (fs_rename(temp_file, file->hash_file) < 0) {
-		if (errno == ENOENT) {
-			/* apparently someone else just renamed it. ignore. */
-		} else {
-			e_error(file->file.event, "%s",
-				fs_file_last_error(file->hash_file));
-		}
-		(void)fs_delete(temp_file);
-	}
-	fs_file_deinit(&temp_file);
+	return result;
 }
 
 static int fs_sis_write(struct fs_file *_file, const void *data, size_t size)
@@ -261,109 +218,73 @@ static int fs_sis_write(struct fs_file *_file, const void *data, size_t size)
 
 	if (fs_write(_file->parent, data, size) < 0)
 		return -1;
-	T_BEGIN {
-		fs_sis_replace_hash_file(file);
-	} T_END;
 	return 0;
 }
 
 static void fs_sis_write_stream(struct fs_file *_file)
 {
-	struct sis_fs_file *file = SIS_FILE(_file);
-
-	i_assert(_file->output == NULL);
-
 	if (_file->parent == NULL) {
 		_file->output = o_stream_create_error_str(EINVAL, "%s",
 						fs_file_last_error(_file));
 	} else {
-		file->fs_output = fs_write_stream(_file->parent);
-		if (file->hash_input == NULL) {
-			_file->output = file->fs_output;
-			o_stream_ref(_file->output);
-		} else {
-			/* compare if files are equal */
-			_file->output = o_stream_create_cmp(file->fs_output,
-							    file->hash_input);
-		}
+		_file->output = fs_write_stream(_file->parent);
 	}
 	o_stream_set_name(_file->output, _file->path);
 }
 
 static int fs_sis_write_stream_finish(struct fs_file *_file, bool success)
 {
-	struct sis_fs_file *file = SIS_FILE(_file);
 
 	if (!success) {
 		if (_file->parent != NULL)
-			fs_write_stream_abort_parent(_file, &file->fs_output);
-		o_stream_unref(&_file->output);
+			fs_write_stream_abort_parent(_file, &_file->output);
 		return -1;
 	}
 
-	if (file->hash_input != NULL &&
-	    o_stream_cmp_equals(_file->output) &&
-	    i_stream_read_eof(file->hash_input)) {
-		o_stream_unref(&_file->output);
-		if (fs_sis_try_link(file)) {
-			fs_write_stream_abort_parent(_file, &file->fs_output);
-			return 1;
-		}
-	}
-	if (_file->output != NULL)
-		o_stream_unref(&_file->output);
 
-	if (fs_write_stream_finish(_file->parent, &file->fs_output) < 0)
-		return -1;
-	T_BEGIN {
-		fs_sis_replace_hash_file(file);
-	} T_END;
-	return 1;
+	return fs_write_stream_finish(_file->parent, &_file->output);
 }
 
 static int fs_sis_delete(struct fs_file *_file)
 {
-	T_BEGIN {
-		fs_sis_try_unlink_hash_file(_file, _file->parent);
-	} T_END;
 	return fs_delete(_file->parent);
 }
 
 const struct fs fs_class_sis = {
 	.name = "sis",
 	.v = {
-		fs_sis_alloc,
-		fs_sis_init,
-		NULL,
-		fs_sis_free,
-		fs_wrapper_get_properties,
-		fs_sis_file_alloc,
-		fs_sis_file_init,
-		fs_sis_file_deinit,
-		fs_sis_file_close,
-		fs_wrapper_file_get_path,
-		fs_wrapper_set_async_callback,
-		fs_wrapper_wait_async,
-		fs_wrapper_set_metadata,
-		fs_wrapper_get_metadata,
-		fs_wrapper_prefetch,
-		fs_wrapper_read,
-		fs_wrapper_read_stream,
-		fs_sis_write,
-		fs_sis_write_stream,
-		fs_sis_write_stream_finish,
-		fs_wrapper_lock,
-		fs_wrapper_unlock,
-		fs_wrapper_exists,
-		fs_wrapper_stat,
-		fs_wrapper_copy,
-		fs_wrapper_rename,
-		fs_sis_delete,
-		fs_wrapper_iter_alloc,
-		fs_wrapper_iter_init,
-		NULL,
-		NULL,
-		NULL,
-		fs_wrapper_get_nlinks,
+		.alloc = fs_sis_alloc,
+		.init = fs_sis_init,
+		.deinit = NULL,
+		.free = fs_sis_free,
+		.get_properties = fs_wrapper_get_properties,
+		.file_alloc = fs_sis_file_alloc,
+		.file_init = fs_sis_file_init,
+		.file_deinit = fs_sis_file_deinit,
+		.file_close = fs_sis_file_close,
+		.get_path = fs_wrapper_file_get_path,
+		.set_async_callback = fs_wrapper_set_async_callback,
+		.wait_async = fs_wrapper_wait_async,
+		.set_metadata = fs_wrapper_set_metadata,
+		.get_metadata = fs_wrapper_get_metadata,
+		.prefetch = fs_wrapper_prefetch,
+		.read = fs_wrapper_read,
+		.read_stream = fs_sis_read_stream,
+		.write = fs_sis_write,
+		.write_stream = fs_sis_write_stream,
+		.write_stream_finish = fs_sis_write_stream_finish,
+		.lock = fs_wrapper_lock,
+		.unlock = fs_wrapper_unlock,
+		.exists = fs_wrapper_exists,
+		.stat = fs_wrapper_stat,
+		.copy = fs_wrapper_copy,
+		.rename = fs_wrapper_rename,
+		.delete_file = fs_sis_delete,
+		.iter_alloc = fs_wrapper_iter_alloc,
+		.iter_init = fs_wrapper_iter_init,
+		.iter_next = NULL,
+		.iter_deinit = NULL,
+		.switch_ioloop = NULL,
+		.get_nlinks = fs_wrapper_get_nlinks,
 	}
 };

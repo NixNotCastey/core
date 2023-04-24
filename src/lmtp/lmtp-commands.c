@@ -2,6 +2,7 @@
 
 #include "lmtp-common.h"
 #include "str.h"
+#include "strescape.h"
 #include "istream.h"
 #include "istream-concat.h"
 #include "ostream.h"
@@ -81,7 +82,8 @@ cmd_rcpt_handle_forward_fields(struct smtp_server_cmd_ctx *cmd,
 		return -1;
 	}
 
-	lrcpt->forward_fields = p_strdup(rcpt->pool, str_c(xforward));
+	char **fields = p_strsplit_tabescaped(rcpt->pool, str_c(xforward));
+	lrcpt->forward_fields = (const char *const *)fields;
 	return 0;
 }
 
@@ -259,7 +261,7 @@ int cmd_data_begin(void *conn_ctx,
 
 	path = t_str_new(256);
 	mail_user_set_get_temp_prefix(path, client->raw_mail_user->set);
-	client->state.mail_data_output = 
+	client->state.mail_data_output =
 		iostream_temp_create_named(str_c(path), 0, "(lmtp data)");
 
 	client->state.data_input = data_input;

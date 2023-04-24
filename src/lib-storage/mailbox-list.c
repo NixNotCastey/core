@@ -148,7 +148,7 @@ int mailbox_list_create(const char *driver, struct mail_namespace *ns,
 	list->root_permissions.dir_create_mode = (mode_t)-1;
 	list->root_permissions.file_create_gid = (gid_t)-1;
 	list->changelog_timestamp = (time_t)-1;
-	if (set->no_noselect)
+	if (!set->keep_noselect)
 		list->props |= MAILBOX_LIST_PROP_NO_NOSELECT;
 
 	/* copy settings */
@@ -185,7 +185,7 @@ int mailbox_list_create(const char *driver, struct mail_namespace *ns,
 	list->set.index_control_use_maildir_name =
 		set->index_control_use_maildir_name;
 	list->set.iter_from_index_dir = set->iter_from_index_dir;
-	list->set.no_noselect = set->no_noselect;
+	list->set.keep_noselect = set->keep_noselect;
 	list->set.no_fs_validation = set->no_fs_validation;
 
 	if (*set->mailbox_dir_name == '\0')
@@ -369,8 +369,12 @@ mailbox_list_settings_parse_full(struct mail_user *user, const char *data,
 		} else if (strcmp(key, "ITERINDEX") == 0) {
 			set_r->iter_from_index_dir = TRUE;
 			continue;
+		} else if (strcmp(key, "KEEP-NOSELECT") == 0) {
+			set_r->keep_noselect = TRUE;
+			continue;
 		} else if (strcmp(key, "NO-NOSELECT") == 0) {
-			set_r->no_noselect = TRUE;
+			/* retained only for backward compatibility */
+			set_r->keep_noselect = FALSE;
 			continue;
 		} else if (strcmp(key, "NO-FS-VALIDATION") == 0) {
 			set_r->no_fs_validation = TRUE;
@@ -419,7 +423,7 @@ const char *mailbox_list_get_unexpanded_path(struct mailbox_list *list,
 					     enum mailbox_list_path_type type)
 {
 	const struct mail_storage_settings *mail_set;
-	const char *location = list->ns->unexpanded_set->location;
+	const char *location = list->ns->set->unexpanded_location;
 	struct mail_user *user = list->ns->user;
 	struct mailbox_list_settings set;
 	const char *p, *path, *error;
@@ -433,10 +437,8 @@ const char *mailbox_list_get_unexpanded_path(struct mailbox_list *list,
 	location++;
 
 	if (*location == '\0') {
-		mail_set = mail_user_set_get_driver_settings(user->set_info,
-			user->unexpanded_set, MAIL_STORAGE_SET_DRIVER_NAME);
-		i_assert(mail_set != NULL);
-		location = mail_set->mail_location;
+		mail_set = mail_user_set_get_storage_set(user);
+		location = mail_set->unexpanded_mail_location;
 		if (*location == SETTING_STRVAR_EXPANDED[0])
 			return "";
 		i_assert(*location == SETTING_STRVAR_UNEXPANDED[0]);
@@ -885,21 +887,27 @@ mailbox_list_get_storage_driver(struct mailbox_list *list, const char *driver,
 	return 0;
 }
 
-int mailbox_list_get_storage(struct mailbox_list **list, const char *vname,
-			     struct mail_storage **storage_r)
+int mailbox_list_default_get_storage(struct mailbox_list **list,
+				     const char **vname,
+				     enum mailbox_list_get_storage_flags flags ATTR_UNUSED,
+				     struct mail_storage **storage_r)
 {
 	const struct mailbox_settings *set;
 
-	if ((*list)->v.get_storage != NULL)
-		return (*list)->v.get_storage(list, vname, storage_r);
-
-	set = mailbox_settings_find((*list)->ns, vname);
+	set = mailbox_settings_find((*list)->ns, *vname);
 	if (set != NULL && set->driver != NULL && set->driver[0] != '\0') {
 		return mailbox_list_get_storage_driver(*list, set->driver,
 						       storage_r);
 	}
 	*storage_r = mail_namespace_get_default_storage((*list)->ns);
 	return 0;
+}
+
+int mailbox_list_get_storage(struct mailbox_list **list, const char **vname,
+			     enum mailbox_list_get_storage_flags flags,
+			     struct mail_storage **storage_r)
+{
+	return (*list)->v.get_storage(list, vname, flags, storage_r);
 }
 
 void mailbox_list_get_default_storage(struct mailbox_list *list,
@@ -1480,6 +1488,8 @@ bool mailbox_list_set_get_root_path(const struct mailbox_list_settings *set,
 	case MAILBOX_LIST_PATH_TYPE_INDEX_PRIVATE:
 		path = set->index_pvt_dir;
 		break;
+	case MAILBOX_LIST_PATH_TYPE_COUNT:
+		i_unreached();
 	}
 	*path_r = path;
 	return path != NULL;

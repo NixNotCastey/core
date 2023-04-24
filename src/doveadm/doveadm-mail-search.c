@@ -29,7 +29,7 @@ cmd_search_box(struct doveadm_mail_cmd_context *ctx,
 
 	ret = 0;
 	if (mailbox_get_metadata(box, MAILBOX_METADATA_GUID, &metadata) < 0) {
-		i_error("Couldn't get mailbox '%s' GUID: %s",
+		e_error(ctx->cctx->event, "Couldn't get mailbox '%s' GUID: %s",
 			mailbox_get_vname(box),
 			mailbox_get_last_internal_error(box, NULL));
 		ret = -1;
@@ -69,18 +69,19 @@ cmd_search_run(struct doveadm_mail_cmd_context *ctx, struct mail_user *user)
 	return ret;
 }
 
-static void cmd_search_init(struct doveadm_mail_cmd_context *ctx,
-			    const char *const args[])
+static void cmd_search_init(struct doveadm_mail_cmd_context *_ctx)
 {
-	if (args[0] == NULL)
+	struct doveadm_cmd_context *cctx = _ctx->cctx;
+
+	const char *const *query;
+	if (!doveadm_cmd_param_array(cctx, "query", &query))
 		doveadm_mail_help_name("search");
+	_ctx->search_args = doveadm_mail_build_search_args(query);
 
 	doveadm_print_header("mailbox-guid", "mailbox-guid",
 			     DOVEADM_PRINT_HEADER_FLAG_HIDE_TITLE);
 	doveadm_print_header("uid", "uid",
 			     DOVEADM_PRINT_HEADER_FLAG_HIDE_TITLE);
-
-	ctx->search_args = doveadm_mail_build_search_args(args);
 }
 
 static struct doveadm_mail_cmd_context *cmd_search_alloc(void)

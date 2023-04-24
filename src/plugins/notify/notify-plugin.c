@@ -40,7 +40,7 @@ void notify_contexts_mail_transaction_begin(struct mailbox_transaction_context *
 {
 	struct notify_context *ctx;
 	struct notify_mail_txn *mail_txn;
-	
+
 	for (ctx = ctx_list; ctx != NULL; ctx = ctx->next) {
 		mail_txn = i_new(struct notify_mail_txn, 1);
 		mail_txn->parent_mailbox_txn = t;
@@ -239,8 +239,14 @@ notify_register(const struct notify_vfuncs *v)
 	return ctx;
 }
 
-void notify_unregister(struct notify_context *ctx)
+void notify_unregister(struct notify_context **_ctx)
 {
+	struct notify_context *ctx = *_ctx;
+
+	if (ctx == NULL)
+		return;
+	*_ctx = NULL;
+
 	struct notify_mail_txn *mail_txn = ctx->mail_txn_list;
 
 	for (; mail_txn != NULL; mail_txn = mail_txn->next) {

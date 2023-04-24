@@ -37,6 +37,7 @@ struct doveadm_proxy_redirect {
 struct doveadm_mail_server_cmd {
 	struct doveadm_server *server;
 	struct doveadm_client *conn;
+	struct doveadm_mail_cmd_context *cmd_ctx;
 	char *username;
 
 	ARRAY(struct doveadm_proxy_redirect) redirect_path;
@@ -44,6 +45,7 @@ struct doveadm_mail_server_cmd {
 	char *cmdline;
 	struct istream *input;
 	bool streaming;
+	bool print_username;
 };
 
 struct doveadm_server_request {
@@ -51,19 +53,16 @@ struct doveadm_server_request {
 	struct doveadm_server *server;
 	struct doveadm_client_settings set;
 	const char *username;
+	bool print_username;
 };
 
 static HASH_TABLE(char *, struct doveadm_server *) servers;
 static pool_t server_pool;
-static struct doveadm_mail_cmd_context *cmd_ctx;
 static bool internal_failure = FALSE;
 static ARRAY(struct doveadm_server_request) doveadm_server_request_queue;
 
 static void doveadm_cmd_callback(const struct doveadm_server_reply *reply,
 				 void *context);
-static void doveadm_mail_server_handle(struct doveadm_server *server,
-				       struct doveadm_client *conn,
-				       const char *username);
 
 static void doveadm_server_request_free(struct doveadm_server_request *request)
 {
@@ -71,7 +70,7 @@ static void doveadm_server_request_free(struct doveadm_server_request *request)
 	pool_unref(&request->pool);
 }
 
-static struct doveadm_server *doveadm_server_get(const char *name)
+struct doveadm_server *doveadm_server_get(const char *name)
 {
 	struct doveadm_server *server;
 	char *dup_name;
@@ -109,11 +108,10 @@ static void doveadm_mail_server_cmd_free(struct doveadm_mail_server_cmd **_cmd)
 	i_free(cmd);
 }
 
-static int
-doveadm_cmd_pass_lookup(struct doveadm_mail_cmd_context *ctx,
-			const char *const *extra_fields, pool_t pool,
-			const char *const **fields_r,
-			const char **auth_socket_path_r)
+int doveadm_cmd_pass_lookup(struct doveadm_mail_cmd_context *ctx,
+			    const char *const *extra_fields, pool_t pool,
+			    const char *const **fields_r,
+			    const char **auth_socket_path_r)
 {
 	struct auth_master_connection *auth_conn;
 	struct auth_user_info info;
@@ -144,12 +142,11 @@ doveadm_cmd_pass_lookup(struct doveadm_mail_cmd_context *ctx,
 				       pool, fields_r);
 }
 
-static int
-doveadm_cmd_pass_reply_parse(struct doveadm_mail_cmd_context *ctx,
-			     const char *auth_socket_path,
-			     const char *const *fields,
-			     struct auth_proxy_settings *proxy_set,
-			     bool *nologin_r, const char **error_r)
+int doveadm_cmd_pass_reply_parse(struct doveadm_mail_cmd_context *ctx,
+				 const char *auth_socket_path,
+				 const char *const *fields,
+				 struct auth_proxy_settings *proxy_set,
+				 bool *nologin_r, const char **error_r)
 {
 	const char *orig_user = proxy_set->username;
 	const char *error, *mend;
@@ -158,8 +155,8 @@ doveadm_cmd_pass_reply_parse(struct doveadm_mail_cmd_context *ctx,
 	proxy_set->username = NULL;
 	proxy_set->host = NULL;
 
-	if (array_is_created(&ctx->proxy_forward_fields))
-		array_clear(&ctx->proxy_forward_fields);
+	if (array_is_created(&ctx->auth_proxy_forward_fields))
+		array_clear(&ctx->auth_proxy_forward_fields);
 
 	*nologin_r = FALSE;
 	for (unsigned int i = 0; fields[i] != NULL; i++) {
@@ -191,13 +188,13 @@ doveadm_cmd_pass_reply_parse(struct doveadm_mail_cmd_context *ctx,
 			if (proxy_set->username == NULL)
 				proxy_set->username = t_strdup(value);
 		} else if (str_begins(key, "forward_", &mend)) {
-			if (!array_is_created(&ctx->proxy_forward_fields)) {
-				p_array_init(&ctx->proxy_forward_fields,
+			if (!array_is_created(&ctx->auth_proxy_forward_fields)) {
+				p_array_init(&ctx->auth_proxy_forward_fields,
 					     ctx->pool, 8);
 			}
 			value = p_strdup_printf(ctx->pool, "%s=%s",
 						mend, value);
-			array_push_back(&ctx->proxy_forward_fields, &value);
+			array_push_back(&ctx->auth_proxy_forward_fields, &value);
 		}
 	}
 	if (proxy_set->username == NULL)
@@ -223,7 +220,7 @@ doveadm_cmd_pass_reply_parse(struct doveadm_mail_cmd_context *ctx,
 			auth_socket_path);
 		if (strstr(auth_socket_path, "/auth-userdb") != NULL) {
 			*error_r = t_strdup_printf(
-				"%s (maybe set auth_socket_path=director-userdb)",
+				"%s (maybe set auth_socket_path=cluster-userdb)",
 				*error_r);
 		}
 		return -1;
@@ -281,18 +278,34 @@ doveadm_proxy_cmd_have_connected(struct doveadm_mail_server_cmd *servercmd,
 	return FALSE;
 }
 
+static const char *const *
+doveadm_mail_get_outgoing_forward_fields(struct doveadm_mail_cmd_context *ctx)
+{
+	if (!array_is_created(&ctx->auth_proxy_forward_fields) ||
+	    array_is_empty(&ctx->auth_proxy_forward_fields))
+		return NULL;
+
+	array_append_zero(&ctx->auth_proxy_forward_fields);
+	array_pop_back(&ctx->auth_proxy_forward_fields);
+	return array_front(&ctx->auth_proxy_forward_fields);
+}
+
 static int
 doveadm_cmd_redirect_finish(struct doveadm_mail_server_cmd *servercmd,
 			    const struct ip_addr *ip, in_port_t port,
 			    enum auth_proxy_ssl_flags ssl_flags,
 			    const char **error_r)
 {
+	struct doveadm_mail_cmd_context *cmd_ctx = servercmd->cmd_ctx;
 	struct doveadm_server *new_server;
 	struct doveadm_client *conn;
 	struct doveadm_proxy_redirect *redirect;
 	const char *server_name, *error;
 
 	i_assert(ip->family != 0);
+
+	if (port == 0)
+		port = doveadm_client_get_settings(servercmd->conn)->port;
 
 	if (doveadm_proxy_cmd_have_connected(servercmd, ip, port)) {
 		*error_r = t_strdup_printf(
@@ -339,22 +352,19 @@ doveadm_cmd_redirect_finish(struct doveadm_mail_server_cmd *servercmd,
 	struct doveadm_client_cmd_settings cmd_set = {
 		.proxy_ttl = cmd_ctx->proxy_ttl,
 	};
-	if (array_is_created(&cmd_ctx->proxy_forward_fields)) {
-		array_append_zero(&cmd_ctx->proxy_forward_fields);
-		cmd_set.forward_fields =
-			array_front(&cmd_ctx->proxy_forward_fields);
-		array_pop_back(&cmd_ctx->proxy_forward_fields);
-	}
+	cmd_set.forward_fields = doveadm_mail_get_outgoing_forward_fields(cmd_ctx);
 	doveadm_client_cmd(conn, &cmd_set, servercmd->cmdline, servercmd->input,
 			   doveadm_cmd_callback, servercmd);
-	return 0;
+	doveadm_client_unref(&conn);
+	return 1;
 }
 
 static int
 doveadm_cmd_redirect_relookup(struct doveadm_mail_server_cmd *servercmd,
-			      const struct ip_addr *ip, in_port_t port,
+			      const char *host, in_port_t port,
 			      const char *destuser, const char **error_r)
 {
+	struct doveadm_mail_cmd_context *cmd_ctx = servercmd->cmd_ctx;
 	struct auth_proxy_settings proxy_set;
 	const char *const *fields, *auth_socket_path;
 	pool_t auth_pool;
@@ -367,8 +377,7 @@ doveadm_cmd_redirect_relookup(struct doveadm_mail_server_cmd *servercmd,
 	str_append(hosts_attempted, "proxy_redirect_host_attempts=");
 	doveadm_proxy_cmd_get_redirect_path(servercmd, hosts_attempted);
 	const char *const extra_fields[] = {
-		t_strdup_printf("proxy_redirect_host_next=%s:%u",
-				net_ip2addr(ip), port),
+		t_strdup_printf("proxy_redirect_host_next=%s:%u", host, port),
 		str_c(hosts_attempted),
 		destuser == NULL ? NULL :
 			t_strdup_printf("destuser=%s", str_tabescape(destuser)),
@@ -390,10 +399,18 @@ doveadm_cmd_redirect_relookup(struct doveadm_mail_server_cmd *servercmd,
 	} else if (doveadm_cmd_pass_reply_parse(cmd_ctx, auth_socket_path, fields,
 						&proxy_set, &nologin, error_r) < 0)
 		ret = -1;
-	else {
+	else if (proxy_set.proxy) {
 		ret = doveadm_cmd_redirect_finish(servercmd, &proxy_set.host_ip,
 						  proxy_set.port,
 						  proxy_set.ssl_flags, error_r);
+	} else if (!nologin || proxy_set.host == NULL) {
+		*error_r = "Redirect authentication is missing proxy or nologin field";
+		ret = -1;
+	} else {
+		/* Send referral back to the TCP client */
+		cmd_ctx->cctx->referral = p_strdup_printf(cmd_ctx->cctx->pool,
+			"%s@%s", proxy_set.username, proxy_set.host);
+		ret = 0;
 	}
 	pool_unref(&auth_pool);
 	return ret;
@@ -403,6 +420,7 @@ static int doveadm_cmd_redirect(struct doveadm_mail_server_cmd *servercmd,
 				const char *destination)
 {
 	struct doveadm_server *orig_server = servercmd->server;
+	struct doveadm_mail_cmd_context *cmd_ctx = servercmd->cmd_ctx;
 	const struct doveadm_client_settings *client_set =
 		doveadm_client_get_settings(servercmd->conn);
 	struct ip_addr ip;
@@ -410,9 +428,9 @@ static int doveadm_cmd_redirect(struct doveadm_mail_server_cmd *servercmd,
 	const char *destuser, *host, *error;
 	int ret;
 
-	if (!auth_proxy_parse_redirect(destination, &destuser,
-				       &host, &ip, &port)) {
-		i_error("%s: Invalid redirect destination: %s",
+	if (!auth_proxy_parse_redirect(destination, &destuser, &host, &port)) {
+		e_error(cmd_ctx->cctx->event,
+			"%s: Invalid redirect destination: %s",
 			orig_server->name, destination);
 		return -1;
 	}
@@ -420,18 +438,25 @@ static int doveadm_cmd_redirect(struct doveadm_mail_server_cmd *servercmd,
 		port = client_set->port;
 
 	if (cmd_ctx->cctx->proxy_redirect_reauth) {
-		ret = doveadm_cmd_redirect_relookup(servercmd, &ip, port,
+		ret = doveadm_cmd_redirect_relookup(servercmd, host, port,
 						    destuser, &error);
 	} else {
+		if (net_addr2ip(host, &ip) < 0) {
+			e_error(cmd_ctx->cctx->event,
+				"%s: Redirect destination host is not an IP: %s",
+				orig_server->name, destination);
+			return -1;
+		}
 		ret = doveadm_cmd_redirect_finish(servercmd, &ip, port,
 						  client_set->ssl_flags,
 						  &error);
 	}
 	if (ret < 0) {
-		i_error("%s: %s", orig_server->name, error);
+		e_error(cmd_ctx->cctx->event,
+			"%s: %s", orig_server->name, error);
 		return -1;
 	}
-	return 0;
+	return ret;
 }
 
 static void
@@ -440,6 +465,10 @@ doveadm_cmd_print_callback(const unsigned char *data,
 			   struct doveadm_mail_server_cmd *servercmd)
 {
 	string_t *str = t_str_new(size);
+	if (servercmd->print_username) {
+		doveadm_print_sticky("username", servercmd->username);
+		servercmd->print_username = FALSE;
+	}
 	if (!finished) {
 		servercmd->streaming = TRUE;
 		str_append_tabunescaped(str, data, size);
@@ -462,14 +491,17 @@ static void doveadm_cmd_callback(const struct doveadm_server_reply *reply,
 {
 	struct doveadm_mail_server_cmd *servercmd = context;
 	struct doveadm_client *conn = servercmd->conn;
+	struct doveadm_mail_cmd_context *cmd_ctx = servercmd->cmd_ctx;
 	struct doveadm_server *server = servercmd->server;
 	struct doveadm_server_request *request;
+	int ret;
 
 	switch (reply->exit_code) {
 	case 0:
 		break;
 	case DOVEADM_CLIENT_EXIT_CODE_DISCONNECTED:
-		i_error("%s: Command %s failed for %s: %s",
+		e_error(cmd_ctx->cctx->event,
+			"%s: Command %s failed for %s: %s",
 			server->name, cmd_ctx->cmd->name, servercmd->username,
 			reply->error);
 		internal_failure = TRUE;
@@ -477,14 +509,17 @@ static void doveadm_cmd_callback(const struct doveadm_server_reply *reply,
 		doveadm_mail_server_cmd_free(&servercmd);
 		return;
 	case EX_NOUSER:
-		i_error("%s: No such user: %s", server->name,
+		e_error(cmd_ctx->cctx->event,
+			"%s: No such user: %s", server->name,
 			servercmd->username);
 		if (cmd_ctx->exit_code == 0)
 			cmd_ctx->exit_code = EX_NOUSER;
 		break;
 	case DOVEADM_EX_REFERRAL:
-		if (doveadm_cmd_redirect(servercmd, reply->error) < 0) {
-			internal_failure = TRUE;
+		ret = doveadm_cmd_redirect(servercmd, reply->error);
+		if (ret <= 0) {
+			if (ret < 0)
+				internal_failure = TRUE;
 			io_loop_stop(current_ioloop);
 			doveadm_mail_server_cmd_free(&servercmd);
 		}
@@ -507,46 +542,52 @@ static void doveadm_cmd_callback(const struct doveadm_server_reply *reply,
 						  request);
 			array_delete(&doveadm_server_request_queue, idx, 1);
 
-			doveadm_mail_server_handle(server, conn,
-						   request_copy.username);
+			doveadm_mail_server_handle(server, conn, cmd_ctx,
+						   request_copy.username,
+						   request_copy.print_username);
 			doveadm_server_request_free(&request_copy);
+			doveadm_client_unref(&conn);
 			break;
 		}
 	}
 	io_loop_stop(current_ioloop);
 }
 
-static void doveadm_mail_server_handle(struct doveadm_server *server,
-				       struct doveadm_client *conn,
-				       const char *username)
+void doveadm_mail_server_handle(struct doveadm_server *server,
+				struct doveadm_client *conn,
+				struct doveadm_mail_cmd_context *cmd_ctx,
+				const char *username, bool print_username)
 {
 	struct doveadm_mail_server_cmd *servercmd;
 	string_t *cmd;
-	unsigned int i;
 
 	/* <flags> <username> <command> [<args>] */
 	cmd = t_str_new(256);
 	if (doveadm_debug)
-		str_append_c(cmd, 'D');
+		str_append_c(cmd, DOVEADM_PROTOCOL_CMD_FLAG_DEBUG);
 	else if (doveadm_verbose)
-		str_append_c(cmd, 'v');
+		str_append_c(cmd, DOVEADM_PROTOCOL_CMD_FLAG_VERBOSE);
 	str_append_c(cmd, '\t');
 
 	str_append_tabescaped(cmd, username);
 	str_append_c(cmd, '\t');
 	str_append_tabescaped(cmd, cmd_ctx->cmd->name);
-	for (i = 0; cmd_ctx->full_args[i] != NULL; i++) {
-		str_append_c(cmd, '\t');
-		str_append_tabescaped(cmd, cmd_ctx->full_args[i]);
+
+	const char *const *args = doveadm_cmdv2_wrapper_generate_args(cmd_ctx);
+	for (; *args != NULL; args++) {
+	 	str_append_c(cmd, '\t');
+	 	str_append_tabescaped(cmd, *args);
 	}
 	str_append_c(cmd, '\n');
 
 	servercmd = i_new(struct doveadm_mail_server_cmd, 1);
 	servercmd->conn = conn;
 	servercmd->server = server;
+	servercmd->cmd_ctx = cmd_ctx;
 	servercmd->username = i_strdup(username);
 	servercmd->cmdline = i_strdup(str_c(cmd));
 	servercmd->input = cmd_ctx->cmd_input;
+	servercmd->print_username = print_username;
 	if (servercmd->input != NULL)
 		i_stream_ref(servercmd->input);
 	doveadm_client_set_print(conn, doveadm_cmd_print_callback,
@@ -554,17 +595,14 @@ static void doveadm_mail_server_handle(struct doveadm_server *server,
 	struct doveadm_client_cmd_settings cmd_set = {
 		.proxy_ttl = cmd_ctx->proxy_ttl,
 	};
-	if (array_is_created(&cmd_ctx->proxy_forward_fields)) {
-		array_append_zero(&cmd_ctx->proxy_forward_fields);
-		cmd_set.forward_fields =
-			array_front(&cmd_ctx->proxy_forward_fields);
-		array_pop_back(&cmd_ctx->proxy_forward_fields);
-	}
+	cmd_set.forward_fields = doveadm_mail_get_outgoing_forward_fields(cmd_ctx);
 	doveadm_client_cmd(conn, &cmd_set, str_c(cmd), cmd_ctx->cmd_input,
 			   doveadm_cmd_callback, servercmd);
 }
 
-static int doveadm_mail_server_request_queue_handle_next(const char **error_r)
+static int
+doveadm_mail_server_request_queue_handle_next(struct doveadm_mail_cmd_context *cmd_ctx,
+					      const char **error_r)
 {
 	struct doveadm_server_request *request, request_copy;
 	struct doveadm_client *conn;
@@ -579,9 +617,11 @@ static int doveadm_mail_server_request_queue_handle_next(const char **error_r)
 		internal_failure = TRUE;
 		return -1;
 	}
-	doveadm_mail_server_handle(request_copy.server, conn,
-				   request_copy.username);
+	doveadm_mail_server_handle(request_copy.server, conn, cmd_ctx,
+				   request_copy.username,
+				   request_copy.print_username);
 	doveadm_server_request_free(&request_copy);
+	doveadm_client_unref(&conn);
 	return 0;
 }
 
@@ -653,6 +693,9 @@ doveadm_mail_server_user_get_host(struct doveadm_mail_cmd_context *ctx,
 			   them. */
 			proxy_set_r->host = orig_host;
 			ret = 0;
+		} else if (proxy_set_r->host[0] == '\0') {
+			*error_r = "Referral host is empty";
+			ret = -1;
 		} else {
 			/* Referral */
 			*referral_r = t_strdup_printf("%s@%s",
@@ -681,7 +724,8 @@ doveadm_mail_cmd_extra_fields_parse(struct doveadm_mail_cmd_context *ctx)
 		if (strcmp(key, "proxy-ttl") == 0) {
 			if (str_to_int(value, &ctx->proxy_ttl) < 0 ||
 			    ctx->proxy_ttl <= 0)
-				i_error("Invalid proxy-ttl value: %s", value);
+				e_error(ctx->cctx->event,
+					"Invalid proxy-ttl value: %s", value);
 		} else if (strcmp(key, "forward") == 0) {
 			if (!array_is_created(&ctx->proxy_forward_fields)) {
 				p_array_init(&ctx->proxy_forward_fields,
@@ -701,10 +745,9 @@ int doveadm_mail_server_user(struct doveadm_mail_cmd_context *ctx,
 	struct doveadm_server_request *request;
 	struct auth_proxy_settings proxy_set;
 	const char *server_name, *socket_path, *referral;
+	bool print_username =
+		doveadm_print_is_initialized() && !ctx->iterate_single_user;
 	int ret;
-
-	i_assert(cmd_ctx == ctx || cmd_ctx == NULL);
-	cmd_ctx = ctx;
 
 	doveadm_mail_cmd_extra_fields_parse(ctx);
 	ret = doveadm_mail_server_user_get_host(ctx, &proxy_set, &socket_path,
@@ -721,7 +764,7 @@ int doveadm_mail_server_user(struct doveadm_mail_cmd_context *ctx,
 		return -1;
 	}
 	if (referral != NULL) {
-		ctx->cctx->referral = referral;
+		ctx->cctx->referral = p_strdup(ctx->cctx->pool, referral);
 		return 1;
 	}
 	i_assert(proxy_set.host != NULL || socket_path != NULL);
@@ -729,10 +772,6 @@ int doveadm_mail_server_user(struct doveadm_mail_cmd_context *ctx,
 	i_assert(proxy_set.username != NULL);
 
 	ctx->cctx->proxy_redirect_reauth = proxy_set.redirect_reauth;
-
-	/* server sends the sticky headers for each row as well,
-	   so undo any sticks we might have added already */
-	doveadm_print_unstick_headers();
 
 	struct doveadm_client_settings conn_set = {
 		.socket_path = socket_path,
@@ -757,7 +796,7 @@ int doveadm_mail_server_user(struct doveadm_mail_cmd_context *ctx,
 		   connections. */
 		if (doveadm_clients_count() < limit &&
 		    array_count(&doveadm_server_request_queue) > 0) {
-			if (doveadm_mail_server_request_queue_handle_next(error_r) < 0)
+			if (doveadm_mail_server_request_queue_handle_next(ctx, error_r) < 0)
 				return -1;
 			continue;
 		}
@@ -777,29 +816,30 @@ int doveadm_mail_server_user(struct doveadm_mail_cmd_context *ctx,
 			internal_failure = TRUE;
 			return -1;
 		} else {
-			doveadm_mail_server_handle(server, conn,
-						   proxy_set.username);
+			doveadm_mail_server_handle(server, conn, ctx,
+						   proxy_set.username,
+						   print_username);
+			doveadm_client_unref(&conn);
 		}
 	} else {
 		request = array_append_space(&doveadm_server_request_queue);
 		request->pool = pool_alloconly_create("doveadm server request", 256);
 		request->server = server;
 		request->username = p_strdup(request->pool, proxy_set.username);
+		request->print_username = print_username;
 		doveadm_client_settings_dup(&conn_set, &request->set, request->pool);
 	}
 	*error_r = "doveadm server failure";
 	return DOVEADM_MAIL_SERVER_FAILED() ? -1 : 1;
 }
 
-void doveadm_mail_server_flush(void)
+void doveadm_mail_server_flush(struct doveadm_mail_cmd_context *ctx)
 {
 	struct doveadm_server_request *request;
 	const char *error;
 
-	if (!hash_table_is_created(servers)) {
-		cmd_ctx = NULL;
+	if (!hash_table_is_created(servers))
 		return;
-	}
 
 	/* flush the queue */
 	unsigned int limit = I_MAX(doveadm_settings->doveadm_worker_count, 1);
@@ -813,8 +853,8 @@ void doveadm_mail_server_flush(void)
 
 		if (array_count(&doveadm_server_request_queue) == 0)
 			break;
-		if (doveadm_mail_server_request_queue_handle_next(&error) < 0) {
-			i_error("%s", error);
+		if (doveadm_mail_server_request_queue_handle_next(ctx, &error) < 0) {
+			e_error(ctx->cctx->event, "%s", error);
 			break;
 		}
 	}
@@ -825,9 +865,9 @@ void doveadm_mail_server_flush(void)
 
 	doveadm_clients_destroy_all();
 	if (master_service_is_killed(master_service))
-		i_error("Aborted");
+		e_error(ctx->cctx->event, "Aborted");
 	if (DOVEADM_MAIL_SERVER_FAILED())
-		doveadm_mail_failed_error(cmd_ctx, MAIL_ERROR_TEMP);
+		doveadm_mail_failed_error(ctx, MAIL_ERROR_TEMP);
 
 	/* queue may not be empty if something failed */
 	array_foreach_modifiable(&doveadm_server_request_queue, request)
@@ -835,5 +875,4 @@ void doveadm_mail_server_flush(void)
 	array_free(&doveadm_server_request_queue);
 	hash_table_destroy(&servers);
 	pool_unref(&server_pool);
-	cmd_ctx = NULL;
 }

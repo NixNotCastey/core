@@ -1,6 +1,7 @@
 /* Copyright (c) 2009-2018 Dovecot authors, see the included COPYING file */
 
 #include "lmtp-common.h"
+#include "smtp-server.h"
 #include "str.h"
 #include "istream.h"
 #include "strescape.h"
@@ -44,6 +45,8 @@ struct lmtp_local {
 
 	struct mail *raw_mail, *first_saved_mail;
 	struct mail_user *rcpt_user;
+
+	struct smtp_server_stats stats;
 };
 
 /*
@@ -58,7 +61,9 @@ lmtp_local_init(struct client *client)
 	local = i_new(struct lmtp_local, 1);
 	local->client = client;
 	i_array_init(&local->rcpt_to, 8);
-
+	const struct smtp_server_stats *stats =
+	        smtp_server_connection_get_stats(local->client->conn);
+	local->stats = *stats;
 	return local;
 }
 
@@ -122,7 +127,8 @@ lmtp_local_rcpt_reply_overquota(struct lmtp_local_recipient *llrcpt,
 {
 	struct smtp_server_recipient *rcpt = llrcpt->rcpt->rcpt;
 	struct lda_settings *lda_set =
-		mail_storage_service_user_get_set(llrcpt->service_user)[2];
+		mail_storage_service_user_get_set(llrcpt->service_user,
+			&lda_setting_parser_info);
 
 	if (lda_set->quota_full_tempfail)
 		smtp_server_recipient_reply(rcpt, 452, "4.2.2", "%s", error);
@@ -298,17 +304,17 @@ int lmtp_local_rcpt(struct client *client,
 	int ret = 0;
 
 	i_zero(&input);
-	input.module = input.service = "lmtp";
+	input.service = "lmtp";
 	input.username = username;
 	input.local_ip = client->local_ip;
 	input.remote_ip = client->remote_ip;
 	input.local_port = client->local_port;
 	input.remote_port = client->remote_port;
 	input.session_id = lrcpt->session_id;
-	input.conn_ssl_secured =
+	input.end_client_tls_secured =
+		client->end_client_tls_secured_set ?
+		client->end_client_tls_secured :
 		smtp_server_connection_is_ssl_secured(client->conn);
-	input.conn_secured = input.conn_ssl_secured ||
-		smtp_server_connection_is_trusted(client->conn);
 	input.forward_fields = lrcpt->forward_fields;
 	input.event_parent = rcpt->event;
 
@@ -418,13 +424,9 @@ lmtp_local_deliver(struct lmtp_local *local,
 	struct mail_user *rcpt_user;
 	const struct mail_storage_service_input *input;
 	const struct mail_storage_settings *mail_set;
-	struct smtp_submit_settings *smtp_set;
 	struct smtp_proxy_data proxy_data;
-	struct lda_settings *lda_set;
 	struct mail_namespace *ns;
 	struct setting_parser_context *set_parser;
-	const struct var_expand_table *var_table;
-	void **sets;
 	const char *line, *error, *username;
 	int ret;
 
@@ -469,35 +471,16 @@ lmtp_local_deliver(struct lmtp_local *local,
 	}
 	local->rcpt_user = rcpt_user;
 
-	sets = mail_storage_service_user_get_set(service_user);
-	var_table = mail_user_var_expand_table(rcpt_user);
-	smtp_set = sets[1];
-	lda_set = sets[2];
-	ret = settings_var_expand(
-		&smtp_submit_setting_parser_info,
-		smtp_set, client->pool, var_table,
-		&error);
-	if (ret > 0) {
-		ret = settings_var_expand(
-			&lda_setting_parser_info,
-			lda_set, client->pool, var_table,
-			&error);
-	}
-	if (ret <= 0) {
-		e_error(rcpt->event, "Failed to expand settings: %s", error);
-		smtp_server_recipient_reply(rcpt, 451, "4.3.0",
-					    "Temporary internal error");
-		return -1;
-	}
-
 	/* Set the log prefix for the user. The default log prefix is
 	   automatically restored later when user context gets deactivated. */
 	i_set_failure_prefix("%s",
 		mail_storage_service_user_get_log_prefix(service_user));
 
 	lldctx.rcpt_user = rcpt_user;
-	lldctx.smtp_set = smtp_set;
-	lldctx.lda_set = lda_set;
+	lldctx.smtp_set = settings_parser_get_root_set(rcpt_user->set_parser,
+			&smtp_submit_setting_parser_info);
+	lldctx.lda_set = settings_parser_get_root_set(rcpt_user->set_parser,
+			&lda_setting_parser_info);
 
 	if (*lrcpt->detail == '\0' ||
 	    !client->lmtp_set->lmtp_save_to_detail_mailbox)
@@ -609,8 +592,22 @@ int lmtp_local_default_deliver(struct client *client,
 	dinput.delivery_time_started = lldctx->delivery_time_started;
 
 	mail_deliver_init(&dctx, &dinput);
+
+	/* Copy statistics to mail user session event here */
+	const struct smtp_server_stats *stats =
+		smtp_server_connection_get_stats(local->client->conn);
+	event_add_int(event, "net_in_bytes",
+		      stats->input - local->stats.input);
+	event_add_int(event, "net_out_bytes",
+		      stats->output - local->stats.output);
+	event_add_int(lrcpt->rcpt->event, "net_in_bytes",
+		      stats->input - local->stats.input);
+	event_add_int(lrcpt->rcpt->event, "net_out_bytes",
+		      stats->output - local->stats.output);
+	local->stats = *stats;
 	ret = lmtp_local_default_do_deliver(local, llrcpt, lldctx, &dctx);
 	mail_deliver_deinit(&dctx);
+
 	event_unref(&event);
 
 	return ret;
@@ -644,8 +641,10 @@ lmtp_local_deliver_to_rcpts(struct lmtp_local *local,
 			continue;
 		}
 
-		ret = lmtp_local_deliver(local, cmd,
-			trans, llrcpt, src_mail, session);
+		T_BEGIN {
+			ret = lmtp_local_deliver(local, cmd, trans, llrcpt,
+						 src_mail, session);
+		} T_END;
 		client_update_data_state(client, NULL);
 
 		/* succeeded and mail_user is not saved in first_saved_mail */
@@ -656,20 +655,20 @@ lmtp_local_deliver_to_rcpts(struct lmtp_local *local,
 		    (ret != 0 && local->rcpt_user != NULL)) {
 			if (i == (count - 1))
 				mail_user_autoexpunge(local->rcpt_user);
-			mail_storage_service_io_deactivate_user(local->rcpt_user->_service_user);
+			mail_storage_service_io_deactivate_user(local->rcpt_user->service_user);
 			mail_user_deinit(&local->rcpt_user);
 		} else if (ret == 0) {
 			/* use the first saved message to save it elsewhere too.
 			   this might allow hard linking the files.
 			   mail_user is saved in first_saved_mail,
 			   will be unreferenced later on */
-			mail_storage_service_io_deactivate_user(local->rcpt_user->_service_user);
+			mail_storage_service_io_deactivate_user(local->rcpt_user->service_user);
 			local->rcpt_user = NULL;
 			src_mail = local->first_saved_mail;
 			first_uid = geteuid();
 			i_assert(first_uid != 0);
 		} else if (local->rcpt_user != NULL) {
-			mail_storage_service_io_deactivate_user(local->rcpt_user->_service_user);
+			mail_storage_service_io_deactivate_user(local->rcpt_user->service_user);
 		}
 	}
 	return first_uid;
@@ -742,12 +741,12 @@ void lmtp_local_data(struct client *client,
 				i_fatal("seteuid() failed: %m");
 		}
 
-		mail_storage_service_io_activate_user(user->_service_user);
+		mail_storage_service_io_activate_user(user->service_user);
 		mail_free(&mail);
 		mailbox_transaction_rollback(&trans);
 		mailbox_free(&box);
 		mail_user_autoexpunge(user);
-		mail_storage_service_io_deactivate_user(user->_service_user);
+		mail_storage_service_io_deactivate_user(user->service_user);
 		mail_user_deinit(&user);
 	}
 

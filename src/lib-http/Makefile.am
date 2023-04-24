@@ -143,7 +143,7 @@ test_http_libs = \
 	../lib-dns/libdns.la \
 	../lib-ssl-iostream/libssl_iostream.la \
 	../lib-master/libmaster.la \
-	../lib-auth/libauth.la \
+	../lib-auth-client/libauth-client.la \
 	../lib-settings/libsettings.la \
 	$(test_libs)
 test_http_deps = \
@@ -151,14 +151,11 @@ test_http_deps = \
 	../lib-dns/libdns.la \
 	../lib-ssl-iostream/libssl_iostream.la \
 	../lib-master/libmaster.la \
-	../lib-auth/libauth.la \
+	../lib-auth-client/libauth-client.la \
 	../lib-settings/libsettings.la \
 	$(test_deps)
 
-test_http_libs_ssl=
-if BUILD_OPENSSL
-test_http_libs_ssl += ../lib-ssl-iostream/libssl_iostream_openssl.la
-endif
+test_http_libs_ssl = ../lib-ssl-iostream/libssl_iostream_openssl.la
 
 test_http_payload_SOURCES = test-http-payload.c
 test_http_payload_LDFLAGS = -export-dynamic

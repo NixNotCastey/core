@@ -14,10 +14,15 @@
 #include "master-service.h"
 #include "doveadm-protocol.h"
 #include "doveadm-client.h"
+#include "dns-lookup.h"
+
+#include <sysexits.h>
 
 #define DOVEADM_LOG_CHANNEL_ID 'L'
 
 #define MAX_INBUF_SIZE (1024*32)
+
+#define DOVEADM_CLIENT_DNS_TIMEOUT_MSECS (1000*10)
 
 enum doveadm_client_reply_state {
 	DOVEADM_CLIENT_REPLY_STATE_DONE = 0,
@@ -28,10 +33,12 @@ enum doveadm_client_reply_state {
 struct doveadm_client {
 	struct connection conn;
 
+	int refcount;
 	struct doveadm_client_settings set;
 
 	pool_t pool;
 	struct timeout *to_destroy;
+	struct timeout *to_create_failed;
 	struct io *io_log;
 	struct istream *log_input;
 	struct ssl_iostream *ssl_iostream;
@@ -41,6 +48,11 @@ struct doveadm_client {
 	const char *delayed_cmd;
 	struct doveadm_client_cmd_settings delayed_set;
 	doveadm_client_cmd_callback_t *callback;
+
+	struct dns_lookup *dns_lookup;
+	unsigned int ips_count;
+	struct ip_addr *ips;
+
 	void *context;
 
 	doveadm_client_print_t *print_callback;
@@ -48,6 +60,7 @@ struct doveadm_client {
 
 	enum doveadm_client_reply_state state;
 
+	bool destroyed:1;
 	bool authenticate_sent:1;
 	bool authenticated:1;
 	bool ssl_done:1;
@@ -61,6 +74,7 @@ static bool doveadm_client_input_one(struct doveadm_client *conn);
 static int doveadm_client_init_ssl(struct doveadm_client *conn,
 				   const char **error_r);
 static void doveadm_client_destroy(struct doveadm_client **_conn);
+static void doveadm_client_destroy_conn(struct connection *_conn);
 
 void doveadm_client_settings_dup(const struct doveadm_client_settings *src,
 				 struct doveadm_client_settings *dest_r,
@@ -72,6 +86,9 @@ void doveadm_client_settings_dup(const struct doveadm_client_settings *src,
 	dest_r->hostname = p_strdup(pool, src->hostname);
 	dest_r->ip = src->ip;
 	dest_r->port = src->port;
+
+	dest_r->dns_client_socket_path = src->dns_client_socket_path != NULL ?
+		p_strdup(pool, src->dns_client_socket_path) : "";
 
 	dest_r->username = p_strdup(pool, src->username);
 	dest_r->password = p_strdup(pool, src->password);
@@ -124,7 +141,8 @@ static int doveadm_client_send_cmd_input_more(struct doveadm_client *conn)
 	case OSTREAM_SEND_ISTREAM_RESULT_WAIT_OUTPUT:
 		return 0;
 	case OSTREAM_SEND_ISTREAM_RESULT_ERROR_INPUT:
-		e_error(conn->conn.event, "read() failed: %s",
+		e_error(conn->conn.event, "read(%s) failed: %s",
+			i_stream_get_name(conn->cmd_input),
 			i_stream_get_error(conn->cmd_input));
 		break;
 	case OSTREAM_SEND_ISTREAM_RESULT_ERROR_OUTPUT:
@@ -141,7 +159,7 @@ static int doveadm_client_send_cmd_input_more(struct doveadm_client *conn)
 		}
 	}
 
-	i_stream_destroy(&conn->cmd_input);
+	i_stream_unref(&conn->cmd_input);
 	o_stream_destroy(&conn->cmd_output);
 	return ret;
 }
@@ -152,7 +170,11 @@ static void doveadm_client_send_cmd_input(struct doveadm_client *conn)
 		return;
 
 	conn->cmd_output = o_stream_create_dot(conn->conn.output, TRUE);
-	(void)doveadm_client_send_cmd_input_more(conn);
+	if (doveadm_client_send_cmd_input_more(conn) < 0) {
+		i_assert(conn->to_destroy == NULL);
+		conn->to_destroy = timeout_add_short(0,
+			doveadm_client_destroy_conn, &conn->conn);
+	}
 }
 
 static int doveadm_client_output(struct doveadm_client *conn)
@@ -262,9 +284,13 @@ doveadm_client_send_cmd(struct doveadm_client *conn,
 	}
 	const char *extra_fields_escaped = str_tabescape(str_c(extra_fields));
 
+	const char flags[] = {
+		DOVEADM_PROTOCOL_CMD_FLAG_EXTRA_FIELDS,
+		'\t'
+	};
 	struct const_iovec iov[] = {
 		{ cmdline, prefix_len },
-		{ "x\t", 2 },
+		{ flags, N_ELEMENTS(flags) },
 		{ extra_fields_escaped, strlen(extra_fields_escaped) },
 		{ cmdline + prefix_len, strlen(cmdline + prefix_len) },
 	};
@@ -556,6 +582,7 @@ static int doveadm_client_init_ssl(struct doveadm_client *conn,
 		conn->set.hostname != NULL ? conn->set.hostname : "";
 	connection_input_halt(&conn->conn);
 	if (io_stream_create_ssl_client(conn->set.ssl_ctx, hostname, &ssl_set,
+					conn->conn.event,
 					&conn->conn.input, &conn->conn.output,
 					&conn->ssl_iostream, &error) < 0) {
 		*error_r = t_strdup_printf(
@@ -626,13 +653,133 @@ static struct connection_settings doveadm_client_set = {
 	.client_connect_timeout_msecs = DOVEADM_TCP_CONNECT_TIMEOUT_SECS*1000,
 };
 
+struct doveadm_client_dns_lookup_context {
+	struct doveadm_client *conn;
+	const char *error;
+};
+
+static void doveadm_client_connect_init(struct doveadm_client *conn)
+{
+	connection_init_client_ip(doveadm_clients, &conn->conn,
+				  conn->set.hostname, &conn->ips[0],
+				  conn->set.port);
+}
+
+static int doveadm_client_connect(struct doveadm_client *conn,
+				   const char **error_r)
+{
+	if (connection_client_connect(&conn->conn) < 0) {
+		*error_r = t_strdup_printf("net_connect(%s) failed: %m",
+					   conn->conn.name);
+		return -1;
+	}
+	return 0;
+}
+
+static void
+doveadm_client_create_failed(struct doveadm_client_dns_lookup_context *ctx)
+{
+	struct doveadm_client *conn = ctx->conn;
+	timeout_remove(&conn->to_create_failed);
+
+	struct doveadm_server_reply reply = {
+		.exit_code = EX_DATAERR,
+		.error  = ctx->error,
+	};
+	doveadm_client_callback(conn, &reply);
+	pool_unref(&conn->pool);
+}
+
+static void
+doveadm_client_dns_lookup_callback(const struct dns_lookup_result *result,
+				   struct doveadm_client_dns_lookup_context *ctx)
+{
+	struct doveadm_client *conn = ctx->conn;
+	const char *error;
+
+	if (result->error != NULL) {
+		ctx->error = p_strdup_printf(conn->pool,
+					     "dns_lookup(%s) failed: %s",
+					     conn->set.hostname, result->error);
+		conn->to_create_failed =
+			timeout_add_short(0, doveadm_client_create_failed, ctx);
+		return;
+	}
+
+	i_assert(result->ips_count > 0);
+	conn->ips = p_new(conn->pool, struct ip_addr, 1);
+	conn->ips[0] = result->ips[0];
+	conn->ips_count = 1;
+
+	doveadm_client_connect_init(conn);
+	if (doveadm_client_connect(conn, &error) < 0) {
+		ctx->error = p_strdup(conn->pool, error);
+		conn->to_create_failed =
+			timeout_add_short(0, doveadm_client_create_failed, ctx);
+	}
+}
+
+static int doveadm_client_dns_lookup(struct doveadm_client *conn,
+				     const char **error_r)
+{
+	struct doveadm_client_dns_lookup_context *ctx =
+		p_new(conn->pool, struct doveadm_client_dns_lookup_context, 1);
+	struct dns_lookup_settings dns_set;
+
+	i_zero(&dns_set);
+	dns_set.dns_client_socket_path = conn->set.dns_client_socket_path;
+	dns_set.timeout_msecs = DOVEADM_CLIENT_DNS_TIMEOUT_MSECS;
+	dns_set.event_parent = conn->conn.event;
+
+	ctx->conn = conn;
+
+	if (dns_lookup(conn->set.hostname, &dns_set,
+		       doveadm_client_dns_lookup_callback, ctx,
+		       &conn->dns_lookup) != 0) {
+		*error_r = t_strdup(ctx->error);
+		return -1;
+	}
+	return 0;
+}
+
+static int
+doveadm_client_resolve_hostname(struct doveadm_client *conn,
+				const char **error_r)
+{
+	struct ip_addr *ips;
+	unsigned int ips_count;
+	int ret;
+
+	if (conn->set.dns_client_socket_path[0] != '\0') {
+		/* If there is an dns_client_socket_path do a dns
+		   lookup. */
+		if (doveadm_client_dns_lookup(conn, error_r) < 0)
+			return -1;
+		return 0;
+	}
+
+	ret = net_gethostbyname(conn->set.hostname, &ips, &ips_count);
+	if (ret == 0) {
+		conn->ips = p_new(conn->pool, struct ip_addr, 1);
+		conn->ips[0] = ips[0];
+		conn->ips_count = 1;
+		doveadm_client_connect_init(conn);
+		return 0;
+	} else {
+		*error_r = t_strdup_printf("Lookup of host %s failed: %s",
+					   conn->set.hostname,
+					   net_gethosterror(ret));
+		return -1;
+	}
+}
+
 int doveadm_client_create(const struct doveadm_client_settings *set,
 			  struct doveadm_client **conn_r,
 			  const char **error_r)
 {
 	struct doveadm_client *conn;
+	const char *error;
 	pool_t pool;
-	int ret;
 
 	i_assert(set->username != NULL);
 	i_assert(set->password != NULL);
@@ -646,6 +793,7 @@ int doveadm_client_create(const struct doveadm_client_settings *set,
 	pool = pool_alloconly_create("doveadm server connection", 1024*16);
 	conn = p_new(pool, struct doveadm_client, 1);
 	conn->pool = pool;
+	conn->refcount = 1;
 	doveadm_client_settings_dup(set, &conn->set, pool);
 
 	if (set->socket_path != NULL) {
@@ -654,29 +802,23 @@ int doveadm_client_create(const struct doveadm_client_settings *set,
 	} else if (set->ip.family != 0) {
 		connection_init_client_ip(doveadm_clients, &conn->conn,
 					  set->hostname, &set->ip, set->port);
-	} else {
-		struct ip_addr *ips;
-		unsigned int ips_count;
 
-		ret = net_gethostbyname(set->hostname, &ips, &ips_count);
-		if (ret != 0) {
-			*error_r = t_strdup_printf(
-				"Lookup of host %s failed: %s",
-				set->hostname, net_gethosterror(ret));
-			pool_unref(&pool);
-			return -1;
-		}
-		connection_init_client_ip(doveadm_clients, &conn->conn,
-					  set->hostname, &ips[0], set->port);
-	}
-	if (connection_client_connect(&conn->conn) < 0) {
-		*error_r = t_strdup_printf(
-			"net_connect(%s) failed: %m", conn->conn.name);
-		connection_deinit(&conn->conn);
+	} else if (doveadm_client_resolve_hostname(conn, &error) != 0) {
+		*error_r = t_strdup(error);
 		pool_unref(&pool);
 		return -1;
 	}
-	conn->state = DOVEADM_CLIENT_REPLY_STATE_DONE;
+
+	if (conn->dns_lookup == NULL) {
+		/* Only connect here if this is not using an async dns
+		   lookup. */
+		if (doveadm_client_connect(conn, error_r) < 0) {
+			connection_deinit(&conn->conn);
+			pool_unref(&pool);
+			return -1;
+		}
+		conn->state = DOVEADM_CLIENT_REPLY_STATE_DONE;
+	}
 
 	*conn_r = conn;
 	return 0;
@@ -691,12 +833,9 @@ void doveadm_client_set_print(struct doveadm_client *conn,
 	conn->print_context = context;
 }
 
-static void doveadm_client_destroy(struct doveadm_client **_conn)
+static void doveadm_client_destroy_int(struct doveadm_client *conn)
 {
-	struct doveadm_client *conn = *_conn;
 	const char *error;
-
-	*_conn = NULL;
 
 	if (conn->callback != NULL) {
 		error = conn->ssl_iostream == NULL ? NULL :
@@ -727,6 +866,31 @@ static void doveadm_client_destroy(struct doveadm_client **_conn)
 
 	connection_deinit(&conn->conn);
 	ssl_iostream_context_unref(&conn->set.ssl_ctx);
+}
+
+static void doveadm_client_destroy(struct doveadm_client **_conn)
+{
+	struct doveadm_client *conn = *_conn;
+
+	*_conn = NULL;
+
+	conn->destroyed = TRUE;
+	timeout_remove(&conn->to_create_failed);
+	doveadm_client_destroy_int(conn);
+	doveadm_client_unref(&conn);
+}
+
+void doveadm_client_unref(struct doveadm_client **_conn)
+{
+	struct doveadm_client *conn = *_conn;
+
+	*_conn = NULL;
+
+	i_assert(conn->refcount > 0);
+	if (--conn->refcount > 0)
+		return;
+	if (!conn->destroyed)
+		doveadm_client_destroy_int(conn);
 	pool_unref(&conn->pool);
 }
 
@@ -780,6 +944,8 @@ void doveadm_client_cmd(struct doveadm_client *conn,
 	}
 	conn->callback = callback;
 	conn->context = context;
+	/* doveadm_client_destroy() will be called to unreference */
+	conn->refcount++;
 }
 
 void doveadm_client_extract(struct doveadm_client *conn,
@@ -792,6 +958,8 @@ void doveadm_client_extract(struct doveadm_client *conn,
 	*log_istream_r = conn->log_input;
 	*ostream_r = conn->conn.output;
 	*ssl_iostream_r = conn->ssl_iostream;
+
+	o_stream_unset_flush_callback(conn->conn.output);
 
 	conn->conn.input = NULL;
 	conn->log_input = NULL;

@@ -14,9 +14,7 @@
 #include "iostream-temp.h"
 #include "iostream-ssl.h"
 #include "iostream-ssl-test.h"
-#ifdef HAVE_OPENSSL
 #include "iostream-openssl.h"
-#endif
 #include "connection.h"
 #include "test-common.h"
 #include "test-subprocess.h"
@@ -27,6 +25,7 @@
 
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/signal.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <dirent.h>
@@ -870,6 +869,7 @@ static int test_run_server(struct test_server_data *data)
 	if (debug)
 		i_debug("PID=%s", my_pid);
 
+	test_subprocess_notify_signal_send_parent(SIGUSR1);
 	ioloop = io_loop_create();
 	test_server_init(server_set);
 	io_loop_run(ioloop);
@@ -931,7 +931,9 @@ test_run_client_server(
 
 	/* Fork server */
 	test_open_server_fd();
+	test_subprocess_notify_signal_reset(SIGUSR1);
 	test_subprocess_fork(test_run_server, &data, FALSE);
+	test_subprocess_notify_signal_wait(SIGUSR1, TEST_SIGNALS_DEFAULT_TIMEOUT_MS);
 	i_close_fd(&fd_listen);
 
 	/* Run client */
@@ -1025,7 +1027,6 @@ test_run_scenarios(
 
 	test_out_reason("unknown payload size", (failure == NULL), failure);
 
-#ifdef HAVE_OPENSSL
 	smtp_server_set.max_pipelined_commands = 5;
 	smtp_server_set.capabilities |= SMTP_CAPABILITY_PIPELINING;
 	test_max_pending = MAX_PARALLEL_PENDING;
@@ -1047,7 +1048,6 @@ test_run_scenarios(
 
 	test_out_reason("parallel pipelining startls",
 			(failure == NULL), failure);
-#endif
 }
 
 static void test_smtp_normal(void)
@@ -1098,17 +1098,13 @@ static void (*const test_functions[])(void) = {
 
 static void main_init(void)
 {
-#ifdef HAVE_OPENSSL
 	ssl_iostream_openssl_init();
-#endif
 }
 
 static void main_deinit(void)
 {
 	ssl_iostream_context_cache_free();
-#ifdef HAVE_OPENSSL
 	ssl_iostream_openssl_deinit();
-#endif
 }
 
 int main(int argc, char *argv[])

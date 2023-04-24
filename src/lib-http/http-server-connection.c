@@ -373,6 +373,7 @@ http_server_connection_ssl_init(struct http_server_connection *conn)
 	} else {
 		ret = io_stream_create_ssl_server(server->ssl_ctx,
 						  server->set.ssl,
+						  server->event,
 						  &conn->conn.input,
 						  &conn->conn.output,
 						  &conn->ssl_iostream, &error);
@@ -930,11 +931,14 @@ void http_server_connection_output_halt(struct http_server_connection *conn)
 
 void http_server_connection_output_resume(struct http_server_connection *conn)
 {
-	if (conn->output_halted) {
-		conn->output_halted = FALSE;
-		o_stream_set_flush_callback(conn->conn.output,
-					    http_server_connection_output, conn);
-	}
+	if (!conn->output_halted)
+		return;
+	conn->output_halted = FALSE;
+
+	if (conn->conn.output == NULL)
+		return;
+	o_stream_set_flush_callback(conn->conn.output,
+				    http_server_connection_output, conn);
 }
 
 bool http_server_connection_pending_payload(

@@ -16,7 +16,6 @@
 #include "time-util.h"
 #include "master-service.h"
 #include "master-service-ssl-settings.h"
-#include "mail-user-hash.h"
 #include "client-common.h"
 #include "login-proxy-state.h"
 #include "login-proxy.h"
@@ -34,6 +33,10 @@
 /* Don't even try to reconnect if proxying will timeout in less than this. */
 #define PROXY_CONNECT_RETRY_MIN_MSECS (PROXY_CONNECT_RETRY_MSECS + 100)
 #define PROXY_DISCONNECT_INTERVAL_MSECS 100
+/* How many times the same ip:port can be connected to before proxying decides
+   that it's a loop and fails. The first time isn't necessarily a loop, just
+   a reversed dynamic decision that it was actually the proper destination. */
+#define PROXY_REDIRECT_LOOP_MIN_COUNT 2
 
 #define LOGIN_PROXY_SIDE_CLIENT IOSTREAM_PROXY_SIDE_LEFT
 #define LOGIN_PROXY_SIDE_SERVER IOSTREAM_PROXY_SIDE_RIGHT
@@ -45,6 +48,7 @@ enum login_proxy_free_flags {
 struct login_proxy_redirect {
 	struct ip_addr ip;
 	in_port_t port;
+	unsigned int count;
 };
 
 struct login_proxy {
@@ -108,15 +112,26 @@ login_proxy_free_full(struct login_proxy **_proxy, const char *log_msg,
 		      const char *disconnect_reason,
 		      enum login_proxy_free_flags flags);
 
-static time_t proxy_last_io(struct login_proxy *proxy)
+static struct timeval
+proxy_last_io_timeval(struct login_proxy *proxy)
 {
-	struct timeval tv1, tv2, tv3, tv4;
+	struct timeval max_tv, tv1, tv2, tv3, tv4;
 
 	i_stream_get_last_read_time(proxy->client_input, &tv1);
 	i_stream_get_last_read_time(proxy->server_input, &tv2);
 	o_stream_get_last_write_time(proxy->client_output, &tv3);
 	o_stream_get_last_write_time(proxy->server_output, &tv4);
-	return I_MAX(tv1.tv_sec, I_MAX(tv2.tv_sec, I_MAX(tv3.tv_sec, tv4.tv_sec)));
+
+	max_tv = timeval_cmp(&tv3, &tv4) > 0 ? tv3 : tv4;
+	max_tv = timeval_cmp(&max_tv, &tv2) > 0 ? max_tv : tv2;
+	max_tv = timeval_cmp(&max_tv, &tv1) > 0 ? max_tv : tv1;
+
+	return max_tv;
+}
+
+static time_t proxy_last_io(struct login_proxy *proxy)
+{
+	return proxy_last_io_timeval(proxy).tv_sec;
 }
 
 static void login_proxy_free_errstr(struct login_proxy **_proxy,
@@ -290,22 +305,26 @@ static bool proxy_try_reconnect(struct login_proxy *proxy)
 	return TRUE;
 }
 
-static bool
-proxy_have_connected(struct login_proxy *proxy,
-		     const struct ip_addr *ip, in_port_t port)
+static bool proxy_is_self(struct login_proxy *proxy,
+			  const struct ip_addr *ip, in_port_t port)
 {
-	const struct login_proxy_redirect *redirect;
+	return net_ip_compare(&proxy->ip, ip) && proxy->port == port;
+}
 
-	if (net_ip_compare(&proxy->ip, ip) && proxy->port == port)
-		return TRUE;
+static struct login_proxy_redirect *
+login_proxy_redirect_find(struct login_proxy *proxy,
+			  const struct ip_addr *ip, in_port_t port)
+{
+	struct login_proxy_redirect *redirect;
+
 	if (!array_is_created(&proxy->redirect_path))
-		return FALSE;
+		return NULL;
 
-	array_foreach(&proxy->redirect_path, redirect) {
+	array_foreach_modifiable(&proxy->redirect_path, redirect) {
 		if (net_ip_compare(&redirect->ip, ip) && redirect->port == port)
-			return TRUE;
+			return redirect;
 	}
-	return FALSE;
+	return NULL;
 }
 
 static bool proxy_connect_failed(struct login_proxy *proxy)
@@ -438,9 +457,9 @@ int login_proxy_new(struct client *client, struct event *event,
 	login_proxy_set_destination(proxy, set->host, &set->ip, set->port);
 
 	/* add event fields */
-	event_add_str(proxy->event, "source_ip",
-		      login_proxy_get_source_host(proxy));
-	event_add_str(proxy->event, "dest_ip", net_ip2addr(&set->ip));
+	event_add_ip(proxy->event, "source_ip",
+		     login_proxy_get_source_host(proxy));
+	event_add_ip(proxy->event, "dest_ip", &set->ip);
 	event_add_int(proxy->event, "dest_port", set->port);
 	event_add_str(event, "dest_host", set->host);
 	event_add_str(event, "master_user", client->proxy_master_user);
@@ -634,10 +653,12 @@ login_proxy_free_full(struct login_proxy **_proxy, const char *log_msg,
 		set_name("proxy_session_finished");
 
 	if (proxy->detached) {
+		struct timeval proxy_tv = proxy_last_io_timeval(proxy);
+		intmax_t idle_usecs = timeval_diff_usecs(&ioloop_timeval, &proxy_tv);
 		i_assert(proxy->connected);
-		e->add_int("idle_secs", ioloop_time - proxy_last_io(proxy));
-		e->add_int("bytes_in", proxy->server_output->offset);
-		e->add_int("bytes_out", proxy->client_output->offset);
+		e->add_int("idle_usecs", idle_usecs);
+		e->add_int("net_in_bytes", proxy->server_output->offset);
+		e->add_int("net_out_bytes", proxy->client_output->offset);
 	}
 
 	/* we'll disconnect server side in any case. */
@@ -694,6 +715,8 @@ login_proxy_free_full(struct login_proxy **_proxy, const char *log_msg,
 void login_proxy_free(struct login_proxy **_proxy)
 {
 	struct login_proxy *proxy = *_proxy;
+	if (proxy == NULL)
+		return;
 
 	i_assert(!proxy->detached || proxy->client->destroyed);
 	/* Note: The NULL error is never even attempted to be used here. */
@@ -781,10 +804,21 @@ void login_proxy_redirect_finish(struct login_proxy *proxy,
 				 const struct ip_addr *ip, in_port_t port)
 {
 	struct login_proxy_redirect *redirect;
+	bool looping;
 
 	i_assert(port != 0);
 
-	if (proxy_have_connected(proxy, ip, port)) {
+	/* If proxy destination is the socket's local IP/port, it's a definite
+	   immediate loop. */
+	looping = proxy_is_self(proxy, ip, port);
+	if (!looping) {
+		/* If the proxy destination has already been connected too
+		   many times, assume it's a loop. */
+		redirect = login_proxy_redirect_find(proxy, ip, port);
+		looping = redirect != NULL &&
+			redirect->count >= PROXY_REDIRECT_LOOP_MIN_COUNT;
+	}
+	if (looping) {
 		const char *error = t_strdup_printf(
 			"Proxying loops - already connected to %s:%d",
 			net_ip2addr(ip), port);
@@ -795,12 +829,15 @@ void login_proxy_redirect_finish(struct login_proxy *proxy,
 	i_assert(proxy->client->proxy_ttl > 0);
 	proxy->client->proxy_ttl--;
 
-	/* add current ip/port to redirect path */
-	if (!array_is_created(&proxy->redirect_path))
-		i_array_init(&proxy->redirect_path, 2);
-	redirect = array_append_space(&proxy->redirect_path);
-	redirect->ip = proxy->ip;
-	redirect->port = proxy->port;
+	if (redirect == NULL) {
+		/* add current ip/port to redirect path */
+		if (!array_is_created(&proxy->redirect_path))
+			i_array_init(&proxy->redirect_path, 2);
+		redirect = array_append_space(&proxy->redirect_path);
+		redirect->ip = proxy->ip;
+		redirect->port = proxy->port;
+	}
+	redirect->count++;
 
 	/* disconnect from current backend */
 	login_proxy_disconnect(proxy);
@@ -838,9 +875,10 @@ struct event *login_proxy_get_event(struct login_proxy *proxy)
 	return proxy->event;
 }
 
-const char *login_proxy_get_source_host(const struct login_proxy *proxy)
+const struct ip_addr *
+login_proxy_get_source_host(const struct login_proxy *proxy)
 {
-	return net_ip2addr(&proxy->source_ip);
+	return &proxy->source_ip;
 }
 
 const char *login_proxy_get_host(const struct login_proxy *proxy)
@@ -1015,6 +1053,7 @@ int login_proxy_starttls(struct login_proxy *proxy)
 	}
 
 	if (io_stream_create_ssl_client(ssl_ctx, proxy->host, &ssl_set,
+					proxy->event,
 					&proxy->server_input,
 					&proxy->server_output,
 					&proxy->server_ssl_iostream,

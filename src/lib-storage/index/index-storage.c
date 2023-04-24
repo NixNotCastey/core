@@ -32,10 +32,11 @@
 struct index_storage_module index_storage_module =
 	MODULE_CONTEXT_INIT(&mail_storage_module_register);
 
-static void set_cache_decisions(struct mail_cache *cache,
+static void set_cache_decisions(struct mailbox *box,
 				const char *set, const char *fields,
 				enum mail_cache_decision_type dec)
 {
+	struct mail_cache *cache = box->cache;
 	struct mail_cache_field field;
 	const char *const *arr;
 	unsigned int idx;
@@ -59,18 +60,21 @@ static void set_cache_decisions(struct mail_cache *cache,
 				field.name = name;
 				field.type = MAIL_CACHE_FIELD_HEADER;
 			} else {
-				i_error("%s: Header name '%s' has invalid character, ignoring",
+				e_error(box->event,
+					"%s: Header name '%s' has invalid character, ignoring",
 					set, name);
 				continue;
 			}
 		} else {
-			i_error("%s: Unknown cache field name '%s', ignoring",
+			e_error(box->event,
+				"%s: Unknown cache field name '%s', ignoring",
 				set, *arr);
 			continue;
 		}
 
 		field.decision = dec;
-		mail_cache_register_fields(cache, &field, 1);
+		mail_cache_register_fields(cache, &field, 1,
+					   unsafe_data_stack_pool);
 	}
 }
 
@@ -80,11 +84,10 @@ static void index_cache_register_defaults(struct mailbox *box)
 	const struct mail_storage_settings *set = box->storage->set;
 	struct mail_cache *cache = box->cache;
 
-	ibox->cache_fields = i_malloc(sizeof(global_cache_fields));
-	memcpy(ibox->cache_fields, global_cache_fields,
-	       sizeof(global_cache_fields));
+	ibox->cache_fields = index_mail_global_cache_fields_dup();
 	mail_cache_register_fields(cache, ibox->cache_fields,
-				   MAIL_INDEX_CACHE_FIELD_COUNT);
+				   MAIL_INDEX_CACHE_FIELD_COUNT,
+				   MAIL_CACHE_TRUNCATE_NAME_FAIL);
 
 	if (strcmp(set->mail_never_cache_fields, "*") == 0) {
 		/* all caching disabled for now */
@@ -92,14 +95,14 @@ static void index_cache_register_defaults(struct mailbox *box)
 		return;
 	}
 
-	set_cache_decisions(cache, "mail_cache_fields",
+	set_cache_decisions(box, "mail_cache_fields",
 			    set->mail_cache_fields,
 			    MAIL_CACHE_DECISION_TEMP);
-	set_cache_decisions(cache, "mail_always_cache_fields",
+	set_cache_decisions(box, "mail_always_cache_fields",
 			    set->mail_always_cache_fields,
 			    MAIL_CACHE_DECISION_YES |
 			    MAIL_CACHE_DECISION_FORCED);
-	set_cache_decisions(cache, "mail_never_cache_fields",
+	set_cache_decisions(box, "mail_never_cache_fields",
 			    set->mail_never_cache_fields,
 			    MAIL_CACHE_DECISION_NO |
 			    MAIL_CACHE_DECISION_FORCED);
@@ -288,6 +291,8 @@ int index_storage_mailbox_alloc_index(struct mailbox *box)
 		.cache = {
 			.unaccessed_field_drop_secs = set->mail_cache_unaccessed_field_drop,
 			.record_max_size = set->mail_cache_record_max_size,
+			.max_header_name_length = set->mail_cache_max_header_name_length,
+			.max_headers_count = set->mail_cache_max_headers_count,
 			.max_size = set->mail_cache_max_size,
 			.purge_min_size = set->mail_cache_purge_min_size,
 			.purge_delete_percentage = set->mail_cache_purge_delete_percentage,
@@ -402,11 +407,8 @@ void index_storage_mailbox_alloc(struct mailbox *box, const char *vname,
 			     mailbox_list_get_storage_name(box->list, vname));
 	box->flags = flags;
 	box->index_prefix = p_strdup(box->pool, index_prefix);
-	box->event = event_create(box->storage->event);
-	event_add_category(box->event, &event_category_mailbox);
-	event_add_str(box->event, "mailbox", box->vname);
-	event_set_append_log_prefix(box->event,
-		t_strdup_printf("Mailbox %s: ", str_sanitize(box->vname, 128)));
+	box->event = mail_storage_mailbox_create_event(box->storage->event,
+						       box->vname);
 
 	p_array_init(&box->search_results, box->pool, 16);
 	array_create(&box->module_contexts,
@@ -486,9 +488,9 @@ index_storage_mailbox_update_cache(struct mailbox *box,
 	const struct mail_cache_field *old_fields;
 	struct mail_cache_field field;
 	unsigned int i, j, old_count;
+	pool_t pool;
 
-	old_fields = mail_cache_register_get_list(box->cache,
-						  pool_datastack_create(),
+	old_fields = mail_cache_register_get_list(box->cache, &pool,
 						  &old_count);
 
 	/* There shouldn't be many fields, so don't worry about O(n^2). */
@@ -519,8 +521,10 @@ index_storage_mailbox_update_cache(struct mailbox *box,
 	if (array_count(&new_fields) > 0) {
 		mail_cache_register_fields(box->cache,
 					   array_front_modifiable(&new_fields),
-					   array_count(&new_fields));
+					   array_count(&new_fields),
+					   unsafe_data_stack_pool);
 	}
+	pool_unref(&pool);
 }
 
 static int
@@ -633,12 +637,6 @@ int index_storage_mailbox_create(struct mailbox *box, bool directory)
 	enum mailbox_existence existence;
 	bool create_parent_dir;
 	int ret;
-
-	if ((box->list->props & MAILBOX_LIST_PROP_NO_NOSELECT) != 0) {
-		/* Layout doesn't support creating \NoSelect mailboxes.
-		   Switch to creating a selectable mailbox. */
-		directory = FALSE;
-	}
 
 	type = directory ? MAILBOX_LIST_PATH_TYPE_DIR :
 		MAILBOX_LIST_PATH_TYPE_MAILBOX;
@@ -923,7 +921,7 @@ int index_storage_mailbox_rename(struct mailbox *src, struct mailbox *dest)
 		struct mail_index_transaction *t =
 			mail_index_transaction_begin(dest->view, 0);
 
-		uint32_t stamp = ioloop_time;
+		uint32_t stamp = ioloop_time32;
 
 		mail_index_update_header_ext(t, dest->box_last_rename_stamp_ext_id,
 					     0, &stamp, sizeof(stamp));
@@ -1085,12 +1083,13 @@ void index_copy_cache_fields(struct mail_save_context *ctx,
 					 &dest_metadata) < 0)
 			i_unreached();
 
-		buf = t_buffer_create(1024);
+		buf = buffer_create_dynamic(default_pool, 1024);
 		array_foreach(src_metadata.cache_fields, field) {
 			mail_copy_cache_field(ctx, src_mail, dest_seq,
 					      field->name, buf);
 		}
 		index_copy_vsize_extension(ctx, src_mail, dest_seq);
+		buffer_free(&buf);
 	} T_END;
 }
 

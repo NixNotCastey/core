@@ -248,6 +248,13 @@ default_sql_statement_init_prepared(struct sql_prepared_statement *stmt)
 	return sql_statement_init(stmt->db, stmt->query_template);
 }
 
+const char *sql_statement_get_log_query(struct sql_statement *stmt)
+{
+	if (stmt->no_log_expanded_values)
+		return stmt->query_template;
+	return sql_statement_get_query(stmt);
+}
+
 const char *sql_statement_get_query(struct sql_statement *stmt)
 {
 	string_t *query = t_str_new(128);
@@ -384,6 +391,12 @@ void sql_statement_set_timestamp(struct sql_statement *stmt,
 {
 	if (stmt->db->v.statement_set_timestamp != NULL)
 		stmt->db->v.statement_set_timestamp(stmt, ts);
+}
+
+void sql_statement_set_no_log_expanded_values(struct sql_statement *stmt,
+					      bool no_expand)
+{
+	stmt->no_log_expanded_values = no_expand;
 }
 
 void sql_statement_bind_str(struct sql_statement *stmt,
@@ -557,13 +570,15 @@ static void sql_result_fetch(struct sql_result *result)
 		case SQL_TYPE_UINT: {
 			if (value != NULL &&
 			    str_to_uint(value, (unsigned int *)ptr) < 0)
-				i_error("sql: Value not uint: %s", value);
+				e_error(result->event,
+					"Value not uint: %s", value);
 			break;
 		}
 		case SQL_TYPE_ULLONG: {
 			if (value != NULL &&
 			    str_to_ullong(value, (unsigned long long *)ptr) < 0)
-				i_error("sql: Value not ullong: %s", value);
+				e_error(result->event,
+					"Value not ullong: %s", value);
 			break;
 		}
 		case SQL_TYPE_BOOL: {
@@ -811,9 +826,7 @@ sql_query_finished_event(struct sql_db *db, struct event *event, const char *que
 		e->add_str("slow_query", "y");
 		db->slow_queries++;
 	}
-
-	if (duration_r != NULL)
-		*duration_r = diff;
+	*duration_r = diff;
 
 	return e;
 }

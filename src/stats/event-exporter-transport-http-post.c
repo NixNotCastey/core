@@ -7,6 +7,7 @@
 #include "http-client.h"
 #include "iostream-ssl.h"
 #include "master-service.h"
+#include "master-service-settings.h"
 #include "master-service-ssl-settings.h"
 
 /* the http client used to export all events with exporter=http-post */
@@ -22,7 +23,7 @@ static void response_fxn(const struct http_response *response,
 			 void *context ATTR_UNUSED)
 {
 	static time_t last_log;
-	static unsigned suppressed;
+	static unsigned int suppressed;
 
 	if (http_response_is_success(response))
 		return;
@@ -50,7 +51,8 @@ void event_export_transport_http_post(const struct exporter *exporter,
 
 	if (exporter_http_client == NULL) {
 		const struct master_service_ssl_settings *master_ssl_set =
-			master_service_ssl_settings_get(master_service);
+			master_service_settings_get_root_set(master_service,
+				&master_service_ssl_setting_parser_info);
 		struct ssl_iostream_settings ssl_set;
 
 		struct http_client_settings set = {

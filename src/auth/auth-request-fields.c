@@ -78,6 +78,8 @@ void auth_request_export(struct auth_request *request, string_t *dest)
 		str_printfa(dest, "\tlport=%u", fields->local_port);
 	if (fields->remote_port != 0)
 		str_printfa(dest, "\trport=%u", fields->remote_port);
+	if (fields->ssl_ja3_hash != NULL)
+		auth_str_add_keyvalue(dest, "ssl_j3_hash", fields->ssl_ja3_hash);
 	if (fields->real_local_ip.family != 0) {
 		auth_str_add_keyvalue(dest, "real_lip",
 				      net_ip2addr(&fields->real_local_ip));
@@ -100,10 +102,10 @@ void auth_request_export(struct auth_request *request, string_t *dest)
 	}
 	if (event_want_debug(request->event))
 		str_append(dest, "\tdebug");
-	switch (fields->secured) {
-	case AUTH_REQUEST_SECURED_NONE: break;
-	case AUTH_REQUEST_SECURED: str_append(dest, "\tsecured"); break;
-	case AUTH_REQUEST_SECURED_TLS: str_append(dest, "\tsecured=tls"); break;
+	switch (fields->conn_secured) {
+	case AUTH_REQUEST_CONN_SECURED_NONE: break;
+	case AUTH_REQUEST_CONN_SECURED: str_append(dest, "\tsecured"); break;
+	case AUTH_REQUEST_CONN_SECURED_TLS: str_append(dest, "\tsecured=tls"); break;
 	default: break;
 	}
 	if (fields->skip_password_check)
@@ -142,13 +144,13 @@ bool auth_request_import_info(struct auth_request *request,
 	} else if (strcmp(key, "lip") == 0) {
 		if (net_addr2ip(value, &fields->local_ip) < 0)
 			return TRUE;
-		event_add_str(event, "local_ip", value);
+		event_add_ip(event, "local_ip", &fields->local_ip);
 		if (fields->real_local_ip.family == 0)
 			auth_request_import_info(request, "real_lip", value);
 	} else if (strcmp(key, "rip") == 0) {
 		if (net_addr2ip(value, &fields->remote_ip) < 0)
 			return TRUE;
-		event_add_str(event, "remote_ip", value);
+		event_add_ip(event, "remote_ip", &fields->remote_ip);
 		if (fields->real_remote_ip.family == 0)
 			auth_request_import_info(request, "real_rip", value);
 	} else if (strcmp(key, "lport") == 0) {
@@ -163,12 +165,16 @@ bool auth_request_import_info(struct auth_request *request,
 		event_add_int(event, "remote_port", fields->remote_port);
 		if (fields->real_remote_port == 0)
 			auth_request_import_info(request, "real_rport", value);
+	} else if (strcmp(key, "ssl_ja3_hash") == 0) {
+		fields->ssl_ja3_hash = p_strdup(request->pool, value);
 	} else if (strcmp(key, "real_lip") == 0) {
 		if (net_addr2ip(value, &fields->real_local_ip) == 0)
-			event_add_str(event, "real_local_ip", value);
+			event_add_ip(event, "real_local_ip",
+				     &fields->real_local_ip);
 	} else if (strcmp(key, "real_rip") == 0) {
 		if (net_addr2ip(value, &fields->real_remote_ip) == 0)
-			event_add_str(event, "real_remote_ip", value);
+			event_add_ip(event, "real_remote_ip",
+				     &fields->real_remote_ip);
 	} else if (strcmp(key, "real_lport") == 0) {
 		if (net_str2port(value, &fields->real_local_port) == 0)
 			event_add_int(event, "real_local_port",
@@ -213,11 +219,11 @@ bool auth_request_import_auth(struct auth_request *request,
 	/* auth client may set these */
 	if (strcmp(key, "secured") == 0) {
 		if (strcmp(value, "tls") == 0) {
-			fields->secured = AUTH_REQUEST_SECURED_TLS;
+			fields->conn_secured = AUTH_REQUEST_CONN_SECURED_TLS;
 			event_add_str(request->event, "transport", "TLS");
 		} else {
-			fields->secured = AUTH_REQUEST_SECURED;
-			event_add_str(request->event, "transport", "trusted");
+			fields->conn_secured = AUTH_REQUEST_CONN_SECURED;
+			event_add_str(request->event, "transport", "secured");
 		}
 	}
 	else if (strcmp(key, "final-resp-ok") == 0)
@@ -293,10 +299,10 @@ auth_request_fix_username(struct auth_request *request, const char **username,
 	unsigned char *p;
 	char *user;
 
-	if (*set->default_realm != '\0' &&
+	if (*set->default_domain != '\0' &&
 	    strchr(*username, '@') == NULL) {
 		user = p_strconcat(unsafe_data_stack_pool, *username, "@",
-				   set->default_realm, NULL);
+				   set->default_domain, NULL);
 	} else {
 		user = t_strdup_noconst(*username);
 	}

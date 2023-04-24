@@ -22,13 +22,13 @@ fs_crypt_load_settings(void)
 
 	i_zero(&input);
 	input.roots = set_roots;
-	input.module = "fs-crypt";
 	input.service = "fs-crypt";
 	if (master_service_settings_read(master_service, &input,
 					 &output, &error) < 0)
 		i_fatal("Error reading configuration: %s", error);
 
-	return master_service_settings_get_others(master_service)[0];
+	return master_service_settings_get_root_set(master_service,
+				&fs_crypt_setting_parser_info);
 }
 
 static

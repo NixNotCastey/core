@@ -45,7 +45,7 @@ cmd_mailbox_metadata_get_mailbox(struct metadata_cmd_context *mctx,
 	if (mctx->empty_mailbox_name) {
 		if (!mctx->allow_empty_mailbox_name) {
 			const char *op_str = doveadm_metadata_op_names[op];
-			i_error("Failed to %s: %s", op_str,
+			e_error(mctx->ctx.cctx->event, "Failed to %s: %s", op_str,
 				"mailbox name cannot be empty");
 			mctx->ctx.exit_code = EX_USAGE;
 			return -1;
@@ -69,7 +69,7 @@ cmd_mailbox_metadata_get_mailbox(struct metadata_cmd_context *mctx,
 
 	if (op == DOVEADM_METADATA_OP_SET &&
 	    mailbox_open(*box_r) < 0) {
-		i_error("Failed to open mailbox: %s",
+		e_error(mctx->ctx.cctx->event, "Failed to open mailbox: %s",
 		        mailbox_get_last_internal_error(*box_r, NULL));
 		doveadm_mail_failed_mailbox(&mctx->ctx, *box_r);
 		mailbox_free(box_r);
@@ -83,7 +83,9 @@ static int
 cmd_mailbox_metadata_set_run(struct doveadm_mail_cmd_context *_ctx,
 			     struct mail_user *user)
 {
-	struct metadata_cmd_context *ctx = (struct metadata_cmd_context *)_ctx;
+	struct metadata_cmd_context *ctx =
+		container_of(_ctx, struct metadata_cmd_context, ctx);
+
 	struct mail_namespace *ns;
 	struct mailbox *box;
 	struct mailbox_transaction_context *trans;
@@ -102,12 +104,12 @@ cmd_mailbox_metadata_set_run(struct doveadm_mail_cmd_context *_ctx,
 		mailbox_attribute_unset(trans, ctx->key_type, ctx->key) :
 		mailbox_attribute_set(trans, ctx->key_type, ctx->key, &ctx->value);
 	if (ret < 0) {
-		i_error("Failed to set attribute: %s",
+		e_error(ctx->ctx.cctx->event, "Failed to set attribute: %s",
 			mailbox_get_last_internal_error(box, NULL));
 		doveadm_mail_failed_mailbox(_ctx, box);
 		mailbox_transaction_rollback(&trans);
 	} else if (mailbox_transaction_commit(&trans) < 0) {
-		i_error("Failed to commit transaction: %s",
+		e_error(ctx->ctx.cctx->event, "Failed to commit transaction: %s",
 			mailbox_get_last_internal_error(box, NULL));
 		doveadm_mail_failed_mailbox(_ctx, box);
 		ret = -1;
@@ -141,38 +143,48 @@ cmd_mailbox_metadata_parse_key(const char *arg,
 }
 
 static void
-cmd_mailbox_metadata_set_init(struct doveadm_mail_cmd_context *_ctx,
-			      const char *const args[])
+parse_args_common(struct doveadm_mail_cmd_context *_ctx)
 {
-	struct metadata_cmd_context *ctx = (struct metadata_cmd_context *)_ctx;
-	const char *key;
+	struct doveadm_cmd_context *cctx = _ctx->cctx;
+	struct metadata_cmd_context *ctx =
+		container_of(_ctx, struct metadata_cmd_context, ctx);
 
-	if (str_array_length(args) != 3)
-		doveadm_mail_help_name("mailbox metadata set");
-	cmd_mailbox_metadata_parse_key(args[1], &ctx->key_type, &key);
-
-	ctx->mailbox = p_strdup(_ctx->pool, args[0]);
-	ctx->key = p_strdup(_ctx->pool, key);
-	ctx->value.value = p_strdup(_ctx->pool, args[2]);
+	ctx->allow_empty_mailbox_name =
+		doveadm_cmd_param_flag(cctx, "allow-empty-mailbox-name");
+	ctx->prepend_prefix = doveadm_cmd_param_flag(cctx, "prepend-prefix");
 }
 
 static bool
-cmd_mailbox_metadata_parse_arg(struct doveadm_mail_cmd_context *_ctx, int c)
+parse_args_key(struct doveadm_mail_cmd_context *_ctx,
+				    const char *field, const char **value_r)
 {
+	struct doveadm_cmd_context *cctx = _ctx->cctx;
 	struct metadata_cmd_context *ctx =
-		(struct metadata_cmd_context *)_ctx;
+		container_of(_ctx, struct metadata_cmd_context, ctx);
 
-	switch (c) {
-	case 's':
-		ctx->allow_empty_mailbox_name = TRUE;
-		break;
-	case 'p':
-		ctx->prepend_prefix = TRUE;
-		break;
-	default:
-		return FALSE;
+	const char *value;
+	*value_r = "";
+	bool found = doveadm_cmd_param_str(cctx, field, &value);
+	if (found) {
+		const char *parsed;
+		cmd_mailbox_metadata_parse_key(value, &ctx->key_type, &parsed);
+		*value_r = p_strdup(_ctx->pool, parsed);
 	}
-	return TRUE;
+	return found;
+}
+
+static void
+cmd_mailbox_metadata_set_init(struct doveadm_mail_cmd_context *_ctx)
+{
+	struct doveadm_cmd_context *cctx = _ctx->cctx;
+	struct metadata_cmd_context *ctx =
+		container_of(_ctx, struct metadata_cmd_context, ctx);
+
+	parse_args_common(_ctx);
+	if (!doveadm_cmd_param_str(cctx, "mailbox", &ctx->mailbox) ||
+	    !parse_args_key(_ctx, "key", &ctx->key) ||
+	    !doveadm_cmd_param_str(cctx, "value", &ctx->value.value))
+		doveadm_mail_help_name("mailbox metadata set");
 }
 
 static struct doveadm_mail_cmd_context *cmd_mailbox_metadata_set_alloc(void)
@@ -181,24 +193,21 @@ static struct doveadm_mail_cmd_context *cmd_mailbox_metadata_set_alloc(void)
 
 	ctx = doveadm_mail_cmd_alloc(struct metadata_cmd_context);
 	ctx->ctx.v.init = cmd_mailbox_metadata_set_init;
-	ctx->ctx.v.parse_arg = cmd_mailbox_metadata_parse_arg;
 	ctx->ctx.v.run = cmd_mailbox_metadata_set_run;
 	return &ctx->ctx;
 }
 
 static void
-cmd_mailbox_metadata_unset_init(struct doveadm_mail_cmd_context *_ctx,
-				const char *const args[])
+cmd_mailbox_metadata_unset_init(struct doveadm_mail_cmd_context *_ctx)
 {
-	struct metadata_cmd_context *ctx = (struct metadata_cmd_context *)_ctx;
-	const char *key;
+	struct doveadm_cmd_context *cctx = _ctx->cctx;
+	struct metadata_cmd_context *ctx =
+		container_of(_ctx, struct metadata_cmd_context, ctx);
 
-	if (str_array_length(args) != 2)
+	parse_args_common(_ctx);
+	if (!doveadm_cmd_param_str(cctx, "mailbox", &ctx->mailbox) ||
+	    !parse_args_key(_ctx, "key", &ctx->key))
 		doveadm_mail_help_name("mailbox metadata unset");
-	cmd_mailbox_metadata_parse_key(args[1], &ctx->key_type, &key);
-
-	ctx->mailbox = p_strdup(_ctx->pool, args[0]);
-	ctx->key = p_strdup(_ctx->pool, key);
 }
 
 static struct doveadm_mail_cmd_context *cmd_mailbox_metadata_unset_alloc(void)
@@ -207,7 +216,6 @@ static struct doveadm_mail_cmd_context *cmd_mailbox_metadata_unset_alloc(void)
 
 	ctx = doveadm_mail_cmd_alloc(struct metadata_cmd_context);
 	ctx->ctx.v.init = cmd_mailbox_metadata_unset_init;
-	ctx->ctx.v.parse_arg = cmd_mailbox_metadata_parse_arg;
 	ctx->ctx.v.run = cmd_mailbox_metadata_set_run;
 	return &ctx->ctx;
 }
@@ -216,7 +224,9 @@ static int
 cmd_mailbox_metadata_get_run(struct doveadm_mail_cmd_context *_ctx,
 			     struct mail_user *user)
 {
-	struct metadata_cmd_context *ctx = (struct metadata_cmd_context *)_ctx;
+	struct metadata_cmd_context *ctx =
+		container_of(_ctx, struct metadata_cmd_context, ctx);
+
 	struct mail_namespace *ns;
 	struct mailbox *box;
 	struct mail_attribute_value value;
@@ -229,7 +239,7 @@ cmd_mailbox_metadata_get_run(struct doveadm_mail_cmd_context *_ctx,
 
 	ret = mailbox_attribute_get_stream(box, ctx->key_type, ctx->key, &value);
 	if (ret < 0) {
-		i_error("Failed to get attribute: %s",
+		e_error(ctx->ctx.cctx->event, "Failed to get attribute: %s",
 			mailbox_get_last_internal_error(box, NULL));
 		doveadm_mail_failed_mailbox(_ctx, box);
 	} else if (ret == 0) {
@@ -237,7 +247,7 @@ cmd_mailbox_metadata_get_run(struct doveadm_mail_cmd_context *_ctx,
 		doveadm_print("");
 	} else if (value.value_stream != NULL) {
 		if (doveadm_print_istream(value.value_stream) < 0) {
-			i_error("read(%s) failed: %s",
+			e_error(ctx->ctx.cctx->event, "read(%s) failed: %s",
 				i_stream_get_name(value.value_stream),
 				i_stream_get_error(value.value_stream));
 			ret = -1;
@@ -251,18 +261,17 @@ cmd_mailbox_metadata_get_run(struct doveadm_mail_cmd_context *_ctx,
 }
 
 static void
-cmd_mailbox_metadata_get_init(struct doveadm_mail_cmd_context *_ctx,
-			      const char *const args[])
+cmd_mailbox_metadata_get_init(struct doveadm_mail_cmd_context *_ctx)
 {
-	struct metadata_cmd_context *ctx = (struct metadata_cmd_context *)_ctx;
-	const char *key;
+	struct doveadm_cmd_context *cctx = _ctx->cctx;
+	struct metadata_cmd_context *ctx =
+		container_of(_ctx, struct metadata_cmd_context, ctx);
 
-	if (str_array_length(args) != 2)
+	parse_args_common(_ctx);
+	if (!doveadm_cmd_param_str(cctx, "mailbox", &ctx->mailbox) ||
+	    !parse_args_key(_ctx, "key", &ctx->key))
 		doveadm_mail_help_name("mailbox metadata get");
-	cmd_mailbox_metadata_parse_key(args[1], &ctx->key_type, &key);
 
-	ctx->mailbox = p_strdup(_ctx->pool, args[0]);
-	ctx->key = p_strdup(_ctx->pool, key);
 	doveadm_print_header("value", "value",
 			     DOVEADM_PRINT_HEADER_FLAG_HIDE_TITLE);
 }
@@ -273,7 +282,6 @@ static struct doveadm_mail_cmd_context *cmd_mailbox_metadata_get_alloc(void)
 
 	ctx = doveadm_mail_cmd_alloc(struct metadata_cmd_context);
 	ctx->ctx.v.init = cmd_mailbox_metadata_get_init;
-	ctx->ctx.v.parse_arg = cmd_mailbox_metadata_parse_arg;
 	ctx->ctx.v.run = cmd_mailbox_metadata_get_run;
 	doveadm_print_init(DOVEADM_PRINT_TYPE_FLOW);
 	return &ctx->ctx;
@@ -305,7 +313,7 @@ cmd_mailbox_metadata_list_run_iter(struct metadata_cmd_context *ctx,
 		}
 	}
 	if (mailbox_attribute_iter_deinit(&iter) < 0) {
-		i_error("Mailbox %s: Failed to iterate mailbox attributes: %s",
+		e_error(ctx->ctx.cctx->event, "Mailbox %s: Failed to iterate mailbox attributes: %s",
 			mailbox_get_vname(box),
 			mailbox_get_last_internal_error(box, NULL));
 		return -1;
@@ -317,7 +325,9 @@ static int
 cmd_mailbox_metadata_list_run(struct doveadm_mail_cmd_context *_ctx,
 			      struct mail_user *user)
 {
-	struct metadata_cmd_context *ctx = (struct metadata_cmd_context *)_ctx;
+	struct metadata_cmd_context *ctx =
+		container_of(_ctx, struct metadata_cmd_context, ctx);
+
 	struct mail_namespace *ns;
 	struct mailbox *box;
 	int ret = 0;
@@ -344,18 +354,17 @@ cmd_mailbox_metadata_list_run(struct doveadm_mail_cmd_context *_ctx,
 }
 
 static void
-cmd_mailbox_metadata_list_init(struct doveadm_mail_cmd_context *_ctx,
-			       const char *const args[])
+cmd_mailbox_metadata_list_init(struct doveadm_mail_cmd_context *_ctx)
 {
-	struct metadata_cmd_context *ctx = (struct metadata_cmd_context *)_ctx;
-	const char *key = NULL;
+	struct doveadm_cmd_context *cctx = _ctx->cctx;
+	struct metadata_cmd_context *ctx =
+		container_of(_ctx, struct metadata_cmd_context, ctx);
 
-	if (args[0] == NULL)
+	parse_args_common(_ctx);
+	if (!doveadm_cmd_param_str(cctx, "mailbox", &ctx->mailbox))
 		doveadm_mail_help_name("mailbox metadata list");
-	if (args[1] != NULL)
-		cmd_mailbox_metadata_parse_key(args[1], &ctx->key_type, &key);
-	ctx->mailbox = p_strdup(_ctx->pool, args[0]);
-	ctx->key = key == NULL ? "" : p_strdup(_ctx->pool, key);
+	parse_args_key(_ctx, "key-prefix", &ctx->key);
+
 	doveadm_print_header("key", "key",
 			     DOVEADM_PRINT_HEADER_FLAG_HIDE_TITLE);
 }
@@ -366,7 +375,6 @@ static struct doveadm_mail_cmd_context *cmd_mailbox_metadata_list_alloc(void)
 
 	ctx = doveadm_mail_cmd_alloc(struct metadata_cmd_context);
 	ctx->ctx.v.init = cmd_mailbox_metadata_list_init;
-	ctx->ctx.v.parse_arg = cmd_mailbox_metadata_parse_arg;
 	ctx->ctx.v.run = cmd_mailbox_metadata_list_run;
 	doveadm_print_init(DOVEADM_PRINT_TYPE_FLOW);
 	return &ctx->ctx;

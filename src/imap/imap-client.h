@@ -161,13 +161,12 @@ struct client {
 
 	int fd_in, fd_out;
 	struct io *io;
-	struct istream *input;
-	struct ostream *output;
+	struct istream *input, *pre_rawlog_input, *post_rawlog_input;
+	struct ostream *output, *pre_rawlog_output, *post_rawlog_output;
 	struct timeout *to_idle, *to_idle_output, *to_delayed_input;
 	guid_128_t anvil_conn_guid;
 
 	pool_t pool;
-	struct mail_storage_service_user *service_user;
 	const struct imap_settings *set;
 	const struct smtp_submit_settings *smtp_set;
 	string_t *capability_string;
@@ -178,6 +177,7 @@ struct client {
         struct mailbox_keywords keywords;
 	unsigned int sync_counter;
 	uint32_t messages_count, recent_count, uidvalidity;
+	uoff_t prev_output_size;
 	ARRAY(bool) enabled_features;
 
 	time_t last_input, last_output;
@@ -219,7 +219,7 @@ struct client {
 	struct client_command_context *mailbox_change_lock;
 
 	/* IMAP URLAUTH context (RFC4467) */
-	struct imap_urlauth_context *urlauth_ctx;	
+	struct imap_urlauth_context *urlauth_ctx;
 
 	/* Module-specific contexts. */
 	ARRAY(union imap_module_context *) module_contexts;
@@ -269,7 +269,6 @@ extern unsigned int imap_feature_qresync;
    if the handle is a socket. */
 struct client *client_create(int fd_in, int fd_out, bool unhibernated,
 			     struct event *event, struct mail_user *user,
-			     struct mail_storage_service_user *service_user,
 			     const struct imap_settings *set,
 			     const struct smtp_submit_settings *smtp_set);
 void client_create_finish_io(struct client *client);

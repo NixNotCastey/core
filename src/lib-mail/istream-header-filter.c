@@ -235,11 +235,11 @@ static ssize_t read_header(struct header_filter_istream *mstream)
 			if (mstream->header_parsed && !mstream->headers_edited) {
 				if (mstream->eoh_not_matched)
 					matched = !matched;
-			} else if (mstream->callback != NULL) {
+			} else if (mstream->callback != NULL) T_BEGIN {
 				mstream->callback(mstream, hdr, &matched,
 						  mstream->context);
 				mstream->callbacks_called = TRUE;
-			}
+			} T_END;
 
 			if (matched) {
 				mstream->eoh_not_matched = TRUE;
@@ -274,8 +274,10 @@ static ssize_t read_header(struct header_filter_istream *mstream)
 			bool orig_matched = matched;
 
 			mstream->parsed_lines = mstream->cur_line;
-			mstream->callback(mstream, hdr, &matched,
-					  mstream->context);
+			T_BEGIN {
+				mstream->callback(mstream, hdr, &matched,
+						  mstream->context);
+			} T_END;
 			mstream->callbacks_called = TRUE;
 			if (matched != orig_matched &&
 			    !hdr->continued && !mstream->headers_edited) {
@@ -716,7 +718,7 @@ i_stream_create_header_filter(struct istream *input,
 		if (ret == 0) {
 			/* drop duplicate */
 			continue;
-		} 
+		}
 		i_assert(ret < 0);
 		mstream->headers[j++] = p_strdup(mstream->pool, headers[i]);
 	}

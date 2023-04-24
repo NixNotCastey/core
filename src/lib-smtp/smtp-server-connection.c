@@ -50,6 +50,7 @@ smtp_server_connection_update_stats(struct smtp_server_connection *conn)
 		conn->stats.input = conn->conn.input->v_offset;
 	if (conn->conn.output != NULL)
 		conn->stats.output = conn->conn.output->offset;
+	connection_update_counters(&conn->conn);
 }
 
 const struct smtp_server_stats *
@@ -395,7 +396,7 @@ int smtp_server_connection_ssl_init(struct smtp_server_connection *conn)
 			&conn->ssl_iostream, &error);
 	} else {
 		ret = io_stream_create_ssl_server(
-			conn->ssl_ctx, conn->set.ssl,
+			conn->ssl_ctx, conn->set.ssl, conn->event,
 			&conn->conn.input, &conn->conn.output,
 			&conn->ssl_iostream, &error);
 	}
@@ -600,6 +601,11 @@ static void smtp_server_connection_input(struct connection *_conn)
 	    conn->callbacks->conn_cmd_input_post != NULL)
 		conn->callbacks->conn_cmd_input_post(conn->context);
 	conn->handling_input = FALSE;
+
+	/* Handle output errors from immediate replies sent to client
+	   (normal replies are exclusively sent in output handler). */
+	if (conn->conn.output != NULL && conn->conn.output->closed)
+               	smtp_server_connection_handle_output_error(conn);
 	smtp_server_connection_unref(&conn);
 }
 
@@ -1123,6 +1129,7 @@ bool smtp_server_connection_unref(struct smtp_server_connection **_conn)
 	i_free(conn->helo_domain);
 	i_free(conn->username);
 	i_free(conn->session_id);
+	i_free(conn->client_transport);
 	event_unref(&conn->next_trans_event);
 	pool_unref(&conn->pool);
 	return FALSE;
@@ -1528,6 +1535,7 @@ void smtp_server_connection_get_proxy_data(struct smtp_server_connection *conn,
 		proxy_data->helo = conn->helo.domain;
 	proxy_data->login = conn->username;
 	proxy_data->session = conn->session_id;
+	proxy_data->client_transport = conn->client_transport;
 
 	if (conn->proxy_proto != SMTP_PROXY_PROTOCOL_UNKNOWN)
 		proxy_data->proto = conn->proxy_proto;
@@ -1572,6 +1580,10 @@ void smtp_server_connection_set_proxy_data(
 		        conn->session_id, proxy_data->session);
 		i_free(conn->session_id);
 		conn->session_id = i_strdup(proxy_data->session);
+	}
+	if (proxy_data->client_transport != NULL) {
+		i_free(conn->client_transport);
+		conn->client_transport = i_strdup(proxy_data->client_transport);
 	}
 
 	if (proxy_data->ttl_plus_1 > 0)

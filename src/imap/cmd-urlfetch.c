@@ -27,7 +27,7 @@ struct cmd_urlfetch_context {
 
 struct cmd_urlfetch_url {
 	const char *url;
-	
+
 	enum imap_urlauth_fetch_flags flags;
 };
 
@@ -284,7 +284,8 @@ cmd_urlfetch_url_callback(struct imap_urlauth_fetch_reply *reply,
 	if ((last && cmd->state == CLIENT_COMMAND_STATE_WAIT_EXTERNAL) ||
 	    ret < 0) {
 		cmd_urlfetch_finish(cmd);
-		client_command_free(&cmd);
+		if (!cmd->executing)
+			client_command_free(&cmd);
 	}
 	if (!in_io_handler)
 		o_stream_uncork(client->output);
@@ -371,7 +372,7 @@ bool cmd_urlfetch(struct client_command_context *cmd)
 		client_send_command_error(cmd, "Invalid arguments.");
 		return TRUE;
 	}
-	
+
 	t_array_init(&urls, 32);
 
 	/* parse url arguments and group them per userid */
@@ -406,5 +407,5 @@ bool cmd_urlfetch(struct client_command_context *cmd)
 
 	if (cmd->client->output_cmd_lock != cmd)
 		cmd->state = CLIENT_COMMAND_STATE_WAIT_EXTERNAL;
-	return FALSE;	
+	return FALSE;
 }

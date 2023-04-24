@@ -539,6 +539,16 @@ static int index_list_mailbox_open(struct mailbox *box)
 	const unsigned char *name_hdr;
 	size_t name_hdr_size;
 
+	if (!box->creating && (box->flags & MAILBOX_FLAG_OPEN_DELETED) == 0) {
+		if (mailbox_list_index_refresh(box->list) < 0)
+			return -1;
+		if (mailbox_list_index_lookup(box->list, box->name) == NULL) {
+			mail_storage_set_error(box->storage, MAIL_ERROR_NOTFOUND,
+					       T_MAIL_ERR_MAILBOX_NOT_FOUND(box->name));
+			return -1;
+		}
+	}
+
 	if (ibox->module_ctx.super.open(box) < 0)
 		return -1;
 
@@ -553,14 +563,10 @@ static int index_list_mailbox_open(struct mailbox *box)
 	   we don't keep rewriting the name just in case some backend switches
 	   between separators when accessed different ways. */
 
-	/* Get the current mailbox name with \0 separators. */
-	char sep = mailbox_list_get_hierarchy_sep(box->list);
-	char *box_zerosep_name = t_strdup_noconst(box->name);
-	size_t box_name_len = strlen(box_zerosep_name);
-	for (size_t i = 0; i < box_name_len; i++) {
-		if (box_zerosep_name[i] == sep)
-			box_zerosep_name[i] = '\0';
-	}
+	/* Get the current mailbox name with \0 separators and unesacped. */
+	size_t box_name_len;
+	const unsigned char *box_zerosep_name =
+		mailbox_name_hdr_encode(box->list, box->name, &box_name_len);
 
 	/* Does it match what's in the header now? */
 	mail_index_get_header_ext(box->view, box->box_name_hdr_ext_id,
@@ -584,14 +590,9 @@ static int index_list_mailbox_open(struct mailbox *box)
 		(void)mail_index_transaction_commit(&trans);
 	} else if (name_hdr_size > 0) {
 		/* Mailbox name is corrupted. Rename it to the previous name. */
-		char sep = mailbox_list_get_hierarchy_sep(box->list);
-		char *newname = t_malloc0(name_hdr_size + 1);
-		memcpy(newname, name_hdr, name_hdr_size);
-		for (size_t i = 0; i < name_hdr_size; i++) {
-			if (newname[i] == '\0')
-				newname[i] = sep;
-		}
-
+		const char *newname =
+			mailbox_name_hdr_decode_storage_name(
+				box->list, name_hdr, name_hdr_size);
 		index_list_rename_corrupted(box, newname);
 	}
 	return 0;
@@ -772,7 +773,7 @@ index_list_delete_mailbox(struct mailbox_list *_list, const char *name)
 		if (index_list_delete_entry(list, name, TRUE) < 0)
 			return -1;
 	}
-	if (_list->set.no_noselect && ret == 0)
+	if (!_list->set.keep_noselect && ret == 0)
 		(void)index_list_try_delete_nonexistent_parent(_list, name);
 
 	return ret;
@@ -891,7 +892,7 @@ index_list_rename_mailbox(struct mailbox_list *_oldlist, const char *oldname,
 
 	ret = mailbox_list_index_sync_end(&sync_ctx, TRUE);
 
-	if (_oldlist->set.no_noselect && ret == 0)
+	if (!_oldlist->set.keep_noselect && ret == 0)
                (void)index_list_try_delete_nonexistent_parent(_oldlist, oldname);
 
 	return ret;
@@ -944,6 +945,7 @@ struct mailbox_list index_mailbox_list = {
 		.alloc = index_list_alloc,
 		.init = index_list_init,
 		.deinit = index_list_deinit,
+		.get_storage = mailbox_list_default_get_storage,
 		.get_hierarchy_sep = index_list_get_hierarchy_sep,
 		.get_vname = mailbox_list_default_get_vname,
 		.get_storage_name = mailbox_list_default_get_storage_name,

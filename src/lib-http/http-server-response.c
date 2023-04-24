@@ -178,7 +178,8 @@ void http_server_response_set_date(struct http_server_response *resp,
 	resp->date = date;
 }
 
-void http_server_response_set_payload(struct http_server_response *resp,
+static void
+http_server_response_set_payload_real(struct http_server_response *resp,
 				      struct istream *input)
 {
 	int ret;
@@ -204,6 +205,14 @@ void http_server_response_set_payload(struct http_server_response *resp,
 	resp->payload_offset = input->v_offset;
 }
 
+void http_server_response_set_payload(struct http_server_response *resp,
+				      struct istream *input)
+{
+	input = i_stream_create_limit(input, UOFF_T_MAX);
+	http_server_response_set_payload_real(resp, input);
+	i_stream_unref(&input);
+}
+
 void http_server_response_set_payload_data(struct http_server_response *resp,
 					   const unsigned char *data,
 					   size_t size)
@@ -222,7 +231,7 @@ void http_server_response_set_payload_data(struct http_server_response *resp,
 	memcpy(payload_data, data, size);
 	input = i_stream_create_from_data(payload_data, size);
 
-	http_server_response_set_payload(resp, input);
+	http_server_response_set_payload_real(resp, input);
 	i_stream_unref(&input);
 }
 
@@ -311,16 +320,16 @@ http_server_response_flush_payload(struct http_server_response *resp)
 	struct http_server_connection *conn = req->conn;
 	int ret;
 
-	if (resp->payload_output != conn->conn.output &&
-	    (ret = o_stream_finish(resp->payload_output)) <= 0) {
-		if (ret < 0)
-			http_server_connection_handle_output_error(conn);
-		else
-			http_server_connection_start_idle_timeout(conn);
-		return ret;
-	}
+	if (resp->payload_output == conn->conn.output)
+		ret = o_stream_flush(resp->payload_output);
+	else
+		ret = o_stream_finish(resp->payload_output);
 
-	return 1;
+	if (ret < 0)
+		http_server_connection_handle_output_error(conn);
+	else if (ret == 0)
+		http_server_connection_start_idle_timeout(conn);
+	return ret;
 }
 
 void http_server_response_request_finished(struct http_server_response *resp)
@@ -351,10 +360,18 @@ int http_server_response_finish_payload_out(struct http_server_response *resp)
 		if (ret == 0) {
 			e_debug(resp->event,
 				"Not quite finished sending payload");
+			conn->output_locked = TRUE;
 			return 0;
 		}
 		o_stream_unref(&resp->payload_output);
 		resp->payload_output = NULL;
+	}
+	if (conn->conn.output != NULL &&
+	    o_stream_get_buffer_used_size(conn->conn.output) > 0) {
+		e_debug(resp->event,
+			"Not quite finished sending response");
+		conn->output_locked = TRUE;
+		return 0;
 	}
 
 	e_debug(resp->event, "Finished sending payload");
@@ -503,12 +520,12 @@ int http_server_response_send_more(struct http_server_response *resp)
 	struct ostream *output = resp->payload_output;
 	enum ostream_send_istream_result res;
 
-	i_assert(resp->payload_output != NULL);
-
 	if (resp->payload_finished) {
 		e_debug(resp->event, "Finish sending payload (more)");
 		return http_server_response_finish_payload_out(resp);
 	}
+
+	i_assert(resp->payload_output != NULL);
 
 	if (resp->payload_stream != NULL) {
 		conn->output_locked = TRUE;

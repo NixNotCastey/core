@@ -159,6 +159,7 @@ maildir_list_get_path(struct mailbox_list *_list, const char *name,
 					_list->set.index_pvt_dir, name);
 		return 1;
 	case MAILBOX_LIST_PATH_TYPE_LIST_INDEX:
+	case MAILBOX_LIST_PATH_TYPE_COUNT:
 		i_unreached();
 	}
 
@@ -498,6 +499,7 @@ struct mailbox_list maildir_mailbox_list = {
 	.v = {
 		.alloc = maildir_list_alloc,
 		.deinit = maildir_list_deinit,
+		.get_storage = mailbox_list_default_get_storage,
 		.get_hierarchy_sep = maildir_list_get_hierarchy_sep,
 		.get_vname = mailbox_list_default_get_vname,
 		.get_storage_name = mailbox_list_default_get_storage_name,
@@ -527,6 +529,7 @@ struct mailbox_list imapdir_mailbox_list = {
 	.v = {
 		.alloc = imapdir_list_alloc,
 		.deinit = maildir_list_deinit,
+		.get_storage = mailbox_list_default_get_storage,
 		.get_hierarchy_sep = maildir_list_get_hierarchy_sep,
 		.get_vname = mailbox_list_default_get_vname,
 		.get_storage_name = mailbox_list_default_get_storage_name,

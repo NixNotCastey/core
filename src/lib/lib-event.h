@@ -3,6 +3,7 @@
 /* event.h name is probably a bit too generic, so lets avoid using it. */
 
 #include <sys/time.h>
+#include "net.h"
 
 /* Field name for the reason_code string list. */
 #define EVENT_REASON_CODE "reason_code"
@@ -32,6 +33,7 @@ enum event_field_value_type {
 	EVENT_FIELD_VALUE_TYPE_STR,
 	EVENT_FIELD_VALUE_TYPE_INTMAX,
 	EVENT_FIELD_VALUE_TYPE_TIMEVAL,
+	EVENT_FIELD_VALUE_TYPE_IP,
 	EVENT_FIELD_VALUE_TYPE_STRLIST,
 };
 
@@ -42,6 +44,8 @@ struct event_field {
 		const char *str;
 		intmax_t intmax;
 		struct timeval timeval;
+		struct ip_addr ip;
+		unsigned int ip_bits; /* set for event filters */
 		ARRAY_TYPE(const_string) strlist;
 	} value;
 };
@@ -52,6 +56,7 @@ struct event_add_field {
 	const char *value;
 	intmax_t value_intmax;
 	struct timeval value_timeval;
+	struct ip_addr value_ip;
 };
 
 struct event_passthrough {
@@ -85,6 +90,8 @@ struct event_passthrough {
 		(*add_int_nonzero)(const char *key, intmax_t num);
 	struct event_passthrough *
 		(*add_timeval)(const char *key, const struct timeval *tv);
+	struct event_passthrough *
+		(*add_ip)(const char *key, const struct ip_addr *ip);
 
 	struct event_passthrough *
 		(*inc_int)(const char *key, intmax_t num);
@@ -277,6 +284,19 @@ event_set_log_message_callback(struct event *event,
 			const char *(*)(typeof(context), enum log_type, \
 					const char *)))
 
+/* Unsets the event message amendment callback. */
+void event_unset_log_message_callback(struct event *event,
+				      event_log_message_callback_t *callback,
+				      void *context);
+#define event_unset_log_message_callback(event, callback, context) \
+	event_unset_log_message_callback(event, \
+		(event_log_message_callback_t*)callback, context)
+
+/* Disable calling all callbacks for the event and its children. This
+   effectively allows the event to be used only for logging, but nothing else
+   (no stats or other filters). */
+void event_disable_callbacks(struct event *event);
+
 /* Set the event's name. The name is specific to a single sending of an event,
    and it'll be automatically cleared once the event is sent. This should
    typically be used only in a parameter to e_debug(), etc. */
@@ -341,6 +361,8 @@ event_inc_int(struct event *event, const char *key, intmax_t num);
 struct event *
 event_add_timeval(struct event *event, const char *key,
 		  const struct timeval *tv);
+struct event *
+event_add_ip(struct event *event, const char *key, const struct ip_addr *ip);
 /* Append new value to list. If the key is not a list, it will
    be cleared first. NULL values are ignored. Duplicate values are ignored. */
 struct event *

@@ -39,11 +39,7 @@ static const struct setting_define master_service_ssl_setting_defines[] = {
 };
 
 static const struct master_service_ssl_settings master_service_ssl_default_settings = {
-#ifdef HAVE_SSL
 	.ssl = "yes:no:required",
-#else
-	.ssl = "no:yes:required",
-#endif
 	.ssl_ca = "",
 	.ssl_client_ca_file = "",
 	.ssl_client_ca_dir = "",
@@ -127,11 +123,6 @@ master_service_ssl_settings_check(void *_set, pool_t pool ATTR_UNUSED,
 		/* disabled */
 		return TRUE;
 	}
-#ifndef HAVE_SSL
-	*error_r = t_strdup_printf("SSL support not compiled in but ssl=%s",
-				   set->ssl);
-	return FALSE;
-#else
 	/* we get called from many different tools, possibly with -O parameter,
 	   and few of those tools care about SSL settings. so don't check
 	   ssl_cert/ssl_key/etc validity here except in doveconf, because it
@@ -168,43 +159,9 @@ master_service_ssl_settings_check(void *_set, pool_t pool ATTR_UNUSED,
 		}
 	}
 
-#ifndef HAVE_SSL_CTX_SET1_CURVES_LIST
-	if (*set->ssl_curve_list != '\0') {
-		*error_r = "ssl_curve_list is set, but the linked openssl "
-			   "version does not support it";
-		return FALSE;
-	}
-#endif
-
 	return TRUE;
-#endif
 }
 /* </settings checks> */
-
-const struct master_service_ssl_settings *
-master_service_ssl_settings_get(struct master_service *service)
-{
-	return master_service_ssl_settings_get_from_parser(service->set_parser);
-}
-
-const struct master_service_ssl_settings *
-master_service_ssl_settings_get_from_parser(struct setting_parser_context *set_parser)
-{
-	void **sets;
-
-	sets = settings_parser_get_list(set_parser);
-	return sets[1];
-}
-
-const struct master_service_ssl_server_settings *
-master_service_ssl_server_settings_get(struct master_service *service)
-{
-	void **sets;
-
-	i_assert(service->want_ssl_server);
-	sets = settings_parser_get_list(service->set_parser);
-	return sets[2];
-}
 
 static void master_service_ssl_common_settings_to_iostream_set(
 	const struct master_service_ssl_settings *ssl_set, pool_t pool,
@@ -224,7 +181,6 @@ static void master_service_ssl_common_settings_to_iostream_set(
 
 	set_r->verbose = ssl_set->verbose_ssl;
 	set_r->verbose_invalid_cert = ssl_set->verbose_ssl;
-	set_r->skip_crl_check = !ssl_set->ssl_require_crl;
 	set_r->prefer_server_ciphers = ssl_set->ssl_prefer_server_ciphers;
 	set_r->compression = ssl_set->parsed_opts.compression;
 	set_r->tickets = ssl_set->parsed_opts.tickets;
@@ -243,6 +199,8 @@ void master_service_ssl_client_settings_to_iostream_set(
 	set_r->cert.key = p_strdup_empty(pool, ssl_set->ssl_client_key);
 	set_r->verify_remote_cert = ssl_set->ssl_client_require_valid_cert;
 	set_r->allow_invalid_cert = !set_r->verify_remote_cert;
+	/* client-side CRL checking not supported currently */
+	set_r->skip_crl_check = TRUE;
 }
 
 void master_service_ssl_server_settings_to_iostream_set(
@@ -264,4 +222,7 @@ void master_service_ssl_server_settings_to_iostream_set(
 	set_r->dh = p_strdup(pool, ssl_server_set->ssl_dh);
 	set_r->verify_remote_cert = ssl_set->ssl_verify_client_cert;
 	set_r->allow_invalid_cert = !set_r->verify_remote_cert;
+	/* ssl_require_crl is used only for checking client-provided SSL
+	   certificate's CRL. */
+	set_r->skip_crl_check = !ssl_set->ssl_require_crl;
 }

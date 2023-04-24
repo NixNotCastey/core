@@ -216,6 +216,11 @@ static void cmd_exec(struct doveadm_cmd_context *cctx)
 	if (!doveadm_cmd_param_array(cctx, "args", &args))
 		args = NULL;
 
+	/* Avoid re-executing doveconf after the binary is executed */
+	int config_fd = doveadm_settings_get_config_fd();
+	fd_close_on_exec(config_fd, FALSE);
+	env_put(DOVECOT_CONFIG_FD_ENV, dec2str(config_fd));
+
 	path = t_strdup_printf("%s/%s", doveadm_settings->libexec_dir, binary);
 
 	unsigned int len = str_array_length(args);
@@ -246,33 +251,30 @@ static struct doveadm_cmd_ver2 *doveadm_cmdline_commands_ver2[] = {
 	&doveadm_cmd_dump,
 	&doveadm_cmd_exec,
 	&doveadm_cmd_help,
-	&doveadm_cmd_oldstats_top_ver2,
 	&doveadm_cmd_pw,
-	&doveadm_cmd_zlibconnect,
+	&doveadm_cmd_compress_connect,
 };
 
 int main(int argc, char *argv[])
 {
 	enum master_service_flags service_flags =
 		MASTER_SERVICE_FLAG_STANDALONE |
-		MASTER_SERVICE_FLAG_KEEP_CONFIG_OPEN |
 		MASTER_SERVICE_FLAG_NO_SSL_INIT |
 		MASTER_SERVICE_FLAG_NO_INIT_DATASTACK_FRAME;
-	struct doveadm_cmd_context cctx;
 	const char *cmd_name;
 	unsigned int i;
 	bool quick_init = FALSE;
 	int c;
 
-	i_zero(&cctx);
-	cctx.conn_type = DOVEADM_CONNECTION_TYPE_CLI;
-
-	i_set_failure_exit_callback(failure_exit_callback);
-
 	/* "+" is GNU extension to stop at the first non-option.
 	   others just accept -+ option. */
 	master_service = master_service_init("doveadm", service_flags,
 					     &argc, &argv, "+Df:hv");
+	struct doveadm_cmd_context *cctx = doveadm_cmd_context_create(
+		DOVEADM_CONNECTION_TYPE_CLI, doveadm_verbose || doveadm_debug);
+
+	i_set_failure_exit_callback(failure_exit_callback);
+
 	while ((c = master_getopt(master_service)) > 0) {
 		switch (c) {
 		case 'D':
@@ -357,9 +359,9 @@ int main(int argc, char *argv[])
 
 	/* this has to be done here because proctitle hack can break
 	   the env pointer */
-	cctx.username = getenv("USER");
+	cctx->username = getenv("USER");
 
-	if (!doveadm_cmdline_try_run(cmd_name, argc, (const char**)argv, &cctx)) {
+	if (!doveadm_cmdline_try_run(cmd_name, argc, (const char**)argv, cctx)) {
 		if (doveadm_has_subcommands(cmd_name))
 			usage_prefix(cmd_name);
 		if (doveadm_has_unloaded_plugin(cmd_name)) {
@@ -369,7 +371,10 @@ int main(int argc, char *argv[])
 		}
 		usage();
 	}
+	if (cctx->referral != NULL)
+		i_fatal("Command requested referral: %s", cctx->referral);
 
+	doveadm_cmd_context_unref(&cctx);
 	if (!quick_init) {
 		doveadm_mail_deinit();
 		doveadm_dump_deinit();

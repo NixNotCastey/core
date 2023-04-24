@@ -8,6 +8,9 @@
 struct save_cmd_context {
 	struct doveadm_mail_cmd_context ctx;
 	const char *mailbox;
+	const char *guid;
+	uint32_t uid;
+	time_t received_date;
 };
 
 static int
@@ -21,7 +24,7 @@ cmd_save_to_mailbox(struct save_cmd_context *ctx, struct mailbox *box,
 	bool save_failed = FALSE;
 
 	if (input->stream_errno != 0) {
-		i_error("open(%s) failed: %s",
+		e_error(ctx->ctx.cctx->event, "open(%s) failed: %s",
 			i_stream_get_name(input),
 			i_stream_get_error(input));
 		ctx->ctx.exit_code = EX_TEMPFAIL;
@@ -29,7 +32,7 @@ cmd_save_to_mailbox(struct save_cmd_context *ctx, struct mailbox *box,
 	}
 
 	if (mailbox_open(box) < 0) {
-		i_error("Failed to open mailbox %s: %s",
+		e_error(ctx->ctx.cctx->event, "Failed to open mailbox %s: %s",
 			mailbox_get_vname(box),
 			mailbox_get_last_internal_error(box, NULL));
 		doveadm_mail_failed_storage(&ctx->ctx, storage);
@@ -39,8 +42,14 @@ cmd_save_to_mailbox(struct save_cmd_context *ctx, struct mailbox *box,
 	trans = mailbox_transaction_begin(box, MAILBOX_TRANSACTION_FLAG_EXTERNAL |
 					  ctx->ctx.transaction_flags, __func__);
 	save_ctx = mailbox_save_alloc(trans);
+	if (ctx->uid != 0)
+		mailbox_save_set_uid(save_ctx, ctx->uid);
+	if (ctx->guid != NULL)
+		mailbox_save_set_guid(save_ctx, ctx->guid);
+	if (ctx->received_date != (time_t)-1)
+		mailbox_save_set_received_date(save_ctx, ctx->received_date, 0);
 	if (mailbox_save_begin(&save_ctx, input) < 0) {
-		i_error("Saving failed: %s",
+		e_error(ctx->ctx.cctx->event, "Saving failed: %s",
 			mailbox_get_last_internal_error(box, NULL));
 		doveadm_mail_failed_storage(&ctx->ctx, storage);
 		mailbox_transaction_rollback(&trans);
@@ -56,18 +65,20 @@ cmd_save_to_mailbox(struct save_cmd_context *ctx, struct mailbox *box,
 	i_assert(ret == -1);
 
 	if (input->stream_errno != 0) {
-		i_error("read(msg input) failed: %s", i_stream_get_error(input));
+		e_error(ctx->ctx.cctx->event,
+			"read(msg input) failed: %s", i_stream_get_error(input));
 		doveadm_mail_failed_error(&ctx->ctx, MAIL_ERROR_TEMP);
 	} else if (save_failed) {
-		i_error("Saving failed: %s",
+		e_error(ctx->ctx.cctx->event, "Saving failed: %s",
 			mailbox_get_last_internal_error(box, NULL));
 		doveadm_mail_failed_storage(&ctx->ctx, storage);
 	} else if (mailbox_save_finish(&save_ctx) < 0) {
-		i_error("Saving failed: %s",
+		e_error(ctx->ctx.cctx->event, "Saving failed: %s",
 			mailbox_get_last_internal_error(box, NULL));
 		doveadm_mail_failed_storage(&ctx->ctx, storage);
 	} else if (mailbox_transaction_commit(&trans) < 0) {
-		i_error("Save transaction commit failed: %s",
+		e_error(ctx->ctx.cctx->event,
+			"Save transaction commit failed: %s",
 			mailbox_get_last_internal_error(box, NULL));
 		doveadm_mail_failed_storage(&ctx->ctx, storage);
 	} else {
@@ -84,7 +95,8 @@ cmd_save_to_mailbox(struct save_cmd_context *ctx, struct mailbox *box,
 static int
 cmd_save_run(struct doveadm_mail_cmd_context *_ctx, struct mail_user *user)
 {
-	struct save_cmd_context *ctx = (struct save_cmd_context *)_ctx;
+	struct save_cmd_context *ctx =
+		container_of(_ctx, struct save_cmd_context, ctx);
 	struct mail_namespace *ns;
 	struct mailbox *box;
 	int ret;
@@ -96,25 +108,25 @@ cmd_save_run(struct doveadm_mail_cmd_context *_ctx, struct mail_user *user)
 	return ret;
 }
 
-static void cmd_save_init(struct doveadm_mail_cmd_context *_ctx,
-			  const char *const args[] ATTR_UNUSED)
+static void cmd_save_init(struct doveadm_mail_cmd_context *_ctx)
 {
-	doveadm_mail_get_input(_ctx);
-}
+	struct doveadm_cmd_context *cctx = _ctx->cctx;
+	struct save_cmd_context *ctx =
+		container_of(_ctx, struct save_cmd_context, ctx);
+	const char *str;
+	bool utc;
 
-static bool
-cmd_mailbox_save_parse_arg(struct doveadm_mail_cmd_context *_ctx, int c)
-{
-	struct save_cmd_context *ctx = (struct save_cmd_context *)_ctx;
-
-	switch (c) {
-	case 'm':
-		ctx->mailbox = optarg;
-		break;
-	default:
-		return FALSE;
+	(void)doveadm_cmd_param_str(cctx, "mailbox", &ctx->mailbox);
+	(void)doveadm_cmd_param_uint32(cctx, "uid", &ctx->uid);
+	(void)doveadm_cmd_param_str(cctx, "guid", &ctx->guid);
+	if (!doveadm_cmd_param_str(cctx, "received-date", &str))
+		ctx->received_date = (time_t)-1;
+	else {
+		if (mail_parse_human_timestamp(str, &ctx->received_date, &utc) < 0)
+			i_fatal("Invalid received-date '%s'", str);
 	}
-	return TRUE;
+
+	doveadm_mail_get_input(_ctx);
 }
 
 static struct doveadm_mail_cmd_context *cmd_save_alloc(void)
@@ -122,8 +134,6 @@ static struct doveadm_mail_cmd_context *cmd_save_alloc(void)
 	struct save_cmd_context *ctx;
 
 	ctx = doveadm_mail_cmd_alloc(struct save_cmd_context);
-	ctx->ctx.getopt_args = "m:";
-	ctx->ctx.v.parse_arg = cmd_mailbox_save_parse_arg;
 	ctx->ctx.v.init = cmd_save_init;
 	ctx->ctx.v.run = cmd_save_run;
 	ctx->mailbox = "INBOX";
@@ -137,6 +147,9 @@ struct doveadm_cmd_ver2 doveadm_cmd_save_ver2 = {
 DOVEADM_CMD_PARAMS_START
 DOVEADM_CMD_MAIL_COMMON
 DOVEADM_CMD_PARAM('m', "mailbox", CMD_PARAM_STR, 0)
+DOVEADM_CMD_PARAM('U', "uid", CMD_PARAM_INT64, CMD_PARAM_FLAG_UNSIGNED)
+DOVEADM_CMD_PARAM('g', "guid", CMD_PARAM_STR, 0)
+DOVEADM_CMD_PARAM('r', "received-date", CMD_PARAM_STR, 0)
 DOVEADM_CMD_PARAM('\0', "file", CMD_PARAM_ISTREAM, CMD_PARAM_FLAG_POSITIONAL)
 DOVEADM_CMD_PARAMS_END
 };

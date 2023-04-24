@@ -15,7 +15,6 @@
 #include "connection.h"
 
 #include <unistd.h>
-#include <libgen.h>
 
 static void connection_handshake_ready(struct connection *conn)
 {
@@ -592,6 +591,8 @@ void connection_init_server(struct connection_list *list,
 	e_debug(e->event(), "Server accepted connection (fd=%d)", fd_in);
 
 	connection_init_streams(conn);
+	if (conn->v.init != NULL)
+		conn->v.init(conn);
 }
 
 void connection_init_server_ip(struct connection_list *list,
@@ -623,6 +624,8 @@ void connection_init_client_fd(struct connection_list *list,
 	   also be obvious that fd_out=1. */
 	e_debug(e->event(), "Client connected (fd=%d)", fd_in);
 
+	if (conn->v.init != NULL)
+		conn->v.init(conn);
 	connection_client_connected(conn, TRUE);
 }
 
@@ -651,6 +654,9 @@ void connection_init_client_ip_from(struct connection_list *list,
 	if (hostname != NULL)
 		event_add_str(conn->event, "dest_host", hostname);
 	connection_update_event(conn);
+
+	if (conn->v.init != NULL)
+		conn->v.init(conn);
 }
 
 void connection_init_client_ip(struct connection_list *list,
@@ -669,6 +675,9 @@ void connection_init_client_unix(struct connection_list *list,
 
 	connection_init(list, conn, path);
 	event_add_str(conn->event, "socket_path", path);
+
+	if (conn->v.init != NULL)
+		conn->v.init(conn);
 }
 
 void connection_init_from_streams(struct connection_list *list,
@@ -693,7 +702,7 @@ void connection_init_from_streams(struct connection_list *list,
 	o_stream_set_no_error_handling(conn->output, TRUE);
 
 	connection_update_stream_names(conn);
-	
+
 	conn->disconnected = FALSE;
 	connection_input_resume_full(conn, FALSE);
 
@@ -782,12 +791,12 @@ int connection_client_connect_async(struct connection *conn)
 	return 0;
 }
 
-static void connection_update_counters(struct connection *conn)
+void connection_update_counters(struct connection *conn)
 {
 	if (conn->input != NULL)
-		event_add_int(conn->event, "bytes_in", conn->input->v_offset);
+		event_add_int(conn->event, "net_in_bytes", conn->input->v_offset);
 	if (conn->output != NULL)
-		event_add_int(conn->event, "bytes_out", conn->output->offset);
+		event_add_int(conn->event, "net_out_bytes", conn->output->offset);
 }
 
 void connection_disconnect(struct connection *conn)
@@ -884,14 +893,15 @@ const char *connection_disconnect_reason(struct connection *conn)
 	case CONNECTION_DISCONNECT_CONNECT_TIMEOUT: {
 		unsigned int msecs =
 			conn->list->set.client_connect_timeout_msecs;
-		return t_strdup_printf("connect() timed out in %u.%03u secs",
-				       msecs/1000, msecs%1000);
+		return t_strdup_printf("connect(%s) timed out in %u.%03u secs",
+				       conn->name, msecs/1000, msecs%1000);
 	}
 	case CONNECTION_DISCONNECT_IDLE_TIMEOUT:
 		return "Idle timeout";
 	case CONNECTION_DISCONNECT_CONN_CLOSED:
 		if (conn->input == NULL)
-			return t_strdup_printf("connect() failed: %m");
+			return t_strdup_printf("connect(%s) failed: %m",
+						conn->name);
 		/* fall through */
 	case CONNECTION_DISCONNECT_NOT:
 	case CONNECTION_DISCONNECT_BUFFER_FULL:
@@ -918,8 +928,8 @@ const char *connection_input_timeout_reason(struct connection *conn)
 	} else {
 		int diff = timeval_diff_msecs(&ioloop_timeval,
 					      &conn->connect_started);
-		return t_strdup_printf("connect() timed out after %u.%03u secs",
-				       diff/1000, diff%1000);
+		return t_strdup_printf("connect(%s) timed out after %u.%03u secs",
+				       conn->name, diff/1000, diff%1000);
 	}
 }
 

@@ -44,7 +44,7 @@ unsigned int imap_client_count = 0;
 unsigned int imap_feature_condstore = UINT_MAX;
 unsigned int imap_feature_qresync = UINT_MAX;
 
-static const char *client_command_state_names[CLIENT_COMMAND_STATE_DONE+1] = {
+static const char *client_command_state_names[] = {
 	"wait-input",
 	"wait-output",
 	"wait-external",
@@ -52,6 +52,8 @@ static const char *client_command_state_names[CLIENT_COMMAND_STATE_DONE+1] = {
 	"wait-sync",
 	"done"
 };
+static_assert_array_size(client_command_state_names,
+			 CLIENT_COMMAND_STATE_DONE+1);
 
 static void client_idle_timeout(struct client *client)
 {
@@ -112,7 +114,6 @@ static bool user_has_special_use_mailboxes(struct mail_user *user)
 
 struct client *client_create(int fd_in, int fd_out, bool unhibernated,
 			     struct event *event, struct mail_user *user,
-			     struct mail_storage_service_user *service_user,
 			     const struct imap_settings *set,
 			     const struct smtp_submit_settings *smtp_set)
 {
@@ -133,7 +134,6 @@ struct client *client_create(int fd_in, int fd_out, bool unhibernated,
 	client->unhibernated = unhibernated;
 	client->set = set;
 	client->smtp_set = smtp_set;
-	client->service_user = service_user;
 	client->fd_in = fd_in;
 	client->fd_out = fd_out;
 	client->input = i_stream_create_fd(fd_in,
@@ -221,8 +221,20 @@ struct client *client_create(int fd_in, int fd_out, bool unhibernated,
 void client_create_finish_io(struct client *client)
 {
 	if (client->set->rawlog_dir[0] != '\0') {
+		client->pre_rawlog_input = client->input;
+		client->pre_rawlog_output = client->output;
 		(void)iostream_rawlog_create(client->set->rawlog_dir,
 					     &client->input, &client->output);
+		if (client->input != client->pre_rawlog_input) {
+			/* rawlog enabled */
+			client->post_rawlog_input = client->input;
+			client->post_rawlog_output = client->output;
+		} else {
+			/* rawlog setting is set, but rawlog wasn't actually
+			   started. */
+			client->pre_rawlog_input = NULL;
+			client->pre_rawlog_output = NULL;
+		}
 	}
 	client->io = io_add_istream(client->input, client_input, client);
 }
@@ -322,11 +334,15 @@ const char *client_stats(struct client *client)
 	str = t_str_new(128);
 	if (var_expand_with_funcs(str, client->set->imap_logout_format,
 				  tab, mail_user_var_expand_func_table,
-				  client->user, &error) < 0) {
+				  client->user, &error) <= 0) {
 		e_error(client->event,
 			"Failed to expand imap_logout_format=%s: %s",
 			client->set->imap_logout_format, error);
 	}
+
+	event_add_int(client->event, "net_in_bytes", i_stream_get_absolute_offset(client->input));
+	event_add_int(client->event, "net_out_bytes", client->output->offset);
+
 	return str_c(str);
 }
 
@@ -370,8 +386,12 @@ static const char *client_get_last_command_status(struct client *client)
 {
 	if (client->logged_out)
 		return "";
-	if (client->last_cmd_name == NULL)
-		return " (No commands sent)";
+	if (client->last_cmd_name == NULL) {
+		if (client->unhibernated)
+			return " (No commands sent after unhibernation)";
+		else
+			return " (No commands sent)";
+	}
 
 	/* client disconnected without sending LOGOUT. if the last command
 	   took over 1 second to run, log it. */
@@ -533,7 +553,6 @@ static void client_default_destroy(struct client *client, const char *reason)
 	if (array_is_created(&client->search_updates))
 		array_free(&client->search_updates);
 	pool_unref(&client->command_pool);
-	mail_storage_service_user_unref(&client->service_user);
 
 	imap_client_count--;
 	DLLIST_REMOVE(&imap_clients, client);
@@ -1008,8 +1027,8 @@ void client_command_free(struct client_command_context **_cmd)
 			  &cmd->stats.last_run_timeval);
 	event_add_int(cmd->event, "running_usecs", cmd->stats.running_usecs);
 	event_add_int(cmd->event, "lock_wait_usecs", cmd->stats.lock_wait_usecs);
-	event_add_int(cmd->event, "bytes_in", cmd->stats.bytes_in);
-	event_add_int(cmd->event, "bytes_out", cmd->stats.bytes_out);
+	event_add_int(cmd->event, "net_in_bytes", cmd->stats.bytes_in);
+	event_add_int(cmd->event, "net_out_bytes", cmd->stats.bytes_out);
 
 	e_debug(cmd->event, "Command finished: %s %s", cmd->name,
 		cmd->human_args != NULL ? cmd->human_args : "");
@@ -1656,7 +1675,7 @@ void clients_init(void)
 
 void client_kick(struct client *client)
 {
-	mail_storage_service_io_activate_user(client->service_user);
+	mail_storage_service_io_activate_user(client->user->service_user);
 	if (client->output_cmd_lock == NULL) {
 		client_send_line(client,
 				 "* BYE "MASTER_SERVICE_SHUTTING_DOWN_MSG".");

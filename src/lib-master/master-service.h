@@ -17,10 +17,6 @@ enum master_service_flags {
 	/* Log to configured log file instead of stderr. By default when
 	   _FLAG_STANDALONE is set, logging is done to stderr. */
 	MASTER_SERVICE_FLAG_DONT_LOG_TO_STDERR	= 0x04,
-	/* Service is going to do multiple configuration lookups,
-	   keep the connection to config service open. Also opens the config
-	   socket before dropping privileges. */
-	MASTER_SERVICE_FLAG_KEEP_CONFIG_OPEN	= 0x08,
 	/* Don't read settings, but use whatever is in environment */
 	MASTER_SERVICE_FLAG_NO_CONFIG_SETTINGS	= 0x10,
 	/* Use MASTER_LOGIN_NOTIFY_FD to track login overflow state */
@@ -30,12 +26,6 @@ enum master_service_flags {
 	/* Show number of connections in process title
 	   (only if verbose_proctitle setting is enabled) */
 	MASTER_SERVICE_FLAG_UPDATE_PROCTITLE	= 0x100,
-	/* Don't read any SSL settings. This is mainly needed to prevent master
-	   process from trying to pass through huge list of SSL CA certificates
-	   through environment for ssl_ca setting, which could fail. Although
-	   the same problem can still happen with standalone doveadm if it
-	   reads settings via doveconf instead of config socket. */
-	MASTER_SERVICE_FLAG_DISABLE_SSL_SET	= 0x200,
 	/* Don't initialize SSL context automatically. */
 	MASTER_SERVICE_FLAG_NO_SSL_INIT		= 0x400,
 	/* Don't create a data stack frame between master_service_init() and
@@ -49,7 +39,7 @@ enum master_service_flags {
 	MASTER_SERVICE_FLAG_HAVE_STARTTLS	= 0x2000,
 };
 
-struct master_service_connection_proxy {
+struct master_service_connection_haproxy {
 	/* only set if ssl is TRUE */
 	const char *hostname;
 	const char *cert_common_name;
@@ -67,6 +57,9 @@ struct master_service_connection {
 	int listen_fd;
 	/* listener name as in configuration file, or "" if unnamed. */
 	const char *name;
+	/* listener type as in configuration file, or "" if no type is
+	   specified */
+	const char *type;
 
 	/* Original client/server IP/port. Both of these may have been changed
 	   by the haproxy protocol. */
@@ -78,10 +71,10 @@ struct master_service_connection {
 	in_port_t real_remote_port, real_local_port;
 
 	/* filled if connection is proxied */
-	struct master_service_connection_proxy proxy;
+	struct master_service_connection_haproxy haproxy;
 
 	/* This is a connection proxied wit HAproxy (or similar) */
-	bool proxied:1;
+	bool haproxied:1;
 
 	/* This is a FIFO fd. Only a single "connection" is ever received from
 	   a FIFO after the first writer sends something to it. */
@@ -209,6 +202,9 @@ unsigned int master_service_get_socket_count(struct master_service *service);
 /* Returns the name of the listener socket, or "" if none is specified. */
 const char *master_service_get_socket_name(struct master_service *service,
 					   int listen_fd);
+/* Returns the type of the listener socket, or "" if none is specified. */
+const char *
+master_service_get_socket_type(struct master_service *service, int listen_fd);
 
 /* Returns configuration file path. */
 const char *master_service_get_config_path(struct master_service *service);
@@ -261,6 +257,13 @@ void master_service_client_connection_accept(struct master_service_connection *c
 void master_service_client_connection_created(struct master_service *service);
 /* Call whenever a client connection is destroyed. */
 void master_service_client_connection_destroyed(struct master_service *service);
+/* Returns the listener type for this connection. If the type is unassigned, the
+   connection name is parsed for a "-suffix" which is returned instead to easily
+   implement backwards compatibility for custom listeners that are still
+   configured without an explicit type. */
+const char *
+master_service_connection_get_type(
+	const struct master_service_connection *conn);
 
 /* Deinitialize the service. */
 void master_service_deinit(struct master_service **service);
@@ -274,10 +277,10 @@ void master_service_deinit_forked(struct master_service **_service);
    The line is expected to be in format:
    VERSION <tab> service_name <tab> major version <tab> minor version */
 bool version_string_verify(const char *line, const char *service_name,
-			   unsigned major_version);
+			   unsigned int major_version);
 /* Same as version_string_verify(), but return the minor version. */
 bool version_string_verify_full(const char *line, const char *service_name,
-				unsigned major_version,
+				unsigned int major_version,
 				unsigned int *minor_version_r);
 
 /* Sets process shutdown filter */

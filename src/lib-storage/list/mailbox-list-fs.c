@@ -136,6 +136,7 @@ fs_list_get_path(struct mailbox_list *_list, const char *name,
 		*path_r = fs_list_get_path_to(set, set->index_pvt_dir, name);
 		return 1;
 	case MAILBOX_LIST_PATH_TYPE_LIST_INDEX:
+	case MAILBOX_LIST_PATH_TYPE_COUNT:
 		i_unreached();
 	}
 
@@ -272,7 +273,7 @@ static int fs_list_delete_mailbox(struct mailbox_list *list, const char *name)
 	} else {
 		ret = fs_list_delete_maildir(list, name);
 	}
-	if (ret == 0 && list->set.no_noselect)
+	if (ret == 0 && !list->set.keep_noselect)
 		mailbox_list_delete_until_root(list, path, MAILBOX_LIST_PATH_TYPE_MAILBOX);
 
 	i_assert(ret <= 0);
@@ -437,7 +438,7 @@ static int fs_list_rename_mailbox(struct mailbox_list *oldlist,
 	bool rmdir_parent = FALSE;
 
 	oldvname = mailbox_list_get_vname(oldlist, oldname);
-	if (mailbox_list_get_storage(&oldlist, oldvname, &oldstorage) < 0)
+	if (mailbox_list_get_storage(&oldlist, &oldvname, 0, &oldstorage) < 0)
 		return -1;
 
 	if (mailbox_list_get_path(oldlist, oldname,
@@ -554,6 +555,7 @@ struct mailbox_list fs_mailbox_list = {
 	.v = {
 		.alloc = fs_list_alloc,
 		.deinit = fs_list_deinit,
+		.get_storage = mailbox_list_default_get_storage,
 		.get_hierarchy_sep = fs_list_get_hierarchy_sep,
 		.get_vname = mailbox_list_default_get_vname,
 		.get_storage_name = mailbox_list_default_get_storage_name,

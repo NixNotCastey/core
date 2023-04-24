@@ -6,7 +6,7 @@ AM_CPPFLAGS = \
 	-I$(top_srcdir)/src/lib-settings \
 	-I$(top_srcdir)/src/lib-master \
 	-I$(top_srcdir)/src/lib-sasl \
-	-I$(top_srcdir)/src/lib-auth \
+	-I$(top_srcdir)/src/lib-auth-client \
 	-I$(top_srcdir)/src/lib-ssl-iostream \
 	-I$(top_srcdir)/src/lib-dns \
 	-I$(top_srcdir)/src/lib-program-client \
@@ -107,10 +107,12 @@ test_libs = \
 	../lib-mail/libmail.la \
 	../lib-charset/libcharset.la \
 	../lib-master/libmaster.la \
-	../lib-auth/libauth.la \
+	../lib-auth-client/libauth-client.la \
 	../lib-ssl-iostream/libssl_iostream.la \
 	../lib-settings/libsettings.la \
 	../lib-sasl/libsasl.la \
+	../lib-auth/libauth.la \
+	../lib-otp/libotp.la \
 	../lib-test/libtest.la \
 	../lib/liblib.la \
 	$(MODULE_LIBS)
@@ -122,17 +124,15 @@ test_deps = \
 	../lib-mail/libmail.la \
 	../lib-charset/libcharset.la \
 	../lib-master/libmaster.la \
-	../lib-auth/libauth.la \
+	../lib-auth-client/libauth-client.la \
 	../lib-ssl-iostream/libssl_iostream.la \
 	../lib-settings/libsettings.la \
 	../lib-sasl/libsasl.la \
+	../lib-auth/libauth.la \
 	../lib-test/libtest.la \
 	../lib/liblib.la
 
-test_libs_ssl=
-if BUILD_OPENSSL
-test_libs_ssl += ../lib-ssl-iostream/libssl_iostream_openssl.la
-endif
+test_libs_ssl = ../lib-ssl-iostream/libssl_iostream_openssl.la
 
 test_smtp_syntax_SOURCES = test-smtp-syntax.c
 test_smtp_syntax_LDADD = $(test_libs)

@@ -2,6 +2,7 @@
 
 #include "login-common.h"
 #include "str.h"
+#include "str-sanitize.h"
 #include "imap-parser.h"
 #include "imap-quote.h"
 #include "imap-login-settings.h"
@@ -63,6 +64,17 @@ cmd_id_x_session_id(struct imap_client *client,
 }
 
 static void
+cmd_id_x_client_transport(struct imap_client *client,
+			  const char *key ATTR_UNUSED, const char *value)
+{
+	/* for now values are either "insecure" or "TLS", but plan ahead already
+	   in case we want to transfer e.g. the TLS security string */
+	client->common.end_client_tls_secured_set = TRUE;
+	client->common.end_client_tls_secured =
+		str_begins_with(value, CLIENT_TRANSPORT_TLS);
+}
+
+static void
 cmd_id_x_forward_(struct imap_client *client,
 		  const char *key, const char *value)
 {
@@ -81,6 +93,7 @@ static const struct imap_id_param_handler imap_login_id_params[] = {
 	{ "x-proxy-ttl", FALSE, cmd_id_x_proxy_ttl },
 	{ "x-session-id", FALSE, cmd_id_x_session_id },
 	{ "x-session-ext-id", FALSE, cmd_id_x_session_id },
+	{ "x-client-transport", FALSE, cmd_id_x_client_transport },
 	{ "x-forward-", TRUE, cmd_id_x_forward_ },
 
 	{ NULL, FALSE, NULL }
@@ -112,23 +125,23 @@ client_try_update_info(struct imap_client *client,
 
 	/* do not try to process NIL values as client-info,
 	   but store them for non-reserved keys */
-	if (client->common.trusted && !client->id_logged && value != NULL)
+	if (client->common.connection_trusted &&
+	    !client->id_logged && value != NULL)
 		handler->callback(client, key, value);
 	return TRUE;
 }
 
 static void cmd_id_handle_keyvalue(struct imap_client *client,
+				   struct imap_id_log_entry *log_entry,
 				   const char *key, const char *value)
 {
-	bool client_id_str;
 	/* length of key + length of value (NIL for NULL) and two set of
 	   quotes and space */
 	size_t kvlen = strlen(key) + 2 + 1 +
 		       (value == NULL ? 3 : strlen(value)) + 2;
+	bool is_login_id_param = client_try_update_info(client, key, value);
 
-	client_id_str = !client_try_update_info(client, key, value);
-
-	if (client->set->imap_id_retain && client_id_str &&
+	if (client->set->imap_id_retain && !is_login_id_param &&
 	    (client->common.client_id == NULL ||
 	     str_len(client->common.client_id) + kvlen < LOGIN_MAX_CLIENT_ID_LEN)) {
 		if (client->common.client_id == NULL) {
@@ -144,13 +157,12 @@ static void cmd_id_handle_keyvalue(struct imap_client *client,
 			imap_append_quoted(client->common.client_id, value);
 	}
 
-	if (client->cmd_id->log_reply != NULL &&
-	    (client->cmd_id->log_keys == NULL ||
-	     str_array_icase_find((void *)client->cmd_id->log_keys, key)))
-		imap_id_log_reply_append(client->cmd_id->log_reply, key, value);
+	if (!is_login_id_param)
+		imap_id_add_log_entry(log_entry, key, value);
 }
 
 static int cmd_id_handle_args(struct imap_client *client,
+			      struct imap_id_log_entry *log_entry,
 			      const struct imap_arg *arg)
 {
 	struct imap_client_cmd_id *id = client->cmd_id;
@@ -162,20 +174,8 @@ static int cmd_id_handle_args(struct imap_client *client,
 			return 1;
 		if (arg->type != IMAP_ARG_LIST)
 			return -1;
-		if (client->set->imap_id_log[0] == '\0') {
-			/* no ID logging */
-		} else if (client->id_logged) {
-			/* already logged the ID reply */
-		} else {
+		if (!client->id_logged)
 			id->log_reply = str_new(default_pool, 64);
-			if (strcmp(client->set->imap_id_log, "*") == 0) {
-				/* log all keys */
-			} else {
-				/* log only specified keys */
-				id->log_keys = p_strsplit_spaces(default_pool,
-					client->set->imap_id_log, " ");
-			}
-		}
 		id->state = IMAP_CLIENT_ID_STATE_KEY;
 		break;
 	case IMAP_CLIENT_ID_STATE_KEY:
@@ -188,7 +188,10 @@ static int cmd_id_handle_args(struct imap_client *client,
 	case IMAP_CLIENT_ID_STATE_VALUE:
 		if (!imap_arg_get_nstring(arg, &value))
 			return -1;
-		cmd_id_handle_keyvalue(client, id->key, value);
+		if (!client->id_logged && id->log_reply != NULL) {
+			log_entry->reply = id->log_reply;
+			cmd_id_handle_keyvalue(client, log_entry, id->key, value);
+		}
 		id->state = IMAP_CLIENT_ID_STATE_KEY;
 		break;
 	}
@@ -197,29 +200,33 @@ static int cmd_id_handle_args(struct imap_client *client,
 
 static void cmd_id_finish(struct imap_client *client)
 {
-	/* finished handling the parameters */
 	if (!client->id_logged) {
 		client->id_logged = TRUE;
 
-		if (client->cmd_id->log_reply != NULL) {
-			e_info(client->common.event, "ID sent: %s",
-			       str_c(client->cmd_id->log_reply));
+		if (client->cmd_id->log_reply != NULL &&
+		    str_len(client->cmd_id->log_reply) > 0) {
+			e_debug(client->cmd_id->params_event,
+				"Pre-login ID sent: %s",
+				str_sanitize(str_c(client->cmd_id->log_reply),
+					     IMAP_ID_PARAMS_LOG_MAX_LEN));
 		}
 	}
 
 	client_send_raw(&client->common,
 		t_strdup_printf("* ID %s\r\n",
 			imap_id_reply_generate(client->set->imap_id_send)));
-	client_send_reply(&client->common, IMAP_CMD_REPLY_OK, "ID completed.");
+	const char *msg = "ID completed.";
+	if (client->common.connection_trusted)
+		msg = "Trusted ID completed.";
+	client_send_reply(&client->common, IMAP_CMD_REPLY_OK, msg);
 }
 
-static void cmd_id_free(struct imap_client *client)
+void cmd_id_free(struct imap_client *client)
 {
 	struct imap_client_cmd_id *id = client->cmd_id;
 
+	event_unref(&id->params_event);
 	str_free(&id->log_reply);
-	if (id->log_keys != NULL)
-		p_strsplit_free(default_pool, id->log_keys);
 	imap_parser_unref(&id->parser);
 
 	i_free_and_null(client->cmd_id);
@@ -249,10 +256,17 @@ int cmd_id(struct imap_client *client)
 		parser_flags = IMAP_PARSE_FLAG_INSIDE_LIST;
 	}
 
+	if (id->params_event == NULL) {
+		id->params_event = event_create(client->common.event);
+		event_set_name(id->params_event, "imap_id_received");
+	}
+	struct imap_id_log_entry log_entry = {
+		.event = id->params_event,
+	};
 	while ((ret = imap_parser_read_args(id->parser, 1, parser_flags, &args)) > 0) {
 		i_assert(ret == 1);
 
-		if ((ret = cmd_id_handle_args(client, args)) < 0) {
+		if ((ret = cmd_id_handle_args(client, &log_entry, args)) < 0) {
 			client_send_reply(&client->common,
 					  IMAP_CMD_REPLY_BAD,
 					  "Invalid ID parameters");

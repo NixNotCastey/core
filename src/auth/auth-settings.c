@@ -17,12 +17,48 @@ static bool auth_userdb_settings_check(void *_set, pool_t pool, const char **err
 
 /* <settings checks> */
 static struct file_listener_settings auth_unix_listeners_array[] = {
-	{ "login/login", 0666, "", "" },
-	{ "token-login/tokenlogin", 0666, "", "" },
-	{ "auth-login", 0600, "$default_internal_user", "" },
-	{ "auth-client", 0600, "$default_internal_user", "" },
-	{ "auth-userdb", 0666, "$default_internal_user", "" },
-	{ "auth-master", 0600, "", "" }
+	{
+		.path = "login/login",
+		.type = "login",
+		.mode = 0666,
+		.user = "",
+		.group = "",
+	},
+	{
+		.path = "token-login/tokenlogin",
+		.type = "token-login",
+		.mode = 0666,
+		.user = "",
+		.group = "",
+	},
+	{
+		.path = "auth-login",
+		.type = "login",
+		.mode = 0600,
+		.user = "$default_internal_user",
+		.group = "",
+	},
+	{
+		.path = "auth-client",
+		.type = "auth",
+		.mode = 0600,
+		.user = "$default_internal_user",
+		.group = "",
+	},
+	{
+		.path = "auth-userdb",
+		.type = "userdb",
+		.mode = 0666,
+		.user = "$default_internal_user",
+		.group = "",
+	},
+	{
+		.path = "auth-master",
+		.type = "master",
+		.mode = 0600,
+		.user = "",
+		.group = "",
+	},
 };
 static struct file_listener_settings *auth_unix_listeners[] = {
 	&auth_unix_listeners_array[0],
@@ -67,7 +103,12 @@ struct service_settings auth_service_settings = {
 
 /* <settings checks> */
 static struct file_listener_settings auth_worker_unix_listeners_array[] = {
-	{ "auth-worker", 0600, "$default_internal_user", "" }
+	{
+		.path = "auth-worker",
+		.mode = 0600,
+		.user = "$default_internal_user",
+		.group = "",
+	},
 };
 static struct file_listener_settings *auth_worker_unix_listeners[] = {
 	&auth_worker_unix_listeners_array[0]
@@ -228,7 +269,7 @@ const struct setting_parser_info auth_userdb_setting_parser_info = {
 static const struct setting_define auth_setting_defines[] = {
 	DEF(STR, mechanisms),
 	DEF(STR, realms),
-	DEF(STR, default_realm),
+	DEF(STR, default_domain),
 	DEF(SIZE, cache_size),
 	DEF(TIME, cache_ttl),
 	DEF(TIME, cache_negative_ttl),
@@ -285,7 +326,7 @@ static const struct setting_define auth_setting_defines[] = {
 static const struct auth_settings auth_default_settings = {
 	.mechanisms = "plain",
 	.realms = "",
-	.default_realm = "",
+	.default_domain = "",
 	.cache_size = 0,
 	.cache_ttl = 60*60,
 	.cache_negative_ttl = 60*60,
@@ -306,7 +347,7 @@ static const struct auth_settings auth_default_settings = {
 	.policy_server_timeout_msecs = 2000,
 	.policy_hash_mech = "sha256",
 	.policy_hash_nonce = "",
-	.policy_request_attributes = "login=%{requested_username} pwhash=%{hashed_password} remote=%{rip} device_id=%{client_id} protocol=%s session_id=%{session}",
+	.policy_request_attributes = "login=%{requested_username} pwhash=%{hashed_password} remote=%{rip} device_id=%{client_id} protocol=%s session_id=%{session} fail_type=%{fail_type}",
 	.policy_reject_on_fail = FALSE,
 	.policy_check_before_auth = TRUE,
 	.policy_check_after_auth = TRUE,
@@ -522,11 +563,9 @@ auth_settings_read(const char *service, pool_t pool,
 	struct master_service_settings_input input;
 	struct setting_parser_context *set_parser;
 	const char *error;
-	void **sets;
 
 	i_zero(&input);
 	input.roots = set_roots;
-	input.module = "auth";
 	input.service = service;
 	if (master_service_settings_read(master_service, &input,
 					 output_r, &error) < 0)
@@ -537,8 +576,8 @@ auth_settings_read(const char *service, pool_t pool,
 	if (!settings_parser_check(set_parser, pool, &error))
 		i_unreached();
 
-	sets = master_service_settings_parser_get_others(master_service,
-							 set_parser);
-	settings_parser_deinit(&set_parser);
-	return sets[0];
+	struct auth_settings *set =
+		settings_parser_get_root_set(set_parser, &auth_setting_parser_info);
+	settings_parser_unref(&set_parser);
+	return set;
 }

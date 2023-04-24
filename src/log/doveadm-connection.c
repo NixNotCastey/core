@@ -29,9 +29,10 @@ static int doveadm_connection_send_errors(struct doveadm_connection *conn)
 	iter = log_error_buffer_iter_init(conn->errorbuf);
 	while ((error = log_error_buffer_iter_next(iter)) != NULL) {
 		str_truncate(str, 0);
-		str_printfa(str, "%s\t%ld\t",
+		str_printfa(str, "%s\t%"PRIdTIME_T".%06u\t",
 			    failure_log_type_names[error->type],
-			    (long)error->timestamp);
+			    error->timestamp.tv_sec,
+			    (unsigned int)error->timestamp.tv_usec);
 		str_append_tabescaped(str, error->prefix);
 		str_append_c(str, '\t');
 		str_append_tabescaped(str, error->text);
@@ -78,8 +79,7 @@ static void doveadm_connection_destroy(struct doveadm_connection **_conn)
 	*_conn = NULL;
 
 	o_stream_destroy(&conn->output);
-	if (close(conn->fd) < 0)
-		i_error("close(doveadm connection) failed: %m");
+	i_close_fd(&conn->fd);
 	i_free(conn);
 
 	master_service_client_connection_destroyed(master_service);

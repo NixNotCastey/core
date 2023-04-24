@@ -14,7 +14,6 @@ struct copy_cmd_context {
 	struct doveadm_mail_cmd_context ctx;
 
 	const char *source_username;
-	struct mail_storage_service_user *source_service_user;
 	struct mail_user *source_user;
 
 	const char *destname;
@@ -52,7 +51,8 @@ cmd_copy_box(struct copy_cmd_context *ctx, struct mailbox *destbox,
 		else
 			ret2 = mailbox_copy(&save_ctx, mail);
 		if (ret2 < 0) {
-			i_error("%s message UID %u from '%s' failed: %s",
+			e_error(ctx->ctx.cctx->event,
+				"%s message UID %u from '%s' failed: %s",
 				ctx->move ? "Moving" : "Copying",
 				mail->uid, info->vname,
 				mailbox_get_last_internal_error(destbox, NULL));
@@ -62,7 +62,7 @@ cmd_copy_box(struct copy_cmd_context *ctx, struct mailbox *destbox,
 	}
 
 	if (mailbox_transaction_commit(&desttrans) < 0) {
-		i_error("Committing %s mails failed: %s",
+		e_error(ctx->ctx.cctx->event, "Committing %s mails failed: %s",
 			ctx->move ? "moved" : "copied",
 			mailbox_get_last_internal_error(destbox, NULL));
 		doveadm_mail_failed_mailbox(&ctx->ctx, destbox);
@@ -87,18 +87,18 @@ cmd_copy_alloc_source_user(struct copy_cmd_context *ctx)
 
 	mail_storage_service_io_deactivate_user(ctx->ctx.cur_service_user);
 	if (mail_storage_service_lookup_next(ctx->ctx.storage_service, &input,
-					     &ctx->source_service_user,
 					     &ctx->source_user,
 					     &error) < 0)
 		i_fatal("Couldn't lookup user %s: %s", input.username, error);
-	mail_storage_service_io_deactivate_user(ctx->source_service_user);
+	mail_storage_service_io_deactivate_user(ctx->source_user->service_user);
 	mail_storage_service_io_activate_user(ctx->ctx.cur_service_user);
 }
 
 static int
 cmd_copy_run(struct doveadm_mail_cmd_context *_ctx, struct mail_user *user)
 {
-	struct copy_cmd_context *ctx = (struct copy_cmd_context *)_ctx;
+	struct copy_cmd_context *ctx =
+		container_of(_ctx, struct copy_cmd_context, ctx);
 	const enum mailbox_list_iter_flags iter_flags =
 		MAILBOX_LIST_ITER_NO_AUTO_BOXES |
 		MAILBOX_LIST_ITER_RETURN_NO_FLAGS;
@@ -115,7 +115,8 @@ cmd_copy_run(struct doveadm_mail_cmd_context *_ctx, struct mail_user *user)
 	ns = mail_namespace_find(user->namespaces, ctx->destname);
 	destbox = mailbox_alloc(ns->list, ctx->destname, MAILBOX_FLAG_SAVEONLY);
 	if (mailbox_open(destbox) < 0) {
-		i_error("Can't open mailbox '%s': %s", ctx->destname,
+		e_error(ctx->ctx.cctx->event,
+			"Can't open mailbox '%s': %s", ctx->destname,
 			mailbox_get_last_internal_error(destbox, NULL));
 		doveadm_mail_failed_mailbox(&ctx->ctx, destbox);
 		mailbox_free(&destbox);
@@ -133,7 +134,8 @@ cmd_copy_run(struct doveadm_mail_cmd_context *_ctx, struct mail_user *user)
 		ret = -1;
 
 	if (mailbox_sync(destbox, 0) < 0) {
-		i_error("Syncing mailbox '%s' failed: %s", ctx->destname,
+		e_error(ctx->ctx.cctx->event,
+			"Syncing mailbox '%s' failed: %s", ctx->destname,
 			mailbox_get_last_internal_error(destbox, NULL));
 		doveadm_mail_failed_mailbox(&ctx->ctx, destbox);
 		ret = -1;
@@ -142,40 +144,35 @@ cmd_copy_run(struct doveadm_mail_cmd_context *_ctx, struct mail_user *user)
 	return ret;
 }
 
-static void cmd_copy_init(struct doveadm_mail_cmd_context *_ctx,
-			  const char *const args[])
+static void cmd_copy_init(struct doveadm_mail_cmd_context *_ctx)
 {
-	struct copy_cmd_context *ctx = (struct copy_cmd_context *)_ctx;
-	const char *destname = args[0], *cmdname = ctx->move ? "move" : "copy";
+	struct doveadm_cmd_context *cctx = _ctx->cctx;
+	struct copy_cmd_context *ctx =
+		container_of(_ctx, struct copy_cmd_context, ctx);
 
-	if (destname == NULL || args[1] == NULL)
+	const char *cmdname = ctx->move ? "move" : "copy";
+	const char *const *query;
+
+	if (!doveadm_cmd_param_str(cctx, "destination-mailbox", &ctx->destname) ||
+	    !doveadm_cmd_param_array(cctx, "query", &query))
 		doveadm_mail_help_name(cmdname);
-	args++;
+	_ctx->search_args = doveadm_mail_build_search_args(query);
 
-	if (args[0] != NULL && args[1] != NULL &&
-	    strcasecmp(args[0], "user") == 0) {
-		if ((_ctx->service_flags &
-		     MAIL_STORAGE_SERVICE_FLAG_USERDB_LOOKUP) == 0)
-			i_fatal("Use -u parameter to specify destination user");
+	if (doveadm_cmd_param_str(cctx, "source-user", &ctx->source_username) &&
+	    (_ctx->service_flags & MAIL_STORAGE_SERVICE_FLAG_USERDB_LOOKUP) == 0)
+		i_fatal("Use -u parameter to specify destination user");
 
-		ctx->source_username = p_strdup(_ctx->pool, args[1]);
-		args += 2;
-	}
-
-	ctx->destname = p_strdup(ctx->ctx.pool, destname);
-	_ctx->search_args = doveadm_mail_build_search_args(args);
 	if (ctx->move)
 		expunge_search_args_check(ctx->ctx.search_args, cmdname);
 }
 
 static void cmd_copy_deinit(struct doveadm_mail_cmd_context *_ctx)
 {
-	struct copy_cmd_context *ctx = (struct copy_cmd_context *)_ctx;
+	struct copy_cmd_context *ctx =
+		container_of(_ctx, struct copy_cmd_context, ctx);
 
-	if (ctx->source_user != NULL) {
-		mail_storage_service_user_unref(&ctx->source_service_user);
+	if (ctx->source_user != NULL)
 		mail_user_deinit(&ctx->source_user);
-	}
 }
 
 static struct doveadm_mail_cmd_context *cmd_copy_alloc(void)
@@ -206,8 +203,7 @@ struct doveadm_cmd_ver2 doveadm_cmd_copy_ver2 = {
 DOVEADM_CMD_PARAMS_START
 DOVEADM_CMD_MAIL_COMMON
 DOVEADM_CMD_PARAM('\0', "destination-mailbox", CMD_PARAM_STR, CMD_PARAM_FLAG_POSITIONAL)
-DOVEADM_CMD_PARAM('\0', "source-type", CMD_PARAM_STR, CMD_PARAM_FLAG_POSITIONAL)
-DOVEADM_CMD_PARAM('\0', "source-user", CMD_PARAM_STR, CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAMKV('\0', "source-user", "user", CMD_PARAM_STR, CMD_PARAM_FLAG_POSITIONAL|CMD_PARAM_FLAG_KEY_VALUE)
 DOVEADM_CMD_PARAM('\0', "query", CMD_PARAM_ARRAY, CMD_PARAM_FLAG_POSITIONAL)
 DOVEADM_CMD_PARAMS_END
 };
@@ -219,8 +215,7 @@ struct doveadm_cmd_ver2 doveadm_cmd_move_ver2 = {
 DOVEADM_CMD_PARAMS_START
 DOVEADM_CMD_MAIL_COMMON
 DOVEADM_CMD_PARAM('\0', "destination-mailbox", CMD_PARAM_STR, CMD_PARAM_FLAG_POSITIONAL)
-DOVEADM_CMD_PARAM('\0', "source-type", CMD_PARAM_STR, CMD_PARAM_FLAG_POSITIONAL)
-DOVEADM_CMD_PARAM('\0', "source-user", CMD_PARAM_STR, CMD_PARAM_FLAG_POSITIONAL)
+DOVEADM_CMD_PARAMKV('\0', "source-user", "user", CMD_PARAM_STR, CMD_PARAM_FLAG_POSITIONAL|CMD_PARAM_FLAG_KEY_VALUE)
 DOVEADM_CMD_PARAM('\0', "query", CMD_PARAM_ARRAY, CMD_PARAM_FLAG_POSITIONAL)
 DOVEADM_CMD_PARAMS_END
 };

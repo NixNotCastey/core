@@ -1,4 +1,4 @@
-AC_PREREQ([2.59])
+AC_PREREQ([2.69])
 
 m4_define([dovecot_VERSION],
     m4_esyscmd_s([build-aux/git-version-gen]))))
@@ -95,13 +95,6 @@ AS_HELP_STRING([--with-libunwind], [Build with libunwind support (auto)]),
   TEST_WITH(libunwind, $withval),
   want_libunwind=auto)
 
-# Berkeley DB support is more or less broken. Disabled for now.
-#AC_ARG_WITH(db,
-#AS_HELP_STRING([--with-db], [Build with Berkeley DB support]),
-#  TEST_WITH(db, $withval),
-#  want_db=no)
-want_db=no
-
 AC_ARG_WITH(cdb,
 AS_HELP_STRING([--with-cdb], [Build with CDB support]),
   TEST_WITH(cdb, $withval),
@@ -164,11 +157,6 @@ AS_HELP_STRING([--with-sodium], [Build with libsodium support (enables argon2, d
   TEST_WITH(sodium, $withval),
   want_sodium=auto)
 
-AC_ARG_WITH(zlib,
-AS_HELP_STRING([--with-zlib], [Build with zlib compression support (auto)]),
-  TEST_WITH(zlib, $withval),
-  want_zlib=auto)
-
 AC_ARG_WITH(bzlib,
 AS_HELP_STRING([--with-bzlib], [Build with bzlib compression support (auto)]),
   TEST_WITH(bzlib, $withval),
@@ -188,28 +176,6 @@ AC_ARG_WITH(libcap,
 AS_HELP_STRING([--with-libcap], [Build with libcap support (Dropping capabilities) (auto)]),
   TEST_WITH(libcap, $withval),
   want_libcap=auto)
-
-AC_ARG_WITH(ssl,
-AS_HELP_STRING([--with-ssl=gnutls|openssl], [Build with GNUTLS or OpenSSL (default)]),
-	if test x$withval = xno; then
-		want_gnutls=no
-		want_openssl=no
-	elif test x$withval = xgnutls; then
-		AC_ERROR([GNUTLS support is broken currently])
-		want_gnutls=yes
-		want_openssl=no
-	elif test x$withval = xopenssl; then
-		want_gnutls=no
-		want_openssl=yes
-	elif test x$withval = xyes; then
-		want_gnutls=no
-		want_openssl=yes
-	else
-		AC_ERROR([--with-ssl: Invalid value: $withval])
-	fi, [
-		want_gnutls=no
-		want_openssl=auto
-	])
 
 AC_ARG_WITH(ssldir,
 AS_HELP_STRING([--with-ssldir=DIR], [SSL base directory for certificates (/etc/ssl)]),
@@ -238,6 +204,11 @@ AC_ARG_WITH([systemd],
    want_systemd="auto"
 )
 
+AC_ARG_WITH([lua],
+AS_HELP_STRING([--with-lua=yes|auto|plugin], [Build with Lua bindings (default=auto)]),
+  TEST_WITH(lua, $withval, plugin),
+  want_lua=auto)
+
 DOVECOT_WANT_SYSTEMD
 
 dovecot_moduledir="$libdir/dovecot"
@@ -251,28 +222,28 @@ AS_HELP_STRING([--with-docs], [Install documentation (default)]),
 		want_docs=yes
 	fi,
 	want_docs=yes)
-AM_CONDITIONAL(BUILD_DOCS, test "$want_docs" = "yes")
+AM_CONDITIONAL(INSTALL_DOCS, test "$want_docs" = "yes")
 
 dnl always enable all of the passbs and userdbs that don't require extra libs
 want_passwd=yes
 want_passwd_file=yes
 want_prefetch_userdb=yes
 
-AC_ISC_POSIX
 AC_PROG_CC
 AC_PROG_CPP
 AC_PROG_CXX # lucene plugin needs this
 AC_CHECK_TOOL([FLEX],[flex],[:])
 AC_CHECK_TOOL([BISON],[bison],[:])
-AS_IF([test "$BISON" = ":" && test ! -e src/lib/event-filter-parser.h],
+AM_MISSING_PROG([WGET], [wget])
+
+AS_IF([test "$BISON" = ":" && test ! -e "$srcdir/src/lib/event-filter-parser.h"],
   AC_MSG_ERROR([Bison is required when building from git])
 ])
-AS_IF([test "$FLEX" = ":" && test ! -e src/lib/event-filter-lexer.c],
+AS_IF([test "$FLEX" = ":" && test ! -e "$srcdir/src/lib/event-filter-lexer.c"],
   AC_MSG_ERROR([flex is required when building from git])
 ])
-AC_HEADER_STDC
 AC_C_INLINE
-AC_PROG_LIBTOOL
+LT_INIT
 AM_ICONV
 
 # SIZE_MAX is missing without this
@@ -299,7 +270,7 @@ AC_COMPILE_IFELSE([AC_LANG_PROGRAM([
 ])], [], AC_MSG_ERROR([Version macros broken]))
 
 AC_CHECK_HEADERS(strings.h stdint.h unistd.h dirent.h malloc.h \
-  sys/uio.h sys/sysmacros.h sys/resource.h sys/select.h libgen.h \
+  sys/uio.h sys/sysmacros.h sys/resource.h sys/select.h \
   sys/quota.h sys/fs/ufs_quota.h ufs/ufs/quota.h jfs/quota.h \
   quota.h sys/fs/quota_common.h \
   mntent.h sys/mnttab.h sys/event.h sys/time.h sys/mkdev.h linux/dqblk_xfs.h \
@@ -314,7 +285,6 @@ DC_DOVECOT_FUZZER
 DC_DOVECOT_CFLAGS
 
 DOVECOT_NSL
-DOVECOT_FDATASYNC
 DOVECOT_LIBCAP
 
 DOVECOT_RANDOM
@@ -322,10 +292,7 @@ DOVECOT_ARC4RANDOM
 
 AC_DEFINE(PACKAGE_WEBPAGE, "http://www.dovecot.org/", [Support URL])
 
-dnl * after -lsocket and -lnsl tests, inet_aton() may be in them
-AC_CHECK_FUNCS(fcntl flock lockf inet_aton sigaction getpagesize madvise \
-               vsyslog writev pread uname \
-	       setrlimit setproctitle seteuid setreuid setegid setresgid \
+AC_CHECK_FUNCS(flock pread setproctitle setresgid \
 	       getmntinfo setpriority quotactl getmntent kqueue kevent \
 	       backtrace_symbols walkcontext dirfd clearenv \
 	       malloc_usable_size glob fallocate posix_fadvise \
@@ -334,7 +301,6 @@ AC_CHECK_FUNCS(fcntl flock lockf inet_aton sigaction getpagesize madvise \
 AC_CHECK_HEADERS([valgrind/valgrind.h])
 
 DOVECOT_SOCKPEERCRED
-DOVECOT_CLOCK_GETTIME
 
 DOVECOT_TYPEOF
 DOVECOT_IOLOOP
@@ -345,13 +311,6 @@ DOVECOT_GLIBC
 dnl * OS specific options
 DC_PLUGIN_DEPS
 case "$host_os" in
-	hpux*)
-		CFLAGS="$CFLAGS -D_XOPEN_SOURCE -D_XOPEN_SOURCE_EXTENDED"
-		# for getting fd_send/fd_recv working:
-		LDFLAGS="$LDFLAGS -Wl,+b,:"
-		LIBS="-lxnet $LIBS"
-		AC_DEFINE(PREAD_BROKEN,, [Define if pread/pwrite implementation is broken])
-		;;
 	linux*|darwin*)
 		AC_DEFINE(PROCTITLE_HACK,, [Define if process title can be changed by modifying argv])
 		;;
@@ -359,13 +318,16 @@ case "$host_os" in
 		;;
 esac
 
+dnl these macros - additionally to the HAVE_<type> values - cache the
+dnl result in `$ac_cv_sizeof_<type>`, which are used in the AC_TYPEOF
+dnl macro and the off_t-specific checks
 AC_CHECK_SIZEOF(int)
 AC_CHECK_SIZEOF(long)
 AC_CHECK_SIZEOF(void *)
 AC_CHECK_SIZEOF(long long)
+AC_CHECK_SIZEOF(size_t)
 
 AC_SYS_LARGEFILE
-AC_CHECK_TYPES(_Bool)
 
 AC_CHECK_TYPE(uoff_t, [
   have_uoff_t=yes
@@ -421,28 +383,6 @@ AC_DEFINE_UNQUOTED(SSIZE_T_MAX, $ssizet_max, [Maximum value of ssize_t])
 dnl we require inttypes.h for PRIu{8,16,32,64} macros
 AC_CHECK_HEADER(inttypes.h,,AC_MSG_ERROR([inttypes.h missing but required]))
 
-dnl some systems don't have stdint.h, but still have some of the types
-dnl defined elsewhere
-AC_CHECK_HEADER(stdint.h, [
-  stdint_include="#include <stdint.h>"
-])
-
-AC_CHECKTYPE2(uintmax_t, [$stdint_include])
-if test $i_cv_type_uintmax_t = yes; then
-  AC_DEFINE(HAVE_UINTMAX_T,, [Define if you have uintmax_t (C99 type)])
-fi
-
-dnl use separate check, eg. Solaris 8 has uintmax_t but not uint_fast32_t
-AC_CHECKTYPE2(uint_fast32_t, [$stdint_include])
-if test $i_cv_type_uint_fast32_t = yes; then
-  AC_DEFINE(HAVE_UINT_FAST32_T,, [Define if you have uint_fast32_t (C99 type)])
-fi
-
-AC_CHECKTYPE2(socklen_t, [#include <sys/socket.h>])
-if test $i_cv_type_socklen_t = yes; then
-  AC_DEFINE(HAVE_SOCKLEN_T,, [Define to 'int' if you don't have socklen_t])
-fi
-
 AC_DEFINE_UNQUOTED(MEM_ALIGN_SIZE, $mem_align, [Required memory alignment])
 
 dnl * find random source
@@ -472,12 +412,9 @@ DOVECOT_TM_GMTOFF
 DOVECOT_GMTIME_MAX
 DOVECOT_TIME_T
 
-DOVECOT_C_STATIC_ARRAY
-DOVECOT_C_FLEXIBLE_ARRAY_MEMBER
+AC_C_FLEXIBLE_ARRAY_MEMBER
 
 DOVECOT_IOVEC
-
-DOVECOT_TYPEOF_DEV_T
 
 DOVECOT_RLIMIT_AS
 DOVECOT_RLIMIT_NPROC
@@ -505,10 +442,7 @@ DOVECOT_DQBLK_CURSPACE
 
 DOVECOT_Q_QUOTACTL
 
-DOVECOT_C99_VSNPRINTF
-
 DOVECOT_VA_COPY
-DOVECOT_VA_COPY_BYVAL
 
 DOVECOT_MODULES
 
@@ -539,7 +473,6 @@ DOVECOT_WANT_PAM
 DOVECOT_WANT_BSDAUTH
 DOVECOT_WANT_GSSAPI
 DOVECOT_WANT_LDAP
-DOVECOT_WANT_DB
 DOVECOT_WANT_CDB
 DOVECOT_WANT_PGSQL
 DOVECOT_WANT_MYSQL
@@ -548,15 +481,6 @@ DOVECOT_WANT_SQLITE
 DOVECOT_WANT_CASSANDRA
 
 DOVECOT_SQL
-
-AM_CONDITIONAL([AUTH_LUA_PLUGIN], [test "x$with_lua_plugin" = "xyes"])
-AM_CONDITIONAL([HAVE_LUA], [test "x$with_lua" = "xyes"])
-AS_IF([test "x$with_lua" = "xyes"],
-  AS_IF([test "x$with_lua_plugin" = "xyes"],
-      [userdb="$userdb lua (plugin)"; passdb="$passdb lua (plugin)"],
-      [userdb="$userdb lua"; passdb="$passdb lua"],
-  ), [])
-AM_CONDITIONAL([DLUA_WITH_YIELDS], [test "$dlua_with_yields" = "yes"])
 
 if test $have_modules = yes; then
   AC_DEFINE(HAVE_MODULES,, [Define if you have dynamic module support])
@@ -576,14 +500,6 @@ AC_SUBST(AUTH_CFLAGS)
 AC_SUBST(AUTH_LIBS)
 AC_SUBST(SQL_CFLAGS)
 AC_SUBST(SQL_LIBS)
-AC_SUBST(MYSQL_CFLAGS)
-AC_SUBST(MYSQL_LIBS)
-AC_SUBST(PGSQL_CFLAGS)
-AC_SUBST(PGSQL_LIBS)
-AC_SUBST(SQLITE_CFLAGS)
-AC_SUBST(SQLITE_LIBS)
-AC_SUBST(CASSANDRA_CFLAGS)
-AC_SUBST(CASSANDRA_LIBS)
 
 AC_SUBST(DICT_LIBS)
 AC_SUBST(CDB_LIBS)
@@ -614,6 +530,7 @@ LIBDOVECOT_LA_LIBS='\
 	$(top_builddir)/src/lib-smtp/libsmtp.la \
 	$(top_builddir)/src/lib-program-client/libprogram_client.la \
 	$(top_builddir)/src/lib-master/libmaster.la \
+	$(top_builddir)/src/lib-login/liblogin.la \
 	$(top_builddir)/src/lib-settings/libsettings.la \
 	$(top_builddir)/src/lib-http/libhttp.la \
 	$(top_builddir)/src/lib-fs/libfs.la \
@@ -623,6 +540,8 @@ LIBDOVECOT_LA_LIBS='\
 	$(top_builddir)/src/lib-mail/libmail.la \
 	$(top_builddir)/src/lib-sasl/libsasl.la \
 	$(top_builddir)/src/lib-auth/libauth.la \
+	$(top_builddir)/src/lib-otp/libotp.la \
+	$(top_builddir)/src/lib-auth-client/libauth-client.la \
 	$(top_builddir)/src/lib-charset/libcharset.la \
 	$(top_builddir)/src/lib-ssl-iostream/libssl_iostream.la \
 	$(top_builddir)/src/lib-dcrypt/libdcrypt.la \
@@ -656,7 +575,7 @@ LIBDOVECOT_SQL='$(top_builddir)/src/lib-sql/libsql.la'
 LIBDOVECOT_COMPRESS='$(top_builddir)/src/lib-compression/libcompression.la'
 LIBDOVECOT_LIBFTS='$(top_builddir)/src/lib-fts/libfts.la'
 
-if test $with_lua != no; then
+if test $want_lua != no; then
   LIBDOVECOT_LUA='$(top_builddir)/src/lib-lua/libdovecot-lua.la'
 else
   LIBDOVECOT_LUA=''
@@ -727,14 +646,12 @@ dnl **
 
 COMPRESS_LIBS=
 
-DOVECOT_WANT_ZLIB
+DOVECOT_ZLIB
 DOVECOT_WANT_BZLIB
 DOVECOT_WANT_LZ4
 DOVECOT_WANT_ZSTD
 
 AC_SUBST(COMPRESS_LIBS)
-
-AM_CONDITIONAL(BUILD_ZLIB_PLUGIN, test "$have_compress_lib" = "yes")
 
 DOVECOT_RPCGEN
 DOVECOT_QUOTA
@@ -776,7 +693,7 @@ dnl **
 dnl IDLE doesn't really belong to banner. It's there just to make Blackberries
 dnl happy, because otherwise BIS server disables push email.
 capability_banner="IMAP4rev1 SASL-IR LOGIN-REFERRALS ID ENABLE IDLE"
-capability="$capability_banner SORT SORT=DISPLAY THREAD=REFERENCES THREAD=REFS THREAD=ORDEREDSUBJECT MULTIAPPEND URL-PARTIAL CATENATE UNSELECT CHILDREN NAMESPACE UIDPLUS LIST-EXTENDED I18NLEVEL=1 CONDSTORE QRESYNC ESEARCH ESORT SEARCHRES WITHIN CONTEXT=SEARCH LIST-STATUS BINARY MOVE SNIPPET=FUZZY PREVIEW=FUZZY PREVIEW STATUS=SIZE SAVEDATE"
+capability="$capability_banner SORT SORT=DISPLAY THREAD=REFERENCES THREAD=REFS THREAD=ORDEREDSUBJECT MULTIAPPEND URL-PARTIAL CATENATE UNSELECT CHILDREN NAMESPACE UIDPLUS LIST-EXTENDED I18NLEVEL=1 CONDSTORE QRESYNC ESEARCH ESORT SEARCHRES WITHIN CONTEXT=SEARCH LIST-STATUS BINARY MOVE SNIPPET=FUZZY PREVIEW=FUZZY PREVIEW STATUS=SIZE SAVEDATE COMPRESS=DEFLATE"
 AC_DEFINE_UNQUOTED(CAPABILITY_STRING, "$capability", [IMAP capabilities])
 AC_DEFINE_UNQUOTED(CAPABILITY_BANNER_STRING, "$capability_banner", [IMAP capabilities advertised in banner])
 
@@ -796,7 +713,6 @@ LDFLAGS="\$(NOPLUGIN_LDFLAGS) $LDFLAGS $EXTRA_LDFLAGS"
 AC_SUBST(NOPLUGIN_LDFLAGS)
 
 DC_CC_WRAPPER
-DC_PANDOC
 
 if test "$docdir" = ""; then
   dnl docdir supported only by autoconf v2.59c and later
@@ -815,13 +731,13 @@ AC_CONFIG_FILES([
 Makefile
 doc/Makefile
 doc/man/Makefile
-doc/wiki/Makefile
 doc/example-config/Makefile
 doc/example-config/conf.d/Makefile
 src/Makefile
 src/lib/Makefile
 src/lib-sql/Makefile
 src/lib-auth/Makefile
+src/lib-auth-client/Makefile
 src/lib-charset/Makefile
 src/lib-compression/Makefile
 src/lib-dcrypt/Makefile
@@ -845,6 +761,7 @@ src/lib-ldap/Makefile
 src/lib-lua/Makefile
 src/lib-mail/Makefile
 src/lib-master/Makefile
+src/lib-login/Makefile
 src/lib-program-client/Makefile
 src/lib-otp/Makefile
 src/lib-dovecot/Makefile
@@ -874,7 +791,6 @@ src/lda/Makefile
 src/log/Makefile
 src/lmtp/Makefile
 src/dict/Makefile
-src/director/Makefile
 src/dns/Makefile
 src/indexer/Makefile
 src/imap/Makefile
@@ -904,7 +820,6 @@ src/plugins/lazy-expunge/Makefile
 src/plugins/listescape/Makefile
 src/plugins/mail-log/Makefile
 src/plugins/mail-lua/Makefile
-src/plugins/mailbox-alias/Makefile
 src/plugins/notify/Makefile
 src/plugins/notify-status/Makefile
 src/plugins/push-notification/Makefile
@@ -916,8 +831,7 @@ src/plugins/replication/Makefile
 src/plugins/trash/Makefile
 src/plugins/virtual/Makefile
 src/plugins/welcome/Makefile
-src/plugins/zlib/Makefile
-src/plugins/imap-zlib/Makefile
+src/plugins/mail-compress/Makefile
 src/plugins/mail-crypt/Makefile
 src/plugins/var-expand-crypt/Makefile
 src/plugins/apparmor/Makefile
@@ -942,7 +856,7 @@ echo "Install prefix . : $prefix"
 echo "File offsets ... : ${offt_bits}bit"
 echo "I/O polling .... : $ioloop"
 echo "I/O notifys .... : $have_notify"
-echo "SSL ............ : $have_ssl"
+echo "SSL ............ : openssl"
 echo "GSSAPI ......... : $have_gssapi"
 echo "passdbs ........ :$passdb"
 if test "$not_passdb" != ""; then

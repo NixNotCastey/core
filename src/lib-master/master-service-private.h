@@ -11,6 +11,7 @@ struct master_service_haproxy_conn;
 struct master_service_listener {
 	struct master_service *service;
 	char *name;
+	char *type;
 
 	/* settings */
 	bool ssl;
@@ -24,6 +25,7 @@ struct master_service_listener {
 
 struct master_service {
 	struct ioloop *ioloop;
+	struct event *event;
 
 	char *name;
 	char *configured_name;
@@ -36,7 +38,8 @@ struct master_service {
 	const char *version_string;
 	char *config_path;
 	ARRAY_TYPE(const_string) config_overrides;
-	int config_fd;
+	void *config_mmap_base;
+	size_t config_mmap_size;
 	int syslog_facility;
 	data_stack_frame_t datastack_frame_id;
 
@@ -62,7 +65,8 @@ struct master_service {
 	master_service_avail_overflow_callback_t *avail_overflow_callback;
 	struct timeout *to_overflow_state, *to_overflow_call;
 
-	struct master_login *login;
+	void (*stop_new_connections_callback)(void *context);
+	void *stop_new_connections_context;
 
 	master_service_connection_callback_t *callback;
 
@@ -103,7 +107,6 @@ struct master_service {
 
 void master_service_io_listeners_add(struct master_service *service);
 void master_status_update(struct master_service *service);
-void master_service_close_config_fd(struct master_service *service);
 
 void master_service_io_listeners_remove(struct master_service *service);
 void master_service_ssl_io_listeners_remove(struct master_service *service);
@@ -112,6 +115,13 @@ void master_service_client_connection_handled(struct master_service *service,
 					      struct master_service_connection *conn);
 void master_service_client_connection_callback(struct master_service *service,
 					       struct master_service_connection *conn);
+
+void master_service_add_stop_new_connections_callback(
+	struct master_service *service,
+	void (*callback)(void *context), void *context);
+void master_service_remove_stop_new_connections_callback(
+	struct master_service *service,
+	void (*callback)(void *context), void *context);
 
 void master_service_haproxy_new(struct master_service *service,
 				struct master_service_connection *conn);

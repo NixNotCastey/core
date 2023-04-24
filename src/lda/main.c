@@ -117,7 +117,8 @@ create_raw_stream(struct mail_deliver_input *dinput,
 		if (smtp_address_parse_mailbox(pool_datastack_create(),
 					       sender, 0, &mail_from,
 					       &error) < 0) {
-			i_warning("Failed to parse address from `From_'-line: %s",
+			e_warning(dinput->event_parent,
+				  "Failed to parse address from `From_'-line: %s",
 				  error);
 		}
 		dinput->mail_from = mail_from;
@@ -149,13 +150,13 @@ lda_raw_mail_open(struct mail_deliver_input *dinput, const char *path)
 	struct mailbox_header_lookup_ctx *headers_ctx;
 	const struct smtp_address *mail_from;
 	struct istream *input;
-	void **sets;
 	time_t mtime;
 	int ret;
 
-	sets = master_service_settings_get_others(master_service);
-	raw_mail_user = raw_storage_create_from_set(dinput->rcpt_user->set_info,
-						    sets[0]);
+	struct mail_storage_service_ctx *storage_service =
+		mail_storage_service_user_get_service_ctx(dinput->rcpt_user->service_user);
+	raw_mail_user = raw_storage_create_from_set(storage_service,
+				dinput->rcpt_user->unexpanded_set_parser);
 
 	mail_from = (dinput->mail_from != NULL ?
 		     dinput->mail_from : &default_envelope_sender);
@@ -280,35 +281,17 @@ lda_do_deliver(struct mail_deliver_context *ctx, bool stderr_rejection)
 
 static int
 lda_deliver(struct mail_deliver_input *dinput,
-	    struct mail_storage_service_user *service_user,
 	    const char *user, const char *path,
 	    struct smtp_address *rcpt_to, const char *rcpt_to_source,
 	    bool stderr_rejection)
 {
 	struct mail_deliver_context ctx;
-	const struct var_expand_table *var_table;
-	struct lda_settings *lda_set;
-	struct smtp_submit_settings *smtp_set;
-	const char *errstr;
 	int ret;
 
-	var_table = mail_user_var_expand_table(dinput->rcpt_user);
-	smtp_set = mail_storage_service_user_get_set(service_user)[1];
-	lda_set = mail_storage_service_user_get_set(service_user)[2];
-	ret = settings_var_expand(
-		&lda_setting_parser_info,
-		lda_set, dinput->rcpt_user->pool, var_table,
-		&errstr);
-	if (ret > 0) {
-		ret = settings_var_expand(
-			&smtp_submit_setting_parser_info,
-			smtp_set, dinput->rcpt_user->pool, var_table,
-			&errstr);
-	}
-	if (ret <= 0)
-		i_fatal("Failed to expand settings: %s", errstr);
-	dinput->set = lda_set;
-	dinput->smtp_set = smtp_set;
+	dinput->set = settings_parser_get_root_set(dinput->rcpt_user->set_parser,
+						   &lda_setting_parser_info);
+	dinput->smtp_set = settings_parser_get_root_set(dinput->rcpt_user->set_parser,
+							&smtp_submit_setting_parser_info);
 
 	dinput->src_mail = lda_raw_mail_open(dinput, path);
 	lda_set_rcpt_to(dinput, rcpt_to, user, rcpt_to_source);
@@ -366,7 +349,6 @@ int main(int argc, char *argv[])
 	const char *user, *errstr, *path;
 	struct smtp_address *rcpt_to, *final_rcpt_to, *mail_from;
 	struct mail_storage_service_ctx *storage_service;
-	struct mail_storage_service_user *service_user;
 	struct mail_storage_service_input service_input;
 	struct event *event;
 	const char *user_source = "", *rcpt_to_source = "", *mail_from_error;
@@ -386,7 +368,7 @@ int main(int argc, char *argv[])
 		} else if ((st.st_mode & 1) != 0 && (st.st_mode & 04000) != 0) {
 			fprintf(stderr, "%s must not be both world-executable "
 				"and setuid-root. This allows root exploits. "
-				"See http://wiki2.dovecot.org/LDA#multipleuids\n",
+				"See https://doc.dovecot.org/configuration_manual/protocols/lda/#multiple-uids\n",
 				argv[0]);
 			return EX_TEMPFAIL;
 		}
@@ -537,7 +519,6 @@ int main(int argc, char *argv[])
 	dinput.event_parent = event;
 
 	i_zero(&service_input);
-	service_input.module = "lda";
 	service_input.service = "lda";
 	service_input.username = user;
 	service_input.event_parent = event;
@@ -550,7 +531,7 @@ int main(int argc, char *argv[])
 	   _lookup() and _next(), but don't bother) */
 	dinput.delivery_time_started = ioloop_timeval;
 	ret = mail_storage_service_lookup_next(storage_service,
-					       &service_input, &service_user,
+					       &service_input,
 					       &dinput.rcpt_user,
 					       &errstr);
 	if (ret <= 0) {
@@ -572,7 +553,7 @@ int main(int argc, char *argv[])
 				mail_from_error);
 		}
 
-		ret = lda_deliver(&dinput, service_user, user, path,
+		ret = lda_deliver(&dinput, user, path,
 				  rcpt_to, rcpt_to_source, stderr_rejection);
 
 		struct mailbox_transaction_context *t =
@@ -584,7 +565,6 @@ int main(int argc, char *argv[])
 		mailbox_free(&box);
 
 		mail_user_deinit(&dinput.rcpt_user);
-		mail_storage_service_user_unref(&service_user);
 	}
 
 	mail_deliver_session_deinit(&dinput.session);

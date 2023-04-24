@@ -689,7 +689,8 @@ ssize_t fs_read_via_stream(struct fs_file *file, void *buf, size_t size)
 			     i_stream_get_error(file->pending_read_input));
 	} else {
 		ret = I_MIN(size, data_size);
-		memcpy(buf, data, ret);
+		if (ret > 0)
+			memcpy(buf, data, ret);
 	}
 	i_stream_unref(&file->pending_read_input);
 	return ret;
@@ -1211,8 +1212,6 @@ int fs_delete(struct fs_file *file)
 {
 	int ret;
 
-	i_assert(!file->writing_stream);
-
 	fs_file_timing_start(file, FS_OP_DELETE);
 	T_BEGIN {
 		ret = file->fs->v.delete_file(file);
@@ -1404,4 +1403,9 @@ fs_iter_init_parent(struct fs_iter *parent,
 {
 	return fs_iter_init_with_event(parent->fs->parent, parent->event,
 				       path, flags);
+}
+
+struct event *fs_get_event(struct fs *fs)
+{
+	return fs->event;
 }

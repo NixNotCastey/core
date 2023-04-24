@@ -466,9 +466,6 @@ int mail_crypt_user_set_private_key(struct mail_user *user, const char *pubid,
 				    struct dcrypt_private_key *key,
 				    const char **error_r)
 {
-	struct mail_namespace *ns = mail_namespace_find_inbox(user->namespaces);
-	struct mailbox *box = mailbox_alloc(ns->list, "INBOX",
-					    MAILBOX_FLAG_READONLY);
 	struct dcrypt_private_key *env_key = NULL;
 	struct dcrypt_public_key *enc_key = NULL;
 	struct mailbox_transaction_context *t;
@@ -494,6 +491,9 @@ int mail_crypt_user_set_private_key(struct mail_user *user, const char *pubid,
 		return -1;
 	}
 
+	struct mail_namespace *ns = mail_namespace_find_inbox(user->namespaces);
+	struct mailbox *box = mailbox_alloc(ns->list, "INBOX",
+					    MAILBOX_FLAG_READONLY);
 	if (mailbox_open(box) < 0) {
 		*error_r = t_strdup_printf("mailbox_open(%s) failed: %s",
 					   "INBOX",
@@ -1155,39 +1155,6 @@ mail_crypt_user_get_or_gen_public_key(struct mail_user *user,
 			return -1;
 		}
 		*pub_r = pair.pub;
-		dcrypt_key_unref_private(&pair.priv);
-	} else
-		return ret;
-	return 0;
-}
-
-int
-mail_crypt_box_get_or_gen_public_key(struct mailbox *box,
-				     struct dcrypt_public_key **pub_r,
-				     const char **error_r)
-{
-	i_assert(box != NULL);
-	i_assert(pub_r != NULL);
-	i_assert(error_r != NULL);
-
-	struct mail_user *user =
-		mail_storage_get_user(mailbox_get_storage(box));
-	int ret;
-	if ((ret = mail_crypt_box_get_public_key(box, pub_r, error_r)) == 0) {
-		struct dcrypt_public_key *user_key;
-		if (mail_crypt_user_get_or_gen_public_key(user, &user_key,
-							  error_r) < 0) {
-			return -1;
-		}
-
-		struct dcrypt_keypair pair;
-		const char *pubid = NULL;
-		if (mail_crypt_box_generate_keypair(box, &pair, user_key,
-						    &pubid, error_r) < 0) {
-			return -1;
-		}
-		*pub_r = pair.pub;
-		dcrypt_key_unref_public(&user_key);
 		dcrypt_key_unref_private(&pair.priv);
 	} else
 		return ret;

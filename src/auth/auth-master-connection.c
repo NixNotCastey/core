@@ -107,7 +107,7 @@ master_input_request(struct auth_master_connection *conn, const char *args)
 	struct auth_client_connection *client_conn;
 	const char *const *list, *const *params;
 	unsigned int id, client_pid, client_id;
-	uint8_t cookie[MASTER_AUTH_COOKIE_SIZE];
+	uint8_t cookie[LOGIN_REQUEST_COOKIE_SIZE];
 	buffer_t buf;
 
 	/* <id> <client-pid> <client-id> <cookie> [<parameters>] */
@@ -121,7 +121,8 @@ master_input_request(struct auth_master_connection *conn, const char *args)
 	}
 
 	buffer_create_from_data(&buf, cookie, sizeof(cookie));
-	if (hex_to_binary(list[3], &buf) < 0) {
+	if (strlen(list[3]) != sizeof(cookie)*2 ||
+	    hex_to_binary(list[3], &buf) < 0) {
 		e_error(conn->event, "BUG: Master sent broken REQUEST cookie");
 		return FALSE;
 	}
@@ -296,9 +297,8 @@ user_callback(enum userdb_result result,
 	case USERDB_RESULT_OK:
 		str_printfa(str, "USER\t%u\t", auth_request->id);
 		str_append_tabescaped(str, auth_request->fields.user);
-		str_append_c(str, '\t');
 		auth_fields_append(auth_request->fields.userdb_reply, str,
-				   AUTH_FIELD_FLAG_HIDDEN, 0);
+				   AUTH_FIELD_FLAG_HIDDEN, 0, TRUE);
 		break;
 	}
 
@@ -348,11 +348,8 @@ static void pass_callback_finish(struct auth_request *auth_request,
 		}
 		str_printfa(str, "PASS\t%u\tuser=", auth_request->id);
 		str_append_tabescaped(str, auth_request->fields.user);
-		if (!auth_fields_is_empty(auth_request->fields.extra_fields)) {
-			str_append_c(str, '\t');
-			auth_fields_append(auth_request->fields.extra_fields,
-					   str, AUTH_FIELD_FLAG_HIDDEN, 0);
-		}
+		auth_fields_append(auth_request->fields.extra_fields, str,
+				   AUTH_FIELD_FLAG_HIDDEN, 0, TRUE);
 		break;
 	case PASSDB_RESULT_USER_UNKNOWN:
 	case PASSDB_RESULT_USER_DISABLED:
@@ -514,7 +511,6 @@ static void master_input_list_callback(const char *user, void *context)
 		ctx->auth_request->userdb = userdb;
 		ctx->iter = userdb_blocking_iter_init(ctx->auth_request,
 					master_input_list_callback, ctx);
-		userdb_blocking_iter_next(ctx->iter);
 		return;
 	}
 
@@ -690,7 +686,7 @@ static void master_input(struct auth_master_connection *conn)
 		/* make sure the major version matches */
 		if (!str_begins(line, "VERSION\t", &args) ||
 		    !str_uint_equals(t_strcut(args, '\t'),
-				     AUTH_MASTER_PROTOCOL_MAJOR_VERSION)) {
+				     AUTH_CLIENT_PROTOCOL_MAJOR_VERSION)) {
 			e_error(conn->event,
 				"Master not compatible with this server "
 				"(mixed old and new binaries?)");
@@ -788,8 +784,8 @@ auth_master_connection_create(struct auth *auth, int fd,
 	event_set_log_message_callback(conn->event, auth_master_event_log_callback, conn);
 
 	line = t_strdup_printf("VERSION\t%u\t%u\nSPID\t%s\n",
-			       AUTH_MASTER_PROTOCOL_MAJOR_VERSION,
-			       AUTH_MASTER_PROTOCOL_MINOR_VERSION,
+			       AUTH_CLIENT_PROTOCOL_MAJOR_VERSION,
+			       AUTH_CLIENT_PROTOCOL_MINOR_VERSION,
 			       my_pid);
 	o_stream_nsend_str(conn->output, line);
 	DLLIST_PREPEND(&auth_master_connections, conn);

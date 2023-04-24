@@ -828,7 +828,7 @@ int net_getunixcred(int fd, struct net_unix_cred *cred_r)
 		i_error("getsockopt(LOCAL_PEEREID) failed: %m");
 		return -1;
 	}
-	
+
 	cred_r->uid = ucred.unp_euid;
 	cred_r->gid = ucred.unp_egid;
 	cred_r->pid = ucred.unp_pid;
@@ -1228,6 +1228,12 @@ bool net_is_in_network(const struct ip_addr *ip,
 	} else {
 		ip1 = (const void *)&ip->u.ip6;
 		ip2 = (const void *)&net_ip->u.ip6;
+		if (ip->scope_id != net_ip->scope_id &&
+		    net_ip->scope_id != 0) {
+			/* %iface1 != %iface2 never matches, but allow
+			   missing interface on the net_ip */
+			return FALSE;
+		}
 	}
 
 	/* check first the full 32bit ints */

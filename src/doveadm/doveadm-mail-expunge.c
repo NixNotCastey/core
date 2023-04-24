@@ -19,7 +19,9 @@ cmd_expunge_box(struct doveadm_mail_cmd_context *_ctx,
 		const struct mailbox_info *info,
 		struct mail_search_args *search_args)
 {
-	struct expunge_cmd_context *ctx = (struct expunge_cmd_context *)_ctx;
+	struct expunge_cmd_context *ctx =
+		container_of(_ctx, struct expunge_cmd_context, ctx);
+
 	struct doveadm_mail_iter *iter;
 	struct mailbox *box;
 	struct mail *mail;
@@ -32,17 +34,15 @@ cmd_expunge_box(struct doveadm_mail_cmd_context *_ctx,
 
 	ret = 0;
 	while (doveadm_mail_iter_next(iter, &mail)) {
-		if (doveadm_debug) {
-			i_debug("expunge: box=%s uid=%u",
-				info->vname, mail->uid);
-		}
+		e_debug(mail_event(mail), "expunge");
 		mail_expunge(mail);
 	}
 
 	if (doveadm_mail_iter_deinit_keep_box(&iter, &box) < 0)
 		ret = -1;
 	else if (mailbox_sync(box, 0) < 0) {
-		i_error("Syncing mailbox '%s' failed: %s",
+		e_debug(ctx->ctx.cctx->event,
+			"Syncing mailbox '%s' failed: %s",
 			mailbox_get_vname(box),
 			mailbox_get_last_internal_error(box, NULL));
 		doveadm_mail_failed_mailbox(_ctx, box);
@@ -53,7 +53,8 @@ cmd_expunge_box(struct doveadm_mail_cmd_context *_ctx,
 		if (mailbox_delete_empty(box) < 0) {
 			error = mailbox_get_last_mail_error(box);
 			if (error != MAIL_ERROR_EXISTS) {
-				i_error("Deleting mailbox '%s' failed: %s",
+				e_debug(ctx->ctx.cctx->event,
+					"Deleting mailbox '%s' failed: %s",
 					mailbox_get_vname(box),
 					mailbox_get_last_internal_error(box, NULL));
 				doveadm_mail_failed_mailbox(_ctx, box);
@@ -61,7 +62,8 @@ cmd_expunge_box(struct doveadm_mail_cmd_context *_ctx,
 			}
 		} else {
 			if (mailbox_set_subscribed(box, FALSE) < 0) {
-				i_error("Unsubscribing mailbox '%s' failed: %s",
+				e_debug(ctx->ctx.cctx->event,
+					"Unsubscribing mailbox '%s' failed: %s",
 					mailbox_get_vname(box),
 					mailbox_get_last_internal_error(box, NULL));
 				doveadm_mail_failed_mailbox(_ctx, box);
@@ -239,28 +241,21 @@ void expunge_search_args_check(struct mail_search_args *args, const char *cmd)
 	mail_search_args_simplify(args);
 }
 
-static void cmd_expunge_init(struct doveadm_mail_cmd_context *ctx,
-			     const char *const args[])
+static void cmd_expunge_init(struct doveadm_mail_cmd_context *_ctx)
 {
-	if (args[0] == NULL)
+	struct doveadm_cmd_context *cctx = _ctx->cctx;
+	struct expunge_cmd_context *ctx =
+		container_of(_ctx, struct expunge_cmd_context, ctx);
+
+	ctx->delete_empty_mailbox =
+		doveadm_cmd_param_flag(cctx, "delete-empty-mailbox");
+
+	const char *const *query;
+	if (!doveadm_cmd_param_array(cctx, "query", &query))
 		doveadm_mail_help_name("expunge");
 
-	ctx->search_args = doveadm_mail_build_search_args(args);
-	expunge_search_args_check(ctx->search_args, "expunge");
-}
-
-static bool cmd_expunge_parse_arg(struct doveadm_mail_cmd_context *_ctx, int c)
-{
-	struct expunge_cmd_context *ctx = (struct expunge_cmd_context *)_ctx;
-
-	switch (c) {
-	case 'd':
-		ctx->delete_empty_mailbox = TRUE;
-		break;
-	default:
-		return FALSE;
-	}
-	return TRUE;
+	_ctx->search_args = doveadm_mail_build_search_args(query);
+	expunge_search_args_check(_ctx->search_args, "expunge");
 }
 
 static struct doveadm_mail_cmd_context *cmd_expunge_alloc(void)
@@ -268,8 +263,6 @@ static struct doveadm_mail_cmd_context *cmd_expunge_alloc(void)
 	struct expunge_cmd_context *ctx;
 
 	ctx = doveadm_mail_cmd_alloc(struct expunge_cmd_context);
-	ctx->ctx.getopt_args = "d";
-	ctx->ctx.v.parse_arg = cmd_expunge_parse_arg;
 	ctx->ctx.v.init = cmd_expunge_init;
 	ctx->ctx.v.run = cmd_expunge_run;
 	return &ctx->ctx;
@@ -278,7 +271,7 @@ static struct doveadm_mail_cmd_context *cmd_expunge_alloc(void)
 struct doveadm_cmd_ver2 doveadm_cmd_expunge_ver2 = {
 	.name = "expunge",
 	.mail_cmd = cmd_expunge_alloc,
-	.usage = DOVEADM_CMD_MAIL_USAGE_PREFIX "[-m] <search query>",
+	.usage = DOVEADM_CMD_MAIL_USAGE_PREFIX "[-d] <search query>",
 DOVEADM_CMD_PARAMS_START
 DOVEADM_CMD_MAIL_COMMON
 DOVEADM_CMD_PARAM('d', "delete-empty-mailbox", CMD_PARAM_BOOL, 0)

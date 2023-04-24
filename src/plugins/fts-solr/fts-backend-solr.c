@@ -194,8 +194,7 @@ fts_backend_solr_init(struct fts_backend *_backend, const char **error_r)
 	}
 
 	mail_user_init_ssl_client_settings(_backend->ns->user, &ssl_set);
-	return solr_connection_init(&fuser->set, &ssl_set,
-				    _backend->ns->user->event,
+	return solr_connection_init(&fuser->set, &ssl_set, _backend->event,
 				    &backend->solr_conn, error_r);
 }
 
@@ -245,7 +244,8 @@ get_last_uid_fallback(struct fts_backend *_backend, struct mailbox *box,
 		if (count == 1 && uidvals[0].seq1 == uidvals[0].seq2) {
 			*last_uid_r = uidvals[0].seq1;
 		} else {
-			i_error("fts_solr: Last UID lookup returned multiple rows");
+			e_error(backend->backend.event,
+				"Last UID lookup returned multiple rows");
 			ret = -1;
 		}
 	}
@@ -382,32 +382,36 @@ fts_backend_solr_expunge_flush(struct solr_fts_backend_update_context *ctx)
 	str_append(ctx->cmd_expunge, "<delete>");
 }
 
+static int fts_backend_solr_commit(struct solr_fts_backend_update_context *ctx)
+{
+	struct solr_fts_backend *backend =
+		(struct solr_fts_backend *) ctx->ctx.backend;
+	struct fts_solr_user *fuser = FTS_SOLR_USER_CONTEXT(ctx->ctx.backend->ns->user);
+
+	if (!fuser->set.soft_commit)
+		return 0;
+
+	const char *str = t_strdup_printf(
+		"<commit softCommit=\"true\" waitSearcher=\"%s\"/>",
+		ctx->documents_added ? "true" : "false");
+	return solr_connection_post(backend->solr_conn, str);
+}
+
 static int
 fts_backend_solr_update_deinit(struct fts_backend_update_context *_ctx)
 {
 	struct solr_fts_backend_update_context *ctx =
 		(struct solr_fts_backend_update_context *)_ctx;
-	struct solr_fts_backend *backend =
-		(struct solr_fts_backend *)_ctx->backend;
-	struct fts_solr_user *fuser = FTS_SOLR_USER_CONTEXT(_ctx->backend->ns->user);
 	struct solr_fts_field *field;
-	const char *str;
 	int ret = _ctx->failed ? -1 : 0;
 
 	if (fts_backed_solr_build_flush(ctx) < 0)
 		ret = -1;
 
-	if (ctx->documents_added || ctx->expunges) {
-		/* commit and wait until the documents we just indexed are
-		   visible to the following search */
-		if (ctx->expunges)
-			fts_backend_solr_expunge_flush(ctx);
-		if (fuser->set.soft_commit) {
-			str = t_strdup_printf("<commit softCommit=\"true\" waitSearcher=\"%s\"/>",
-					      ctx->documents_added ? "true" : "false");
-			if (solr_connection_post(backend->solr_conn, str) < 0)
-				ret = -1;
-		}
+	if (ctx->expunges) {
+		fts_backend_solr_expunge_flush(ctx);
+		if (fts_backend_solr_commit(ctx) < 0)
+			ret = -1;
 	}
 
 	str_free(&ctx->cmd);
@@ -436,8 +440,12 @@ fts_backend_solr_update_set_mailbox(struct fts_backend_update_context *_ctx,
 		   last_uid before we know it has succeeded */
 		if (fts_backed_solr_build_flush(ctx) < 0)
 			_ctx->failed = TRUE;
-		else if (!_ctx->failed)
-			fts_index_set_last_uid(ctx->cur_box, ctx->prev_uid);
+		else if (!_ctx->failed) {
+			if (fts_backend_solr_commit(ctx) < 0)
+				_ctx->failed = TRUE;
+			else
+				fts_index_set_last_uid(ctx->cur_box, ctx->prev_uid);
+		}
 		ctx->prev_uid = 0;
 	}
 
@@ -622,9 +630,8 @@ fts_backend_solr_update_build_more(struct fts_backend_update_context *_ctx,
 	    str_len(ctx->cur_value) >= SOLR_HEADER_MAX_SIZE) {
 		/* a large header */
 		i_assert(ctx->cur_value != ctx->cmd);
-
-		i_warning("fts-solr(%s): Mailbox %s UID=%u header size is huge, truncating",
-			  ctx->cur_box->storage->user->username,
+		e_warning(ctx->ctx.backend->event,
+			  "Mailbox %s UID=%u header size is huge, truncating",
 			  mailbox_get_vname(ctx->cur_box), ctx->prev_uid);
 		ctx->truncate_header = TRUE;
 	}
@@ -853,7 +860,7 @@ fts_backend_solr_lookup(struct fts_backend *_backend, struct mailbox *box,
 		if (solr_search(_backend, str, box_guid,
 				&result->maybe_uids, &result->scores) < 0)
 			return -1;
-	}               
+	}
 	result->scores_sorted = TRUE;
 	return 0;
 }
@@ -863,6 +870,7 @@ solr_search_multi(struct fts_backend *_backend, string_t *str,
 		  struct mailbox *const boxes[], enum fts_lookup_flags flags,
 		  struct fts_multi_result *result)
 {
+	struct event *event = _backend->ns->user->event;
 	struct solr_fts_backend *backend = (struct solr_fts_backend *)_backend;
 	struct solr_result **solr_results;
 	struct fts_result *fts_result;
@@ -915,7 +923,8 @@ solr_search_multi(struct fts_backend *_backend, string_t *str,
 		box = hash_table_lookup(mailboxes, solr_results[i]->box_id);
 		if (box == NULL) {
 			if (!search_all_mailboxes) {
-				i_warning("fts_solr: Lookup returned unexpected mailbox "
+				e_warning(event,
+					  "fts-solr: Lookup returned unexpected mailbox "
 					  "with guid=%s", solr_results[i]->box_id);
 			}
 			continue;
